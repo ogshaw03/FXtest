@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
     cmds = None  # type: ignore
 
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 WINDOW = "toon_fireWin"
@@ -172,15 +172,11 @@ def _make_flame_mesh(name, height=3.0, radius=1.0, subdiv_axis=16):
 
     poly_result = cmds.nurbsToPoly(
         nurbs_surface,
-        mnd=1, ch=False,
-        f=2, pt=1, pc=300,
-        chr=0.9, ft=0.01,
-        mel=0.001, d=0.1,
-        ut=1, un=subdiv_axis,
-        vt=1, vn=6,
-        uch=0, ucr=0, cht=0.2, es=0,
-        ntr=0, mrt=0, mel1=0.001,
-        name=name + "_mesh",
+        ch=False,
+        n=name + "_mesh",
+        f=2,          # format: Quads
+        pt=1,         # polygonType: Count method
+        pc=300,       # target polygon count
     )
     poly_mesh = poly_result[0]
 
