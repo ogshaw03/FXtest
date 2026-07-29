@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
     cmds = None  # type: ignore
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 WINDOW = "toon_fireWin"
@@ -161,14 +161,14 @@ def _make_flame_mesh(name, height=3.0, radius=1.0, subdiv_axis=16):
 
     curve = cmds.curve(d=3, p=scaled, name=name + "_profile")
 
-    nurbs_surface, _revolve_node = cmds.revolve(
+    nurbs_surface = cmds.revolve(
         curve,
         ch=False, po=0,
         ssw=0, esw=360,
         ax=(0, 1, 0),
         degree=3, s=subdiv_axis,
         name=name + "_nurbs",
-    )
+    )[0]
 
     poly_result = cmds.nurbsToPoly(
         nurbs_surface,
