@@ -1,18 +1,16 @@
-"""toon_fire -- Maya 2023 セルルック炎エフェクト (ポリゴン + トゥーン)
+"""toon_fire -- Maya 2023 セルルック炎エフェクト (焚き火シルエット版)
 
 アニメ調 (2〜3階調フラット) の炎エフェクトを生成する
 シングルファイル ツール。install.py と同居して配布し、シェルフから
 起動 / GitHub 更新できる。
 
-構成:
-  - outer   : 外炎 (濃いオレンジ)                        [最外]
-  - middle  : 中炎 (オレンジ)
-  - core    : 芯 (黄〜白)                                [最内]
+構成 (焚き火シルエット):
+  - outer   : 外炎 (濃いオレンジ)   広い低い base + 3 tongues
+  - middle  : 中炎 (オレンジ)       小さい base + 4 tongues
+  - core    : 芯 (黄〜白)          base 無し, 5 tall/sharp tongues
 
-アニメーション:
-  各レイヤーに time ベースの noise() 多オクターブ表現式で
-  scale/rotate/translate を付与。scaleY は上方向 (>1) に
-  バイアスをかけ、炎が「舐め上がる」動きを再現する。
+各 tongue は独立メッシュで xz にオフセット配置 + 個別 phase
+表現式による flicker。base より tongue の方が amp/speed が高い。
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ except ImportError:  # pragma: no cover
     cmds = None  # type: ignore
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 WINDOW = "toon_fireWin"
@@ -147,16 +145,44 @@ def _reopen_after_update() -> None:
 # Fire effect generation
 # =========================================================================
 
-def _make_flame_mesh(name, height=3.0, radius=1.0, subdiv_axis=16):
-    """炎シルエットのプロファイル曲線を Y 軸に revolve → ポリゴン化。"""
-    profile_pts = [
-        (0.65, 0.00, 0.0),
-        (1.00, 0.15, 0.0),
-        (0.95, 0.40, 0.0),
-        (0.75, 0.65, 0.0),
-        (0.45, 0.85, 0.0),
-        (0.00, 1.00, 0.0),
-    ]
+# 炎シルエットのプロファイル (Y 軸に revolve). 全て正規化 (max radius=1, height=1)。
+
+# BASE_PROFILE: 幅広く低い. 中央がふくらむ「土台」形状.
+# 焚き火の広い base — 底で丸まって膨らみ、上端はなだらかに閉じる.
+BASE_PROFILE = [
+    (0.85, 0.00, 0.0),
+    (1.00, 0.18, 0.0),
+    (0.95, 0.42, 0.0),
+    (0.78, 0.65, 0.0),
+    (0.45, 0.85, 0.0),
+    (0.00, 1.00, 0.0),
+]
+
+# TONGUE_PROFILE: 細く尖った tongue (individual flame lick).
+# 下は細めに絞り、中央でわずかに膨らみ、先端に向かって鋭くテーパー.
+TONGUE_PROFILE = [
+    (0.45, 0.00, 0.0),
+    (0.85, 0.14, 0.0),
+    (1.00, 0.32, 0.0),
+    (0.78, 0.55, 0.0),
+    (0.48, 0.75, 0.0),
+    (0.20, 0.90, 0.0),
+    (0.00, 1.00, 0.0),
+]
+
+
+def _make_flame_mesh(name, profile_pts, height=3.0, radius=1.0,
+                     subdiv_axis=12):
+    """任意のプロファイル曲線を Y 軸に revolve → ポリゴン化。
+
+    Args:
+        name:         生成メッシュのベース名。
+        profile_pts:  [(x, y, z), ...] 正規化された 2D プロファイル
+                      (max radius=1, height=1). Y は 0..1.
+        height:       revolve 後の総高さ (unit).
+        radius:       revolve 後の最大半径 (unit).
+        subdiv_axis:  Y 軸周りの分割数 (revolve の s フラグ).
+    """
     scaled = [(x * radius, y * height, z) for x, y, z in profile_pts]
 
     curve = cmds.curve(d=3, p=scaled, name=name + "_profile")
@@ -176,7 +202,7 @@ def _make_flame_mesh(name, height=3.0, radius=1.0, subdiv_axis=16):
         n=name + "_mesh",
         f=2,          # format: Quads
         pt=1,         # polygonType: Count method
-        pc=300,       # target polygon count
+        pc=200,       # target polygon count
     )
     poly_mesh = poly_result[0]
 
@@ -202,19 +228,23 @@ def _assign_shader(mesh, sg):
 
 def _add_flicker_expression(transform, phase=0.0, speed=6.0,
                             amp_scale=0.08, amp_rot=6.0,
-                            up_bias=0.60):
+                            up_bias=0.60,
+                            base_tx=0.0, base_tz=0.0,
+                            drift=0.06):
     """炎の揺らぎを付与する MEL 表現式。
 
     - noise() を 2 オクターブ重ねて有機的な揺らぎを作る。
     - scaleY は上方向 (>1) にバイアスをかけ「舐め上がる」動きに。
-    - translate は 0.15 unit 以下に抑え、位置は安定させる。
+    - translate は base_tx/base_tz を中心に drift 幅で揺らす。
     - rotate はゆっくりした横揺れ (sway) のみ。
 
     Args:
-        up_bias: 0..1  scaleY を 1 より上に押し上げる比率 (fire licks up).
+        base_tx/base_tz:  tongue の設置位置 (xz オフセット).
+                          expression が translate を毎フレーム上書きするため
+                          xform ではなく expression に組み込む。
+        drift:            translate 揺らぎ振幅 (unit).
+        up_bias:          0..1  scaleY を 1 より上に押し上げる比率.
     """
-    # noise(x) は Maya 表現式で ~-1..1 の smooth pseudo-random を返す。
-    # 2 オクターブ (低周波の大うねり + 高周波のちらつき) を混ぜる。
     expr = (
         "float $t   = time * {speed} + {phase};\n"
         "float $t2  = $t * 2.3 + 5.1;\n"
@@ -225,7 +255,6 @@ def _add_flicker_expression(transform, phase=0.0, speed=6.0,
         "+ noise($t * 2.6 + 13.0) * 0.30;\n"
         "float $nr  = noise($t * 0.45 + 21.0);\n"
         "// --- upward-biased scaleY (fire licks up) ---\n"
-        "// remap ny (~-1..1) so it sits mostly above 1.\n"
         "float $sy_raw = ($ny + 1.0) * 0.5;   // 0..1\n"
         "float $sy_bias = $sy_raw * (1.0 - {up_bias}) + {up_bias};\n"
         "{n}.scaleY = 1.0 + $sy_bias * ({a_s} * 1.6);\n"
@@ -233,20 +262,87 @@ def _add_flicker_expression(transform, phase=0.0, speed=6.0,
         "{n}.scaleZ = 1.0 + $nz * {a_s};\n"
         "// --- slow sway rotation, no spin ---\n"
         "{n}.rotateY = $nr * {a_r};\n"
-        "// --- tiny drift (< 0.15 unit) ---\n"
-        "{n}.translateX = $nx * 0.06;\n"
-        "{n}.translateZ = $nz * 0.06;\n"
+        "// --- position = base offset + tiny drift ---\n"
+        "{n}.translateX = {btx} + $nx * {drift};\n"
+        "{n}.translateZ = {btz} + $nz * {drift};\n"
     ).format(
         n=transform, speed=speed, phase=phase,
         a_s=amp_scale, a_r=amp_rot, up_bias=up_bias,
+        btx=base_tx, btz=base_tz, drift=drift,
     )
     cmds.expression(s=expr, name=transform + "_flicker_EXPR", ae=True, uc="all")
 
 
+# --- Layer specification -------------------------------------------------
+# 焚き火シルエット: base (dome) + 複数 tongue (individual licks).
+# tongue tuple = (ox_frac, oz_frac, h_frac, r_frac, phase)
+#   ox_frac/oz_frac : xz 位置オフセット (radius 倍率, 焚き火中心からの距離)
+#   h_frac/r_frac   : 高さ/半径 (height/radius 倍率)
+#   phase           : flicker phase offset (rad). tongue ごとに個別.
+
+_LAYER_SPECS = [
+    {
+        "name": "fire_outer",
+        "color": (0.95, 0.30, 0.03),
+        # 広く短い base (h≈1.5, r≈1.2 with h=3, r=1)
+        "base": {
+            "h_frac": 0.50, "r_frac": 1.20,
+            "phase": 0.0, "speed": 3.0,
+            "amp_s": 0.05, "up_bias": 0.35,
+        },
+        "tongue_speed": 3.8,
+        "tongue_amp_s": 0.14,
+        "tongue_up_bias": 0.60,
+        "tongues": [
+            # ox     oz     h     r     phase
+            (-0.35,  0.10, 0.55, 0.32, 0.0),
+            ( 0.30, -0.20, 0.42, 0.30, 1.7),
+            ( 0.05,  0.40, 0.62, 0.28, 3.2),
+        ],
+    },
+    {
+        "name": "fire_mid",
+        "color": (1.00, 0.60, 0.10),
+        # 小さめ base (h≈1.2, r≈0.9)
+        "base": {
+            "h_frac": 0.40, "r_frac": 0.90,
+            "phase": 1.1, "speed": 4.5,
+            "amp_s": 0.06, "up_bias": 0.45,
+        },
+        "tongue_speed": 5.5,
+        "tongue_amp_s": 0.16,
+        "tongue_up_bias": 0.70,
+        "tongues": [
+            (-0.25, -0.10, 0.55, 0.28, 0.5),
+            ( 0.20,  0.25, 0.72, 0.26, 2.3),
+            (-0.05,  0.35, 0.50, 0.24, 3.9),
+            ( 0.30, -0.30, 0.48, 0.26, 5.1),
+        ],
+    },
+    {
+        "name": "fire_core",
+        "color": (1.00, 0.95, 0.55),
+        # core は base 無し、tall/sharp tongues のみ
+        "base": None,
+        "tongue_speed": 8.0,
+        "tongue_amp_s": 0.20,
+        "tongue_up_bias": 0.80,
+        "tongues": [
+            ( 0.00,  0.00, 0.82, 0.22, 0.8),
+            (-0.20, -0.05, 0.68, 0.20, 2.1),
+            ( 0.18,  0.12, 0.78, 0.18, 3.7),
+            (-0.08,  0.25, 0.55, 0.20, 5.3),
+            ( 0.15, -0.22, 0.50, 0.18, 6.6),
+        ],
+    },
+]
 
 
 def create(height=3.0, radius=1.0, speed_mult=1.0):
-    """Generate the toon fire in the current scene.
+    """Generate the toon campfire in the current scene.
+
+    焚き火シルエット: layer ごとに wide base (dome) と複数の
+    off-center tongue (individual licks) を生成し、独立 flicker を付与。
 
     Args:
         height:     炎全体の高さ (unit).
@@ -261,23 +357,55 @@ def create(height=3.0, radius=1.0, speed_mult=1.0):
 
     group = cmds.group(em=True, name=GROUP_NAME)
 
-    # (name, h_scale, r_scale, color, phase, speed, amp_s, up_bias)
-    # outer は広くゆっくり、core は速く鋭く。amp/up_bias で先端の伸びを演出。
-    layers = [
-        ("fire_outer", 1.00, 1.00, (0.95, 0.30, 0.03), 0.0, 3.5, 0.12, 0.55),
-        ("fire_mid",   0.80, 0.70, (1.00, 0.60, 0.10), 1.7, 5.5, 0.14, 0.65),
-        ("fire_core",  0.60, 0.38, (1.00, 0.95, 0.55), 3.4, 8.0, 0.16, 0.75),
-    ]
-
-    for name, hs, rs, color, phase, speed, amp_s, up_bias in layers:
-        mesh = _make_flame_mesh(name, height=height * hs, radius=radius * rs)
+    for layer in _LAYER_SPECS:
+        name = layer["name"]
+        color = layer["color"]
         _shader, sg = _make_flat_shader(name, color)
-        _assign_shader(mesh, sg)
-        _add_flicker_expression(
-            mesh, phase=phase, speed=speed * speed_mult,
-            amp_scale=amp_s, up_bias=up_bias,
-        )
-        cmds.parent(mesh, group)
+
+        # --- base (dome) --------------------------------------------------
+        base_spec = layer["base"]
+        if base_spec is not None:
+            base_mesh = _make_flame_mesh(
+                name + "_base",
+                BASE_PROFILE,
+                height=height * base_spec["h_frac"],
+                radius=radius * base_spec["r_frac"],
+                subdiv_axis=16,
+            )
+            _assign_shader(base_mesh, sg)
+            _add_flicker_expression(
+                base_mesh,
+                phase=base_spec["phase"],
+                speed=base_spec["speed"] * speed_mult,
+                amp_scale=base_spec["amp_s"],
+                up_bias=base_spec["up_bias"],
+                base_tx=0.0, base_tz=0.0,
+                drift=0.04,   # base は動きすぎない
+            )
+            cmds.parent(base_mesh, group)
+
+        # --- tongues (individual licks) -----------------------------------
+        for i, (ox, oz, h_frac, r_frac, phase) in enumerate(layer["tongues"]):
+            tname = f"{name}_tongue{i + 1}"
+            tmesh = _make_flame_mesh(
+                tname,
+                TONGUE_PROFILE,
+                height=height * h_frac,
+                radius=radius * r_frac,
+                subdiv_axis=10,
+            )
+            _assign_shader(tmesh, sg)
+            _add_flicker_expression(
+                tmesh,
+                phase=phase,
+                speed=layer["tongue_speed"] * speed_mult,
+                amp_scale=layer["tongue_amp_s"],
+                up_bias=layer["tongue_up_bias"],
+                base_tx=ox * radius,
+                base_tz=oz * radius,
+                drift=0.08,   # tongue は base より大きく揺れる
+            )
+            cmds.parent(tmesh, group)
 
     cmds.playbackOptions(min=1, max=120, ast=1, aet=120)
     cmds.currentTime(1)
