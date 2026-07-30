@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.8.4"
+__version__ = "0.9.0"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -755,15 +755,8 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         except Exception: pass
 
     # --- 2. IK handle on CLEAN chain ---
-    # leg 系のみ: 現ポーズを preferredAngle に保存してから ikHandle 作成。
-    # これで RP solver が bind ポーズを "曖昧" と判定して chain を数度回転させ、
-    # orient blend offset が非ゼロになる問題を回避 (leg 2.84 unit drift 消滅)。
-    # arm は MMD 由来の jointOrient 左右非対称のため spa 適用で R 側が 63 unit
-    # 反転する副作用があり、適用しない (drift 0.8-1.9 unit で許容)。
-    if "leg" in label.lower():
-        for j in ik_chain:
-            try: cmds.joint(j, e=True, spa=True)
-            except Exception: pass
+    # v0.9.0 の freeze_joint_rotations で rotate=0 になっているので RP solver
+    # は bind pose を曖昧と判定せず chain を perturb しない (spa fix 不要)。
     ik_handle = cmds.ikHandle(sj=arm_ik, ee=wrist_ik,
                               sol="ikRPsolver", n=label + "_ikh")[0]
     # IK handle は attach_ctrls_grp 下に (元 chain 内に置かないほうが管理しやすい)
@@ -881,11 +874,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         # これで wrist_ik 経由の local-space 不整合が消え、TWIST scout 報告の
         # 手首捻れ (arm_R wrist 127°) が解消する。
         ikj_source = ik_ctl if orig == end else ikj
-        # end joint は mo=False で offset 蓄積を防ぐ (ik_ctl と world rot 一致
-        # 済なので offset 不要)。これで wrist 微小 drift が fingers に cascade
-        # して middle_3_R が 17 unit 飛ぶ問題を解消。
-        use_mo = (orig != end)
-        cons = cmds.orientConstraint(fkj, ikj_source, orig, mo=use_mo,
+        cons = cmds.orientConstraint(fkj, ikj_source, orig, mo=True,
                                      n=orig + "_ikfk_oc")[0]
         wal = cmds.orientConstraint(cons, q=True, wal=True)  # [fkW, ikW]
         cmds.connectAttr(rev + ".outputX",  cons + "." + wal[0])
@@ -1320,10 +1309,6 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     ankle_ik = ankle_joint + "_ik"
     toe_ik = toe_joint + "_ik"
     if cmds.objExists(ankle_ik) and cmds.objExists(toe_ik):
-        # preferredAngle を現ポーズで固定 (setup_ik_fk と同理由の re-solve 回避)
-        for j in (ankle_ik, toe_ik):
-            try: cmds.joint(j, e=True, spa=True)
-            except Exception: pass
         try:
             toe_ikh = cmds.ikHandle(sj=ankle_ik, ee=toe_ik,
                                     sol="ikSCsolver", n=label + "_toeIkh")[0]
@@ -1339,9 +1324,14 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     # heel_piv を foot IK ctl の下に置くと ctl (=ankle joint rot 継承) の局所軸で
     # pivot が回転してしまい footRoll が水平スライドになる。ctl と heel_piv の間に
     # world-aligned な offset group を挟んで world 軸で回転させる。
+    # NOTE: os=True, ro=(0,0,0) は local=0 = parent (=ctl) rot 継承なので逆効果。
+    # ws=True, ro=(0,0,0) で world 軸に揃えると heel_piv の local rot が baked
+    # せず、後段の connectAttr(heelRoll→heel.rotateX) が rot 破壊しない
+    # (ankle 2.25 unit drift の真因)。
     piv_root = cmds.group(em=True, n=ankle_joint + "_pivRoot")
     cmds.parent(piv_root, foot_ik_ctl)
-    cmds.xform(piv_root, os=True, t=(0,0,0), ro=(0,0,0))
+    cmds.xform(piv_root, ws=True, t=cmds.xform(foot_ik_ctl, q=True, ws=True, t=True),
+                ro=(0, 0, 0))
     try:
         cmds.parent(heel_piv, piv_root)
     except Exception:
@@ -1578,6 +1568,47 @@ def delete_unnecessary(dry_run=False):
 
 # --- Full auto-setup: rename -> delete unnecessary -> attach FK -> IK/FK ---
 
+def freeze_joint_rotations(joints=None):
+    """joint の rotate 値を jointOrient に完全移動させて rotate=0 化。
+
+    MMD/FBX import 直後の joint は rotate に値が baked in された状態で
+    やってくる。この状態で ikHandle / orient constraint を掛けると RP
+    solver が preferred pose を誤判定して chain が drift する、L/R で
+    jointOrient 符号が非対称になり arm_R が反転する、等の重篤な問題を
+    起こす。リギング前に必ず rotate → jointOrient にフリーズする。
+
+    Args:
+        joints: 対象 joint リスト。None なら scene 内全 joint。
+
+    アルゴリズム (ユーザ提供):
+      1. 現 world rotation を記録
+      2. jointOrient を (0,0,0) にセット
+      3. world rotation を元値に復元 (rotate に全て入る)
+      4. その object-space rotate を jointOrient にコピー
+      5. rotate を (0,0,0) にリセット
+    結果: world rotation 不変、rotate=0、jointOrient に全て。
+    """
+    if cmds is None:
+        raise RuntimeError("Must run inside Maya.")
+    if joints is None:
+        joints = cmds.ls(type="joint") or []
+    n_ok = 0
+    for jnt in joints:
+        try:
+            rot = cmds.xform(jnt, q=True, ws=True, rotation=True)
+            cmds.setAttr(jnt + ".jointOrient", 0, 0, 0, type="double3")
+            cmds.xform(jnt, ws=True, rotation=rot)
+            new_rot = cmds.xform(jnt, q=True, os=True, rotation=True)
+            cmds.setAttr(jnt + ".jointOrient",
+                          new_rot[0], new_rot[1], new_rot[2], type="double3")
+            cmds.setAttr(jnt + ".rotate", 0, 0, 0, type="double3")
+            n_ok += 1
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] freeze_joint_rotations({jnt}) failed: {exc}")
+    print(f"[{_PACKAGE}] freeze_joint_rotations: {n_ok}/{len(joints)} joint(s) frozen")
+    return n_ok
+
+
 def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     """FBX 直後の状態から完全 rig setup を 1 コマンドで実行。
     1. namespace 除去
@@ -1603,6 +1634,12 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     else:
         fbx_renamer.remove_all_namespaces()
         fbx_renamer.rename_all_joints()
+
+    # Step 2.5: joint の rotate 値を jointOrient に焼き込む (rotate=0 化)。
+    # MMD/FBX import 由来の joint は rotate に値が入ったまま来て、後段の
+    # ikHandle / orient constraint が bind の "曖昧" と誤判定して chain を
+    # 数度動かし、hero drift や arm 反転を起こす原因になる。
+    freeze_joint_rotations()
 
     # Step 3: cleanup
     if delete_junk:
