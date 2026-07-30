@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -374,6 +374,12 @@ def _pick_ctl_maker(joint_name):
 
     if n == "waist":
         return _make_wide_flat_box_curve, diag * 0.19, True
+    # breast (MMD 胸_L/胸_R → chest_L/chest_R): upper_body の ring 判定より
+    # 前に置いて substring "chest" が誤マッチしないようにする。bone 長で
+    # cube を作り、flat_horizontal=False で乳房の向きに沿わせる。
+    if n.startswith("chest_l") or n.startswith("chest_r") or "breast" in n:
+        bl = _bone_length(joint_name) or (diag * 0.03)
+        return _make_cube_curve, bl, False
     if "upper_body" in n or "chest" in n:
         base = 0.16 if n == "upper_body_2" else 0.18
         return _make_ring_curve, diag * base, True
@@ -682,10 +688,18 @@ def _compute_pv_position(start_pos, mid_pos, end_pos, distance, fallback_dir=Non
     pole_dir = [mid_pos[i] - projected[i] for i in range(3)]
     pole_len = math.sqrt(sum(a*a for a in pole_dir))
 
-    # chain plane 判定不安定なら fallback_dir を採用 (chain length の 10% を閾値)
-    if pole_len < len_se * 0.1:
+    # chain plane 判定不安定な時のみ fallback_dir を採用 (PVFIX scout 発見:
+    # 閾値 len_se*0.1 は広すぎて Nekotatune の arm/leg 両方が fallback に落ち
+    # PV が平面外にズレていた。絶対 0.05 unit 未満のみ fallback に絞る)。
+    if pole_len < max(len_se * 0.02, 0.05):
         if fallback_dir is not None:
             pd = list(fallback_dir)
+            # fallback は v_se 方向成分を差し引いて chain 平面に強制射影
+            se_unit_len = len_se
+            if se_unit_len > 1e-6:
+                v_se_unit = [v_se[i] / se_unit_len for i in range(3)]
+                dot = sum(pd[i] * v_se_unit[i] for i in range(3))
+                pd = [pd[i] - dot * v_se_unit[i] for i in range(3)]
             pd_len = math.sqrt(sum(a*a for a in pd))
             if pd_len > 1e-6:
                 pole_dir = [pd[i] / pd_len for i in range(3)]
@@ -800,7 +814,13 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     mid_pos = cmds.xform(mid, q=True, ws=True, t=True)
     end_pos = cmds.xform(end, q=True, ws=True, t=True)
     if pv_offset is None:
-        base_offset = diag / 8.0
+        # PVFIX scout 発見: mesh diag 依存だと chain 長差 (arm 32 / leg 58) が
+        # 無視されて leg の PV が近すぎ (18 unit)。chain 実長さから決めれば
+        # スケール変化にも耐性ある妥当な位置になる。
+        import math as _math
+        chain_len = _math.sqrt(sum(
+            (end_pos[i] - start_pos[i])**2 for i in range(3)))
+        base_offset = chain_len * 0.6
     else:
         base_offset = pv_offset
     # T-pose straight chain の fallback: 腕は後方 (-Z), 脚は前方 (+Z)
@@ -1354,32 +1374,14 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     for piv in (heel_piv, toe_piv, ball_piv):
         _lock_hide_attrs(piv, ["tx","ty","tz"])
 
-    # UI host に attr を集約 (mGear 慣習): leg_L_UI_ctl があればそこに、無ければ IK ctl に
-    label_chain = "leg_L" if side == "L" else "leg_R" if side == "R" else "leg_C"
-    ui_host_name = label_chain + "_UI_ctl"
-    host = ui_host_name if cmds.objExists(ui_host_name) else foot_ik_ctl
+    # ユーザ要望: attr 集約 (footRoll 等) をやめ、pivot ctl (heel/ball/toe) を
+    # 直接掴んで rotate する方式に。attr connect が rotate を占有していると
+    # ユーザが動かせないため、connectAttr は行わない。rotate は _lock_hide_attrs
+    # で translate だけロックしてあるので自由に触れる。
+    # tip: heel/toe は主に rotateX、bank は heel の rotateZ で直感的に操作可。
 
-    # divider (Channel Box 見出し)
-    div_name = "__foot__"
-    if not cmds.attributeQuery(div_name, node=host, exists=True):
-        cmds.addAttr(host, ln=div_name, at="enum", en="foot", k=False)
-        cmds.setAttr(host + "." + div_name, channelBox=True)
-    for attr, dv in [("footRoll", 0.0), ("toeRoll", 0.0),
-                     ("heelRoll", 0.0), ("footBank", 0.0)]:
-        if not cmds.attributeQuery(attr, node=host, exists=True):
-            cmds.addAttr(host, ln=attr, at="float", k=True, dv=dv)
-
-    # 接続 (host の attr から pivot ctl の rotate に)
-    try:
-        cmds.connectAttr(host + ".heelRoll", heel_piv + ".rotateX")
-        cmds.connectAttr(host + ".footRoll", ball_piv + ".rotateX")
-        cmds.connectAttr(host + ".toeRoll",  toe_piv  + ".rotateX")
-        cmds.connectAttr(host + ".footBank", heel_piv + ".rotateZ")
-    except Exception as exc:
-        cmds.warning(f"[attach_ctrls] reverse foot connect failed: {exc}")
-
-    print(f"[{_PACKAGE}] Reverse foot: {ankle_joint} heel/ball/toe pivots + "
-          f"footRoll/toeRoll/heelRoll/footBank on {foot_ik_ctl}")
+    print(f"[{_PACKAGE}] Reverse foot: {ankle_joint} heel/ball/toe pivots "
+          f"(direct rotate control, no UI attrs)")
     return {
         "heel_piv": heel_piv, "ball_piv": ball_piv, "toe_piv": toe_piv,
         "toe_ikh": toe_ikh,
