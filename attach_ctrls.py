@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -640,6 +640,32 @@ def _dup_clean_chain(joints, suffix):
     return new_joints
 
 
+def _compute_pv_position(start_pos, mid_pos, end_pos, distance):
+    """3-joint chain (start-mid-end) の bind pose を保つ pole vector 位置。
+
+    chain plane 内で mid から start-end 直線の perpendicular 方向に distance 押し出す。
+    こうすると IK RP solver は既にこの平面で解いており、bind pose = solved pose に
+    なるため、pole vector 追加でも hero joint が bind から drift しない。
+    """
+    import math
+    v_se = [end_pos[i] - start_pos[i] for i in range(3)]
+    v_sm = [mid_pos[i] - start_pos[i] for i in range(3)]
+    len2_se = sum(a*a for a in v_se)
+    if len2_se < 1e-6:
+        return list(mid_pos)
+    t = sum(v_sm[i] * v_se[i] for i in range(3)) / len2_se
+    # start-end 直線上の mid 最近点
+    projected = [start_pos[i] + t * v_se[i] for i in range(3)]
+    # projected -> mid の方向 = perpendicular
+    pole_dir = [mid_pos[i] - projected[i] for i in range(3)]
+    pole_len = math.sqrt(sum(a*a for a in pole_dir))
+    if pole_len < 1e-6:
+        # chain が直線状 (degenerate) → 適当な perpendicular (world Z)
+        pole_dir = [0, 0, 1]
+        pole_len = 1.0
+    return [mid_pos[i] + pole_dir[i] / pole_len * distance for i in range(3)]
+
+
 def _dup_hero_joint(orig, suffix, new_parent=None):
     """joint を子なしで duplicate、任意の parent に付け直す。world transform は preserve。"""
     n = cmds.duplicate(orig, po=True, n=orig + suffix)[0]
@@ -734,18 +760,18 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     # ↑ PV は色を通常ctl とは変えて識別しやすく (L=lightblue20, R=lightred12, C=yellow17)
     pv_npo = cmds.group(em=True, name=label + "_PV_npo")
     cmds.parent(pv_ctl, pv_npo)
+    # bind pose を保つ幾何位置に PV を配置 (chain plane 内、start-end 直線の
+    # perpendicular 方向、mid から distance 押し出し)。これで IK RP solver が
+    # bind pose = solved pose を保つ → PV 追加でも hero joint が drift しない。
+    start_pos = cmds.xform(start, q=True, ws=True, t=True)
     mid_pos = cmds.xform(mid, q=True, ws=True, t=True)
+    end_pos = cmds.xform(end, q=True, ws=True, t=True)
     if pv_offset is None:
-        base_offset = diag / 8.0  # 大きめ offset (mesh 外に出す)
+        base_offset = diag / 8.0
     else:
         base_offset = pv_offset
-    lo = label.lower()
-    if "leg" in lo or "knee" in lo or "ankle" in lo:
-        z_off = +base_offset  # 脚: 前方 (膝側)
-    else:
-        z_off = -base_offset  # 腕: 後方 (肘側)
-    cmds.xform(pv_npo, ws=True,
-               t=(mid_pos[0], mid_pos[1], mid_pos[2] + z_off))
+    pv_pos = _compute_pv_position(start_pos, mid_pos, end_pos, base_offset)
+    cmds.xform(pv_npo, ws=True, t=pv_pos)
     cmds.parent(pv_npo, ROOT_GROUP)
     # NOTE: poleVectorConstraint はここでは張らない。
     #       張ると IK 再ソルブが走り clean chain の rotate が bind から drift、
@@ -859,8 +885,101 @@ def find_ik_chains():
     return out
 
 
+def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
+    """Reverse foot rig: heel/ball/toe の pivot chain と footRoll attr を付与。
+
+    joint 想定 (MMD 標準):
+      ankle_L → toe_L (child)
+    heel 位置は ankle 位置 - (toe - ankle) の 0.4 倍 後方 (Z-) で概算、Y=0。
+    ball 位置は ankle と toe の中間、Y=0。
+    """
+    toe_joint = ankle_joint.replace("ankle", "toe")
+    if not cmds.objExists(toe_joint):
+        return None  # toe が無ければスキップ
+
+    ankle_pos = cmds.xform(ankle_joint, q=True, ws=True, t=True)
+    toe_pos = cmds.xform(toe_joint, q=True, ws=True, t=True)
+
+    # heel: ankle 後方 (toe と反対方向) 0.4 倍、Y=0 (地面)
+    back_vec = [ankle_pos[i] - toe_pos[i] for i in range(3)]
+    heel_pos = [ankle_pos[0] + back_vec[0] * 0.4,
+                0.0,
+                ankle_pos[2] + back_vec[2] * 0.4]
+    ball_pos = [(ankle_pos[0] + toe_pos[0]) * 0.5,
+                0.0,
+                (ankle_pos[2] + toe_pos[2]) * 0.5]
+    toe_pivot_pos = [toe_pos[0], 0.0, toe_pos[2]]
+
+    label = ankle_joint
+    heel_piv = cmds.group(em=True, n=label + "_heelPiv")
+    cmds.xform(heel_piv, ws=True, t=heel_pos)
+    toe_piv = cmds.group(em=True, n=label + "_toePiv")
+    cmds.xform(toe_piv, ws=True, t=toe_pivot_pos)
+    cmds.parent(toe_piv, heel_piv)
+    ball_piv = cmds.group(em=True, n=label + "_ballPiv")
+    cmds.xform(ball_piv, ws=True, t=ball_pos)
+    cmds.parent(ball_piv, toe_piv)
+
+    # 既存の pointConstraint (ik_ctl -> foot_ikh) を削除。
+    # そうしないと pivot chain の rotation で handle 位置が動いても
+    # constraint が override して IK が再ソルブしない。
+    pt_cons = cmds.listConnections(foot_ikh + ".translateX",
+                                    s=True, d=False, type="pointConstraint") or []
+    for pc in set(pt_cons):
+        try: cmds.delete(pc)
+        except Exception: pass
+
+    # foot IK handle を ball_piv の下に。以降は pivot chain の world transform
+    # (heel -> toe -> ball) だけで handle が動く。
+    try:
+        cmds.parent(foot_ikh, ball_piv)
+    except Exception:
+        pass
+
+    # ankle -> toe の SC IK handle (toe を持ち上げる用)
+    try:
+        toe_ikh = cmds.ikHandle(sj=ankle_joint, ee=toe_joint,
+                                sol="ikSCsolver", n=label + "_toeIkh")[0]
+        cmds.parent(toe_ikh, toe_piv)
+    except Exception as exc:
+        cmds.warning(f"[attach_ctrls] toe ikHandle failed for {ankle_joint}: {exc}")
+        toe_ikh = None
+
+    # heel_piv を foot IK ctl の下に (ctl を動かすと全 pivot chain が追従)
+    try:
+        cmds.parent(heel_piv, foot_ik_ctl)
+    except Exception:
+        pass
+
+    # attrs on foot IK ctl
+    for attr, dv in [("footRoll", 0.0), ("toeRoll", 0.0),
+                     ("heelRoll", 0.0), ("footBank", 0.0)]:
+        if not cmds.attributeQuery(attr, node=foot_ik_ctl, exists=True):
+            cmds.addAttr(foot_ik_ctl, ln=attr, at="float", k=True, dv=dv)
+
+    # 接続:
+    #   heelRoll -> heel_piv.rotateX (かかとを地面に付けたまま足首上げ)
+    #   footRoll -> ball_piv.rotateX (ボール位置で足全体を前傾)
+    #   toeRoll  -> toe_piv.rotateX  (爪先立ち)
+    #   footBank -> heel_piv.rotateZ (横倒し)
+    try:
+        cmds.connectAttr(foot_ik_ctl + ".heelRoll", heel_piv + ".rotateX")
+        cmds.connectAttr(foot_ik_ctl + ".footRoll", ball_piv + ".rotateX")
+        cmds.connectAttr(foot_ik_ctl + ".toeRoll",  toe_piv  + ".rotateX")
+        cmds.connectAttr(foot_ik_ctl + ".footBank", heel_piv + ".rotateZ")
+    except Exception as exc:
+        cmds.warning(f"[attach_ctrls] reverse foot connect failed: {exc}")
+
+    print(f"[{_PACKAGE}] Reverse foot: {ankle_joint} heel/ball/toe pivots + "
+          f"footRoll/toeRoll/heelRoll/footBank on {foot_ik_ctl}")
+    return {
+        "heel_piv": heel_piv, "ball_piv": ball_piv, "toe_piv": toe_piv,
+        "toe_ikh": toe_ikh,
+    }
+
+
 def setup_all_ik_fk():
-    """検出できた L/R arm/leg 全てに IK/FK rig を構築。"""
+    """検出できた L/R arm/leg 全てに IK/FK rig を構築。leg には reverse foot も。"""
     chains = find_ik_chains()
     results = []
     for label, chain in chains.items():
@@ -868,6 +987,11 @@ def setup_all_ik_fk():
         try:
             r = setup_ik_fk(chain[0], chain[1], chain[2], side=side)
             results.append(r)
+            # leg なら reverse foot も試みる
+            if "leg" in label:
+                rf = setup_reverse_foot(chain[2], r["ik_ctl"], r["ik_handle"], side=side)
+                if rf:
+                    r["reverse_foot"] = rf
         except Exception as exc:
             cmds.warning(f"[attach_ctrls] IK setup for {label} failed: {exc}")
     print(f"[{_PACKAGE}] setup_all_ik_fk: {len(results)}/{len(chains)} chains")
@@ -996,6 +1120,16 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     # Step 3: cleanup
     if delete_junk:
         delete_unnecessary()
+
+    # Step 3.5: joint radius を mesh diag 相対で小さく (骨自体の viewport 表示縮小)
+    diag = _scene_mesh_bbox_diag()
+    joint_radius = max(0.05, diag / 400.0)
+    for j in cmds.ls(type="joint") or []:
+        try:
+            cmds.setAttr(j + ".radius", joint_radius)
+        except Exception:
+            pass
+    print(f"[{_PACKAGE}] joint radius set to {joint_radius:.3f} (diag/400)")
 
     # Step 4: root/main ctls を作成 (地面のオクタゴン + 主体 box)
     #         attach_ctrls_grp の直下、他の ctl の親になる
