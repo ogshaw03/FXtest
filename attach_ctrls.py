@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.8.3"
+__version__ = "0.8.4"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -881,7 +881,11 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         # これで wrist_ik 経由の local-space 不整合が消え、TWIST scout 報告の
         # 手首捻れ (arm_R wrist 127°) が解消する。
         ikj_source = ik_ctl if orig == end else ikj
-        cons = cmds.orientConstraint(fkj, ikj_source, orig, mo=True,
+        # end joint は mo=False で offset 蓄積を防ぐ (ik_ctl と world rot 一致
+        # 済なので offset 不要)。これで wrist 微小 drift が fingers に cascade
+        # して middle_3_R が 17 unit 飛ぶ問題を解消。
+        use_mo = (orig != end)
+        cons = cmds.orientConstraint(fkj, ikj_source, orig, mo=use_mo,
                                      n=orig + "_ikfk_oc")[0]
         wal = cmds.orientConstraint(cons, q=True, wal=True)  # [fkW, ikW]
         cmds.connectAttr(rev + ".outputX",  cons + "." + wal[0])
