@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -838,10 +838,13 @@ def _compute_pv_position(start_pos, mid_pos, end_pos, distance, fallback_dir=Non
     pole_dir = [mid_pos[i] - projected[i] for i in range(3)]
     pole_len = math.sqrt(sum(a*a for a in pole_dir))
 
-    # chain plane 判定不安定な時のみ fallback_dir を採用 (PVFIX scout 発見:
-    # 閾値 len_se*0.1 は広すぎて Nekotatune の arm/leg 両方が fallback に落ち
-    # PV が平面外にズレていた。絶対 0.05 unit 未満のみ fallback に絞る)。
-    if pole_len < max(len_se * 0.02, 0.05):
+    # fallback を使うか判定。LEGPV scout 発見: Nekotatune の脚は tiny bend
+    # (2 unit / chain 58 = 3.4%) を amplify すると PV が反対側へ飛ぶ。
+    # bind pose (T-pose) では natural bend は基本 noise なので、fallback_dir
+    # が指定されていたら 常に fallback を優先する (chain plane に射影して使う)。
+    # fallback_dir 無指定時のみ natural bend を使う (pose 済 chain 想定)。
+    use_fallback = (fallback_dir is not None) or (pole_len < max(len_se * 0.02, 0.05))
+    if use_fallback:
         if fallback_dir is not None:
             pd = list(fallback_dir)
             # fallback は v_se 方向成分を差し引いて chain 平面に強制射影
@@ -999,13 +1002,13 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     mid_pos = cmds.xform(mid, q=True, ws=True, t=True)
     end_pos = cmds.xform(end, q=True, ws=True, t=True)
     if pv_offset is None:
-        # PVFIX scout 発見: mesh diag 依存だと chain 長差 (arm 32 / leg 58) が
-        # 無視されて leg の PV が近すぎ (18 unit)。chain 実長さから決めれば
-        # スケール変化にも耐性ある妥当な位置になる。
+        # SPIDERMAN scout 実測: arm 0.71 / leg 0.60 × chain_len が Spider-Man
+        # (mGear 出力) の実位置比率。掴みやすさと画面圧迫のバランス。
         import math as _math
         chain_len = _math.sqrt(sum(
             (end_pos[i] - start_pos[i])**2 for i in range(3)))
-        base_offset = chain_len * 0.6
+        is_leg_pv = "leg" in label.lower()
+        base_offset = chain_len * (0.60 if is_leg_pv else 0.71)
     else:
         base_offset = pv_offset
     # T-pose straight chain の fallback: 腕は後方 (-Z), 脚は前方 (+Z)
@@ -1042,12 +1045,13 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     cmds.parent(fk_ctls[0][0], ROOT_GROUP)
 
     # --- 6. Switch attribute (UI host ctl に集約、mGear 慣習に合わせる) ---
-    # UI host は chain の end joint 付近に配置 (掴みやすさ)
+    # UI host は wrist/ankle から少し離した目立つ位置に配置 (ユーザ意向:
+    # 「手首の近くにあるオプションコントローラー」で switch / roll を制御)。
     end_pos = cmds.xform(end, q=True, ws=True, t=True)
-    ui_offset = diag / 25.0  # 少し離した位置に浮かべる
+    ui_offset = diag / 15.0  # v0.9.6 の diag/25 より離して掴みやすく
     ui_pos = (end_pos[0] + (ui_offset if side == "L" else -ui_offset),
-              end_pos[1] + ui_offset * 0.5, end_pos[2])
-    ui_host = _create_ui_host_ctl(label, ui_pos, ik_size * 0.6, side)
+              end_pos[1] + ui_offset * 0.6, end_pos[2])
+    ui_host = _create_ui_host_ctl(label, ui_pos, ik_size * 0.9, side)
     # divider (Channel Box 見出し) + 主要 attr
     if not cmds.attributeQuery("__" + label + "__", node=ui_host, exists=True):
         cmds.addAttr(ui_host, ln="__" + label + "__", at="enum", en=label,
@@ -1121,22 +1125,10 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         except Exception:
             pass
 
-    # 互換: IK ctl にも IK_FK を持たせる (proxy attribute で双方向編集可)
-    # proxy 先は master の `_blend` (IK_FK は driven なので書けない)。
-    if not cmds.attributeQuery("IK_FK", node=ik_ctl, exists=True):
-        try:
-            # Maya 2019+ の proxy attribute
-            cmds.addAttr(ik_ctl, ln="IK_FK",
-                         proxy=ui_host + "." + blend_attr, k=True)
-        except Exception:
-            # フォールバック: proxy 未対応環境なら通常 attr + connect
-            cmds.addAttr(ik_ctl, ln="IK_FK", at="float",
-                         min=0.0, max=1.0, dv=1.0, k=True)
-            try:
-                cmds.connectAttr(ui_host + "." + blend_attr,
-                                 ik_ctl + ".IK_FK", f=True)
-            except Exception:
-                pass
+    # v0.9.7: ik_ctl.IK_FK proxy を削除 (SPIDERMAN scout + ユーザ意向:
+    # 「IKFKSwitch が色んな controller に紐付いててややこしい」)。
+    # switch は UI host (option ctl) 一本に集約、UI host 選択 → 右クリ →
+    # mGear IK/FK Switch という一貫フローに統一。
 
     rev = cmds.createNode("reverse", n=label + "_ikfk_rev")
     cmds.connectAttr(ui_host + ".IK_FK", rev + ".inputX")
@@ -1155,7 +1147,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                                      n=orig + "_ikfk_oc")[0]
         wal = cmds.orientConstraint(cons, q=True, wal=True)  # [fkW, ikW]
         cmds.connectAttr(rev + ".outputX",  cons + "." + wal[0])
-        cmds.connectAttr(ik_ctl + ".IK_FK", cons + "." + wal[1])
+        cmds.connectAttr(ui_host + ".IK_FK", cons + "." + wal[1])
     # 従来の orientConstraint(ik_ctl, wrist_ik, mo=True) は削除
     # (wrist_ik を driven する必要が無くなった)
 
@@ -1843,17 +1835,30 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
 
 
 def _create_ui_host_ctl(label, world_pos, size, side):
-    """mGear armUI/legUI 相当の設定 host ctl を生成 (小さい平面 square)。
+    """IK/FK Switch / foot roll 等の attr を集約する option ctl。
 
-    ここに IK_FK / foot roll 系 attr を集約して Channel Box を整理する。
-    形状は degree-1 quad (見つけやすい浮遊パネル)。
+    ユーザ意向 (v0.9.7): 「手首の近くにあるオプションコントローラーみたい
+    なやつからそのへんは制御したい」→ 目立つ形状にして wrist/ankle 側に
+    明確に配置。mGear の armUI 相当だが text ではなく八角+内部十字で
+    ・見つけやすさ (colored bright)
+    ・ここに attr が集約されてる感 (円+cross = "settings" icon 風)
+    を出す。
     """
     host_name = label + "_UI_ctl"
     if cmds.objExists(host_name):
         return host_name
-    s = size * 0.5
-    pts = [(-s,0,-s), (s,0,-s), (s,0,s), (-s,0,s), (-s,0,-s),
-           (0,0,-s), (0,0,s), (s,0,0), (-s,0,0)]  # 井桁
+    import math as _mm
+    s = size * 0.9  # v0.9.6 以前の井桁より大きめ、目立たせる
+    # 外周: octagon (8 sides + close)
+    sides = 8
+    pts = [(s * _mm.cos(2*_mm.pi*i/sides),
+            0,
+            s * _mm.sin(2*_mm.pi*i/sides)) for i in range(sides + 1)]
+    # 内部十字 (見つけやすい settings icon 感)
+    cross = [(0,0,0), (s*0.7,0,0), (0,0,0),
+             (-s*0.7,0,0), (0,0,0), (0,0,s*0.7),
+             (0,0,0), (0,0,-s*0.7)]
+    pts.extend(cross)
     host = cmds.curve(d=1, p=pts, n=host_name)
     _set_ctl_color(host, COLOR_UI)
     host_npo = cmds.group(em=True, n=label + "_UI_npo")

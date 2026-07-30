@@ -120,8 +120,11 @@ try:
     step("ik_ctls_count", len(ik_ctls) >= 4, f"ik_ctls={ik_ctls}")
     step("pv_ctls_count", len(pv_ctls) >= 4, f"pv_ctls={pv_ctls}")
 
-    ok_attr = sum(1 for ic in ik_ctls if cmds.attributeQuery("IK_FK", node=ic, exists=True))
-    step("ik_ctls_have_IK_FK_attr", ok_attr == len(ik_ctls), f"{ok_attr}/{len(ik_ctls)}")
+    # v0.9.7: IK/FK Switch は UI host に一本化 (SPIDERMAN scout 提案 +
+    # ユーザ意向「IKFKSwitch がいろんな controller に紐付いてややこしい」)
+    ui_hosts = cmds.ls("*_UI_ctl", type="transform") or []
+    ok_attr = sum(1 for uh in ui_hosts if cmds.attributeQuery("IK_FK", node=uh, exists=True))
+    step("ui_hosts_have_IK_FK_attr", ok_attr >= 4, f"{ok_attr}/{len(ui_hosts)}")
 
     # --- Functional IK/FK per chain ---
     functional_pass = 0; functional_check = 0
@@ -138,7 +141,7 @@ try:
         functional_check += 2
 
         # FK: rotate FK ctl -> hero joint world orient changes
-        cmds.setAttr(ik_ctl + ".IK_FK", 0)
+        cmds.setAttr(chain_label + "_UI_ctl." + chain_label + "_blend", 0)
         for a in ("rotateX","rotateY","rotateZ"):
             cmds.setAttr(fk_ctl_mid + "." + a, 0)
         # 世界回転で比較する (local rotate は twist bones との親空間差で正確に測れないケースあり)
@@ -156,7 +159,7 @@ try:
         cmds.setAttr(fk_ctl_mid + ".rotateX", 0)
 
         # IK
-        cmds.setAttr(ik_ctl + ".IK_FK", 1)
+        cmds.setAttr(chain_label + "_UI_ctl." + chain_label + "_blend", 1)
         for a in ("translateX","translateY","translateZ"):
             cmds.setAttr(ik_ctl + "." + a, 0)
         ctl_ws = cmds.xform(ik_ctl, q=True, ws=True, t=True)
@@ -190,7 +193,7 @@ try:
         if not cmds.objExists(ik_ctl):
             continue
         # 初期化 -> IK ON
-        cmds.setAttr(ik_ctl + ".IK_FK", 1)
+        cmds.setAttr(chain_label + "_UI_ctl." + chain_label + "_blend", 1)
         for a in ("translateX","translateY","translateZ"):
             cmds.setAttr(ik_ctl + "." + a, 0)
         # twist bones の rot を記録
@@ -224,7 +227,7 @@ try:
             finger_names.append(cand)
     if finger_names and cmds.objExists("arm_L_IK_ctl") and cmds.objExists("wrist_L"):
         # IK ON, move IK ctl, verify finger follows
-        cmds.setAttr("arm_L_IK_ctl.IK_FK", 1)
+        cmds.setAttr("arm_L_UI_ctl.arm_L_blend", 1)
         for a in ("translateX","translateY","translateZ"):
             cmds.setAttr("arm_L_IK_ctl." + a, 0)
         finger_before = {n: cmds.xform(n, q=True, ws=True, t=True) for n in finger_names}
@@ -257,7 +260,11 @@ try:
         # Ensure IK ON for both legs
         for ctl in ("leg_L_IK_ctl","leg_R_IK_ctl"):
             if cmds.objExists(ctl):
-                cmds.setAttr(ctl + ".IK_FK", 1)
+                side_lbl = "leg_L" if "leg_L" in ctl else "leg_R"
+                try:
+                    cmds.setAttr(side_lbl + "_UI_ctl." + side_lbl + "_blend", 1)
+                except Exception:
+                    pass
                 for a in ("translateX","translateY","translateZ"):
                     cmds.setAttr(ctl + "." + a, 0)
 
