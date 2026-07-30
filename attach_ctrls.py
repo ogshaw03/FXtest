@@ -747,7 +747,11 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     cmds.xform(pv_npo, ws=True,
                t=(mid_pos[0], mid_pos[1], mid_pos[2] + z_off))
     cmds.parent(pv_npo, ROOT_GROUP)
-    cmds.poleVectorConstraint(pv_ctl, ik_handle)
+    # NOTE: poleVectorConstraint はここでは張らない。
+    #       張ると IK 再ソルブが走り clean chain の rotate が bind から drift、
+    #       そのまま mo=True で orient blend を作ると offset が不整合になり、
+    #       PV を動かすたびに hero joint (wrist_L 等) が振り回される。
+    #       → step 7 の orient blend 構築が済んだ後 (step 8) で PV constraint を張る。
     _lock_hide_attrs(pv_ctl, ["sx", "sy", "sz", "rx", "ry", "rz"])
 
     # --- 5. FK ctls (clean FK chain の各 joint を drive) ---
@@ -787,6 +791,12 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     # end joint に IK ctl の rotation も反映 (手/足の向き制御)
     end_orient_cons = cmds.orientConstraint(ik_ctl, wrist_ik, mo=True,
                                             n=end + "_ik_orient_oc")[0]
+
+    # --- 8. Pole vector constraint (orient blend 構築の後で張る) ---
+    # ここで初めて IK re-solve が発生するが、既に orient blend の mo=True offset
+    # は bind (ik_j == fk_j == orig 全部同じ) で捕捉済みなので、以降の PV 操作は
+    # hero joint を bind から drift させない。
+    cmds.poleVectorConstraint(pv_ctl, ik_handle)
 
     # --- 8. Visibility ---
     try: cmds.setAttr(ik_ctl + ".v", lock=False)
