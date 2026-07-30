@@ -356,21 +356,48 @@ def _make_square_curve(name, scale=1.0):
     return ctl
 
 
+def _make_wide_flat_box_curve(name, scale=1.0):
+    """腰 (waist) 用: 横長 flat box (床置きイメージ)。"""
+    return _make_flat_box_curve(name, scale, x_ratio=2.4, z_ratio=1.6)
+
+
 # --- 骨名パターン -> ctl shape maker マッピング ---
-# キー: substring (小文字), 値: (maker 関数, scale multiplier)
 def _pick_ctl_maker(joint_name):
-    """joint 名から適切な maker function と scale multiplier を返す。"""
+    """joint 名から (maker function, absolute_size または None) を返す。
+    absolute_size が None なら auto_ctl_scale を使う。
+    背骨/waist/lower_body 系は mesh bbox の割合で絶対サイズ指定 → mesh を外側で囲む。"""
     n = joint_name.split(":")[-1].lower()
-    # 完全に区別したいもの: 背骨/首/head
-    if any(k in n for k in ("upper_body", "lower_body", "waist", "neck", "chest")):
-        return _make_ring_curve, 1.2  # 水平リング、少し大きめ
-    if "head" == n or n.endswith("_head") or n == "head":
-        return _make_cube_curve, 0.9
+    diag = _scene_mesh_bbox_diag()
+
+    # 腰 (waist): 一番目立たせる、横長 flat box
+    if n == "waist":
+        return _make_wide_flat_box_curve, diag * 0.19
+
+    # 上半身/上半身2 chest 系: 水平リング (胸幅を覆う)
+    if "upper_body" in n or "chest" in n:
+        # upper_body_2 は upper_body より少し小さく (nested 演出)
+        base = 0.16 if n == "upper_body_2" else 0.18
+        return _make_ring_curve, diag * base
+
+    # 下半身 (lower_body): 水平リング (骨盤幅を覆う)
+    if "lower_body" in n:
+        return _make_ring_curve, diag * 0.20
+
+    # 首 (neck): 小さめリング
+    if "neck" in n:
+        return _make_ring_curve, diag * 0.05
+
+    # 頭 (head): cube (顔幅を包む)
+    if n == "head" or n.endswith("_head"):
+        return _make_cube_curve, diag * 0.09
+
+    # 指
     if any(n.startswith(k) or ("_" + k) in n for k in
            ("thumb", "index", "middle", "ring", "pinky", "finger")):
-        return _make_square_curve, 0.7  # 指: 小さめ square
-    # default
-    return _make_cube_curve, 1.0
+        return _make_square_curve, None  # 指は auto (bone-length 準拠、小さい)
+
+    # default: cube, auto scale
+    return _make_cube_curve, None
 
 
 def _set_ctl_color(ctl, color_idx):
@@ -442,15 +469,16 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
         else:
             color = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
 
-        # 自動サイズ
-        if auto_scale:
-            base_size = _auto_ctl_scale(jnt, mult=scale)
+        # 骨タイプに応じた shape 選定
+        maker, absolute_size = _pick_ctl_maker(jnt)
+        if absolute_size is not None:
+            # 背骨/waist/head 系は mesh bbox の割合で固定 (mesh を外側で囲む)
+            ctl_size = absolute_size * scale  # scale slider で全体調整可
+        elif auto_scale:
+            ctl_size = _auto_ctl_scale(jnt, mult=scale)
         else:
-            base_size = scale
+            ctl_size = scale
 
-        # 骨タイプに応じた shape
-        maker, shape_mult = _pick_ctl_maker(jnt)
-        ctl_size = base_size * shape_mult
         ctl = maker(ctl_name, scale=ctl_size)
         _set_ctl_color(ctl, color)
 
