@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -819,10 +819,40 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                                             n=end + "_ik_orient_oc")[0]
 
     # --- 8. Pole vector constraint (orient blend 構築の後で張る) ---
-    # ここで初めて IK re-solve が発生するが、既に orient blend の mo=True offset
-    # は bind (ik_j == fk_j == orig 全部同じ) で捕捉済みなので、以降の PV 操作は
-    # hero joint を bind から drift させない。
+    # 記録: bind pose の hero start joint 世界回転 (twist 補正判定用)
+    def _rot_diff_max(j, ref_rot):
+        cur = [cmds.getAttr(j + "." + a) for a in ("rx","ry","rz")]
+        d = [abs((cur[i] - ref_rot[i] + 180) % 360 - 180) for i in range(3)]
+        return max(d)
+    bind_start_rot = [cmds.getAttr(start + "." + a) for a in ("rx","ry","rz")]
+
     cmds.poleVectorConstraint(pv_ctl, ik_handle)
+
+    # --- 8.5. Twist 自動補正 (RP solver plane flip 対策) ---
+    # まっすぐな arm 系 chain で RP solver は plane を誤選択、PV 適用で hero が
+    # 180° 反転することがある。twist attr を 0/±30/±60/±90/±120/±150/180 で
+    # 総当りして bind rot に最も近い値を採用。
+    #
+    # 常に総当り評価 (skip しない): threshold で分岐すると arm_R 85° drift のような
+    # ケースを見落とす。
+    _twist_candidates = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180]
+    best_twist = 0.0
+    best_drift = _rot_diff_max(start, bind_start_rot)
+    for twist_try in _twist_candidates:
+        try:
+            cmds.setAttr(ik_handle + ".twist", float(twist_try))
+            d = _rot_diff_max(start, bind_start_rot)
+            if d < best_drift:
+                best_drift = d
+                best_twist = float(twist_try)
+        except Exception:
+            pass
+    try:
+        cmds.setAttr(ik_handle + ".twist", best_twist)
+    except Exception:
+        pass
+    init_drift = _rot_diff_max(start, bind_start_rot)  # after setting best
+    print(f"[{_PACKAGE}] {label} twist={best_twist}° (final drift {init_drift:.1f}°)")
 
     # --- 8. Visibility ---
     try: cmds.setAttr(ik_ctl + ".v", lock=False)
@@ -900,15 +930,29 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     ankle_pos = cmds.xform(ankle_joint, q=True, ws=True, t=True)
     toe_pos = cmds.xform(toe_joint, q=True, ws=True, t=True)
 
-    # heel: ankle 後方 (toe と反対方向) 0.4 倍、Y=0 (地面)
+    # 地面 Y: mesh 全体の最下端 (足元) を使う。Y=0 固定だと空中に浮く。
+    ground_y = 0.0
+    try:
+        meshes = cmds.ls(type="mesh") or []
+        tforms = set()
+        for m in meshes:
+            p = cmds.listRelatives(m, p=True, f=True) or []
+            if p: tforms.add(p[0])
+        if tforms:
+            bb = cmds.exactWorldBoundingBox(list(tforms))
+            ground_y = bb[1]  # ymin
+    except Exception:
+        pass
+
+    # heel: ankle 後方 (toe と反対方向) 0.4 倍、Y=ground
     back_vec = [ankle_pos[i] - toe_pos[i] for i in range(3)]
     heel_pos = [ankle_pos[0] + back_vec[0] * 0.4,
-                0.0,
+                ground_y,
                 ankle_pos[2] + back_vec[2] * 0.4]
     ball_pos = [(ankle_pos[0] + toe_pos[0]) * 0.5,
-                0.0,
+                ground_y,
                 (ankle_pos[2] + toe_pos[2]) * 0.5]
-    toe_pivot_pos = [toe_pos[0], 0.0, toe_pos[2]]
+    toe_pivot_pos = [toe_pos[0], ground_y, toe_pos[2]]
 
     label = ankle_joint
     heel_piv = cmds.group(em=True, n=label + "_heelPiv")
@@ -945,9 +989,16 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
         cmds.warning(f"[attach_ctrls] toe ikHandle failed for {ankle_joint}: {exc}")
         toe_ikh = None
 
-    # heel_piv を foot IK ctl の下に (ctl を動かすと全 pivot chain が追従)
+    # heel_piv を foot IK ctl の下に置くと ctl (=ankle joint rot 継承) の局所軸で
+    # pivot が回転してしまい footRoll が水平スライドになる。ctl と heel_piv の間に
+    # world-aligned な offset group を挟んで world 軸で回転させる。
+    piv_root = cmds.group(em=True, n=ankle_joint + "_pivRoot")
+    # piv_root は identity rot (world-aligned) で ctl の子に
+    cmds.parent(piv_root, foot_ik_ctl)
+    cmds.xform(piv_root, os=True, t=(0,0,0), ro=(0,0,0))
+    # heel_piv をそこに parent (world 位置は preserve)
     try:
-        cmds.parent(heel_piv, foot_ik_ctl)
+        cmds.parent(heel_piv, piv_root)
     except Exception:
         pass
 
