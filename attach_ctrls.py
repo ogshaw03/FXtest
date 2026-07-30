@@ -755,6 +755,13 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         except Exception: pass
 
     # --- 2. IK handle on CLEAN chain ---
+    # 現ポーズを preferredAngle に保存してから ikHandle 作成。これをしないと
+    # RP solver が bind ポーズを "曖昧" と判定して chain を数度回転させ、
+    # orient blend の offset が非ゼロになり hero chain が 2.84 unit drift する
+    # (ctl は正しい位置にあるが joint が移動して見える現象)。
+    for j in ik_chain:
+        try: cmds.joint(j, e=True, spa=True)
+        except Exception: pass
     ik_handle = cmds.ikHandle(sj=arm_ik, ee=wrist_ik,
                               sol="ikRPsolver", n=label + "_ikh")[0]
     # IK handle は attach_ctrls_grp 下に (元 chain 内に置かないほうが管理しやすい)
@@ -1307,6 +1314,10 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     ankle_ik = ankle_joint + "_ik"
     toe_ik = toe_joint + "_ik"
     if cmds.objExists(ankle_ik) and cmds.objExists(toe_ik):
+        # preferredAngle を現ポーズで固定 (setup_ik_fk と同理由の re-solve 回避)
+        for j in (ankle_ik, toe_ik):
+            try: cmds.joint(j, e=True, spa=True)
+            except Exception: pass
         try:
             toe_ikh = cmds.ikHandle(sj=ankle_ik, ee=toe_ik,
                                     sol="ikSCsolver", n=label + "_toeIkh")[0]
@@ -1591,10 +1602,10 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     if delete_junk:
         delete_unnecessary()
 
-    # Step 3.5: joint radius を mesh diag 相対で **かなり小さく** (骨の viewport 表示縮小)
-    # ユーザー要望で diag/400 → diag/1000 に (ほぼ点表示)
+    # Step 3.5: joint radius を最小限に (骨の viewport 表示は ctl を邪魔しない程度)
+    # ユーザー要望: 固定 0.016 (mesh scale 依存を外して常に極小)
     diag = _scene_mesh_bbox_diag()
-    joint_radius = max(0.02, diag / 1000.0)
+    joint_radius = 0.016
     for j in cmds.ls(type="joint") or []:
         try:
             cmds.setAttr(j + ".radius", joint_radius)
