@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -100,6 +100,82 @@ def _is_decoration(joint_name):
 
 
 # --- Auto ctl scale (bone length ベース) ---
+
+_MESH_FRONT_OFFSET_TOKENS = ("breast", "chest_l", "chest_r", "buttock")
+
+
+def _needs_mesh_front_offset(joint_name):
+    """胸や尻など、joint 位置が mesh 内部にあり ctl が埋没する骨を判定。"""
+    n = joint_name.split(":")[-1].split("|")[-1].lower()
+    return any(n.startswith(t) or ("_" + t) in n for t in _MESH_FRONT_OFFSET_TOKENS)
+
+
+def _mesh_front_offset(joint, weight_thresh=0.3, min_verts=5, search_radius=15.0):
+    """joint が影響する mesh の高重み vtx 重心 - joint pos を返す。
+    ctl の CV を world 相対でこの vec 分 shift すれば mesh 前面に飛ばせる。
+    無理なら None。
+
+    高速化: 86k vtx の全 skinPercent は遅いので、joint 近傍
+    (search_radius 内) の vtx だけを候補にして weight 判定する。
+    """
+    if cmds is None:
+        return None
+    jp = cmds.xform(joint, q=True, ws=True, t=True)
+    scs = cmds.listConnections(joint + ".worldMatrix", type="skinCluster",
+                                d=True, s=False) or []
+    scs = list(set(scs))
+    if not scs:
+        for sc in cmds.ls(type="skinCluster") or []:
+            try:
+                if joint in (cmds.skinCluster(sc, q=True, inf=True) or []):
+                    scs.append(sc)
+            except Exception:
+                pass
+    if not scs:
+        return None
+    r2 = search_radius * search_radius
+    for sc in scs:
+        try:
+            geo = cmds.skinCluster(sc, q=True, g=True) or []
+        except Exception:
+            continue
+        if not geo:
+            continue
+        mesh = geo[0]
+        try:
+            nv = cmds.polyEvaluate(mesh, v=True)
+        except Exception:
+            nv = 0
+        if not nv:
+            continue
+        # 1. joint bbox 半径内の vtx を絞り込み (距離判定は cheap)
+        near = []
+        for i in range(nv):
+            try:
+                p = cmds.xform(f"{mesh}.vtx[{i}]", q=True, ws=True, t=True)
+            except Exception:
+                continue
+            d2 = ((p[0]-jp[0])**2 + (p[1]-jp[1])**2 + (p[2]-jp[2])**2)
+            if d2 <= r2:
+                near.append((i, p))
+        # 2. 近傍 vtx について weight 判定
+        hi = []
+        for i, p in near:
+            try:
+                w = cmds.skinPercent(sc, f"{mesh}.vtx[{i}]",
+                                     transform=joint, q=True)
+            except Exception:
+                continue
+            if w is not None and w >= weight_thresh:
+                hi.append(p)
+        if len(hi) < min_verts:
+            continue
+        cx = sum(p[0] for p in hi) / len(hi)
+        cy = sum(p[1] for p in hi) / len(hi)
+        cz = sum(p[2] for p in hi) / len(hi)
+        return (cx - jp[0], cy - jp[1], cz - jp[2])
+    return None
+
 
 def _bone_length(joint):
     """joint から最初の child joint までの距離。無ければ parent 距離。0 なら None。"""
@@ -428,6 +504,29 @@ def _rewrite_flat_horizontal(ctl_name, world_pos, scale, maker):
             pass
 
 
+def _mark_as_ctl(ctl):
+    """mGear (dagMenuProc override) が右クリックで controller menu を出せるよう
+    marker attr を付ける。mGear は message attr `isCtl` を主に検出するので
+    それを bool + message の両方で set。既存 rig との互換性確保。
+    """
+    for attr, kind, kwargs in (
+        ("isCtl", "bool", {"dv": True, "k": False}),
+        ("is_ctl", "bool", {"dv": True, "k": False}),
+    ):
+        try:
+            if not cmds.attributeQuery(attr, node=ctl, exists=True):
+                cmds.addAttr(ctl, ln=attr, at=kind, **kwargs)
+            cmds.setAttr(ctl + "." + attr, channelBox=False)
+        except Exception:
+            pass
+    # Maya 標準の "controller" tag も付けておく (2019+ で右クリック
+    # pick-walking / marking menu が有効化される)
+    try:
+        cmds.controller(ctl)
+    except Exception:
+        pass
+
+
 def _set_ctl_color(ctl, color_idx):
     shape = cmds.listRelatives(ctl, s=True, f=False)
     if not shape:
@@ -513,6 +612,7 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
 
         ctl = maker(ctl_name, scale=ctl_size)
         _set_ctl_color(ctl, color)
+        _mark_as_ctl(ctl)
 
         npo = cmds.group(em=True, name=npo_name)
         cmds.parent(ctl, npo)
@@ -526,6 +626,17 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
         if flat_horizontal:
             joint_ws = cmds.xform(jnt, q=True, ws=True, t=True)
             _rewrite_flat_horizontal(ctl, joint_ws, ctl_size, maker)
+        elif _needs_mesh_front_offset(jnt):
+            # 胸 (breast) 等 joint が mesh 内部に埋まる骨は、shape の CV だけを
+            # mesh 前面重心へ world 相対 shift。transform は joint 位置維持で
+            # parentConstraint に影響なし (BREAST scout 発見)。
+            off = _mesh_front_offset(jnt)
+            if off:
+                try:
+                    cmds.move(off[0], off[1], off[2],
+                              ctl + ".cv[*]", relative=True, worldSpace=True)
+                except Exception:
+                    pass
 
         _lock_hide_attrs(ctl, ["sx", "sy", "sz", "v"])
 
@@ -959,6 +1070,70 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
           f"(total drift {final_total:.1f}°, per-joint: "
           f"{ {k.split('|')[-1]: round(v,1) for k,v in final_per_j.items()} })")
 
+    # --- 8.7. Stretch (ui_host.stretch attr で ON/OFF blend) ---
+    # 標準 IK stretch: chain root ↔ IK ctl の距離が rest_len を超えたら
+    # 各 bone の translate をスケール。stretch attr で ON/OFF blend。
+    # hero chain も translate 駆動 (IK モード時のみ) しないとメッシュが届かない。
+    try:
+        import math as _sm
+        # rest_len は clean IK chain の bind 時 bone 長総和 (chain 全長)
+        p0 = cmds.xform(arm_ik, q=True, ws=True, t=True)
+        p1 = cmds.xform(mid_ik if False else ik_chain[1], q=True, ws=True, t=True)
+        p2 = cmds.xform(wrist_ik, q=True, ws=True, t=True)
+        rest_len = (_sm.sqrt(sum((a-b)**2 for a, b in zip(p0, p1))) +
+                    _sm.sqrt(sum((a-b)**2 for a, b in zip(p1, p2))))
+        if rest_len > 1e-4:
+            # 距離ノード: arm_ik root ↔ IK ctl
+            db = cmds.createNode("distanceBetween", n=label + "_stretch_dist")
+            cmds.connectAttr(arm_ik + ".worldMatrix[0]", db + ".inMatrix1")
+            cmds.connectAttr(ik_ctl + ".worldMatrix[0]", db + ".inMatrix2")
+            # 距離 / rest_len
+            div = cmds.createNode("multiplyDivide", n=label + "_stretch_div")
+            cmds.setAttr(div + ".operation", 2)  # divide
+            cmds.connectAttr(db + ".distance", div + ".input1X")
+            cmds.setAttr(div + ".input2X", rest_len)
+            # rest_len 超え時のみ scale 適用 (それ以下は 1.0 で bone 短縮を防ぐ)
+            cnd = cmds.createNode("condition", n=label + "_stretch_cond")
+            cmds.setAttr(cnd + ".operation", 2)  # greater
+            cmds.connectAttr(db + ".distance", cnd + ".firstTerm")
+            cmds.setAttr(cnd + ".secondTerm", rest_len)
+            cmds.connectAttr(div + ".outputX", cnd + ".colorIfTrueR")
+            cmds.setAttr(cnd + ".colorIfFalseR", 1.0)
+            # stretch attr で 1.0 (off) ↔ scale (on) blend
+            bta = cmds.createNode("blendTwoAttr", n=label + "_stretch_blend")
+            cmds.setAttr(bta + ".input[0]", 1.0)
+            cmds.connectAttr(cnd + ".outColorR", bta + ".input[1]")
+            cmds.connectAttr(ui_host + ".stretch", bta + ".attributesBlender")
+            # IK chain bones の translate に scale 掛ける (elbow_ik と wrist_ik)
+            for b in (ik_chain[1], ik_chain[2]):
+                rest_t = cmds.getAttr(b + ".translate")[0]
+                md = cmds.createNode("multiplyDivide", n=b + "_stretch_mul")
+                cmds.setAttr(md + ".input1", *rest_t)
+                cmds.connectAttr(bta + ".output", md + ".input2X")
+                cmds.connectAttr(bta + ".output", md + ".input2Y")
+                cmds.connectAttr(bta + ".output", md + ".input2Z")
+                cmds.connectAttr(md + ".output", b + ".translate", f=True)
+            # hero chain (mid, end) の translate も IK モード時に scale 追従。
+            # IK_FK gate で FK 時は bind translate 維持。
+            ik_gate = cmds.createNode("blendTwoAttr", n=label + "_stretch_ikgate")
+            cmds.setAttr(ik_gate + ".input[0]", 1.0)
+            cmds.connectAttr(bta + ".output", ik_gate + ".input[1]")
+            cmds.connectAttr(ui_host + ".IK_FK", ik_gate + ".attributesBlender")
+            for h in (mid, end):
+                if cmds.objExists(h):
+                    rest_h = cmds.getAttr(h + ".translate")[0]
+                    md_h = cmds.createNode("multiplyDivide", n=h + "_stretch_mul")
+                    cmds.setAttr(md_h + ".input1", *rest_h)
+                    cmds.connectAttr(ik_gate + ".output", md_h + ".input2X")
+                    cmds.connectAttr(ik_gate + ".output", md_h + ".input2Y")
+                    cmds.connectAttr(ik_gate + ".output", md_h + ".input2Z")
+                    try:
+                        cmds.connectAttr(md_h + ".output", h + ".translate", f=True)
+                    except Exception:
+                        pass
+    except Exception as exc:
+        cmds.warning(f"[attach_ctrls] stretch setup failed for {label}: {exc}")
+
     # --- 8. Visibility (UI host の ikVis/fkVis で明示制御) ---
     try: cmds.setAttr(ik_ctl + ".v", lock=False)
     except Exception: pass
@@ -1341,16 +1516,41 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     # に対応する joint に張って副作用を避ける。もし ankle_ik が無ければ skip。
     ankle_ik = ankle_joint + "_ik"
     toe_ik = toe_joint + "_ik"
-    if cmds.objExists(ankle_ik) and cmds.objExists(toe_ik):
+    # setup_ik_fk は 3-joint chain (leg/knee/ankle) しか dup しないので
+    # toe_L_ik は未生成。それだと SC ikHandle が張れず、ball_ctl を回すと
+    # toe が ankle 階層で丸ごと動く「足全体が動く」バグになる (RFOOT scout
+    # 発見)。ここで toe_ik を ankle_ik の子として自前 dup する。
+    if cmds.objExists(ankle_ik) and not cmds.objExists(toe_ik):
+        try:
+            toe_ik = _dup_hero_joint(toe_joint, "_ik", new_parent=ankle_ik)
+            try: cmds.setAttr(toe_ik + ".drawStyle", 2)
+            except Exception: pass
+        except Exception as exc:
+            cmds.warning(f"[attach_ctrls] toe_ik dup failed: {exc}")
+            toe_ik = None
+    if ankle_ik and toe_ik and cmds.objExists(ankle_ik) and cmds.objExists(toe_ik):
         try:
             toe_ikh = cmds.ikHandle(sj=ankle_ik, ee=toe_ik,
                                     sol="ikSCsolver", n=label + "_toeIkh")[0]
             cmds.parent(toe_ikh, toe_piv)
+            # hero toe joint を toe_ik に parentConstraint (translate + rotate)
+            # で pin。orient だけでは toe が ankle の bind 階層で引きずられて
+            # 「足全体が動く」ままになる。既存 parentConstraint (attach_controllers
+            # Pass 3 で toe_L_ctl から入っている) を削除してから toe_ik を張る。
+            if cmds.objExists(toe_joint):
+                for con in (cmds.listConnections(toe_joint + ".translateX",
+                            s=True, d=False, type="constraint") or []):
+                    try: cmds.delete(con)
+                    except Exception: pass
+                try:
+                    cmds.parentConstraint(toe_ik, toe_joint, mo=False,
+                                          n=toe_joint + "_ikfk_pc")
+                except Exception as e:
+                    cmds.warning(f"[attach_ctrls] toe parentConstraint: {e}")
         except Exception as exc:
-            cmds.warning(f"[attach_ctrls] toe ikHandle failed on ik chain: {exc}")
+            cmds.warning(f"[attach_ctrls] toe ikHandle failed: {exc}")
             toe_ikh = None
     else:
-        # ik chain 未生成の場合 (setup_ik_fk 未実施等) は toe ikHandle を張らない
         cmds.warning(f"[attach_ctrls] toe ikHandle skipped: {ankle_ik}/{toe_ik} not found")
         toe_ikh = None
 
@@ -1612,9 +1812,16 @@ def _pw_start(title="Attach Ctrls", status="Setting up...", max_v=100):
     _PW_ACTIVE = False
     if cmds is None: return
     try:
-        # 前の window が残っていたら閉じる (異常終了対策)
-        try: cmds.progressWindow(endProgress=True)
-        except Exception: pass
+        # 二重積み対策: 残留 progressWindow を全部 drain。
+        # 前回異常終了 (例外で finally 未実行、または多重 spawn) で複数 window
+        # が積まれていると Maya の main menu 全体が反応停止する副作用がある。
+        for _ in range(8):
+            try:
+                if cmds.progressWindow(q=True, isCancelled=True) is None:
+                    break
+                cmds.progressWindow(endProgress=True)
+            except Exception:
+                break
         cmds.progressWindow(title=title, status=status, progress=0,
                              min=0, max=max_v, isInterruptable=False)
         _PW_ACTIVE = True
