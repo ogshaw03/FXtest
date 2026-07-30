@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -117,12 +117,49 @@ def _bone_length(joint):
     return None
 
 
-def _auto_ctl_scale(joint, mult=1.0, min_s=0.2, max_s=20.0):
-    """bone length に応じた ctl サイズ。leaf/root は fallback。"""
+_CACHED_MESH_DIAG = None
+
+
+def _scene_mesh_bbox_diag():
+    """シーン内 mesh の world bbox 対角線長さ。cache する。"""
+    global _CACHED_MESH_DIAG
+    if _CACHED_MESH_DIAG is not None:
+        return _CACHED_MESH_DIAG
+    meshes = cmds.ls(type="mesh") or []
+    if not meshes:
+        _CACHED_MESH_DIAG = 100.0
+        return _CACHED_MESH_DIAG
+    tforms = set()
+    for m in meshes:
+        p = cmds.listRelatives(m, p=True, f=True) or []
+        if p:
+            tforms.add(p[0])
+    if not tforms:
+        _CACHED_MESH_DIAG = 100.0
+        return _CACHED_MESH_DIAG
+    try:
+        bb = cmds.exactWorldBoundingBox(list(tforms))
+        d = ((bb[3]-bb[0])**2 + (bb[4]-bb[1])**2 + (bb[5]-bb[2])**2)**0.5
+        _CACHED_MESH_DIAG = d
+    except Exception:
+        _CACHED_MESH_DIAG = 100.0
+    return _CACHED_MESH_DIAG
+
+
+def _reset_scale_cache():
+    global _CACHED_MESH_DIAG
+    _CACHED_MESH_DIAG = None
+
+
+def _auto_ctl_scale(joint, mult=1.0):
+    """bone length * 0.35 を base に、mesh bbox 対角の [1/400, 1/50] で clamp。
+    小ぶりだが sizes は明確に differentiate される。"""
+    diag = _scene_mesh_bbox_diag()
+    min_s = diag / 400.0
+    max_s = diag / 50.0
     d = _bone_length(joint)
-    if d is None:
-        return max(min_s, min(max_s, 1.0 * mult))
-    return max(min_s, min(max_s, d * 1.0 * mult))
+    base = (d * 0.35) if d else min_s * 3
+    return max(min_s, min(max_s, base * mult))
 
 
 # =========================================================================
@@ -272,6 +309,70 @@ def _make_cube_curve(name, scale=1.0):
     return ctl
 
 
+def _make_diamond_curve(name, scale=1.0):
+    """ダイヤモンド (八面体) 形の NURBS カーブ。pole vector 等の視認性重視用。"""
+    s = scale
+    pts = [
+        ( 0,  s,  0), ( s,  0,  0), ( 0, -s,  0), (-s,  0,  0), ( 0,  s,  0),
+        ( 0,  0,  s), ( s,  0,  0), ( 0,  0, -s), (-s,  0,  0), ( 0,  0,  s),
+        ( 0, -s,  0), ( 0,  0, -s), ( 0,  s,  0),
+    ]
+    ctl = cmds.curve(d=1, p=pts, n=name)
+    return ctl
+
+
+def _make_ring_curve(name, scale=1.0, sides=16):
+    """水平 (XZ plane) の円リング。背骨/首用。"""
+    import math
+    pts = []
+    for i in range(sides + 1):
+        a = 2 * math.pi * i / sides
+        pts.append((math.cos(a) * scale, 0, math.sin(a) * scale))
+    ctl = cmds.curve(d=1, p=pts, n=name)
+    return ctl
+
+
+def _make_octagon_curve(name, scale=1.0):
+    """水平 8 角形。root ctl 用 (地面に置く)。"""
+    return _make_ring_curve(name, scale=scale, sides=8)
+
+
+def _make_flat_box_curve(name, scale=1.0, x_ratio=1.4, z_ratio=1.0):
+    """水平面 (XZ plane) の長方形 (box を平らに)。手/足 IK ctl 用。"""
+    sx = scale * x_ratio * 0.5
+    sz = scale * z_ratio * 0.5
+    pts = [
+        (-sx, 0, -sz), ( sx, 0, -sz), ( sx, 0,  sz), (-sx, 0,  sz), (-sx, 0, -sz),
+    ]
+    ctl = cmds.curve(d=1, p=pts, n=name)
+    return ctl
+
+
+def _make_square_curve(name, scale=1.0):
+    """垂直 (XY plane) の正方形。FK 指用 (bone に沿って表示)。"""
+    s = scale * 0.5
+    pts = [(-s, -s, 0), (s, -s, 0), (s, s, 0), (-s, s, 0), (-s, -s, 0)]
+    ctl = cmds.curve(d=1, p=pts, n=name)
+    return ctl
+
+
+# --- 骨名パターン -> ctl shape maker マッピング ---
+# キー: substring (小文字), 値: (maker 関数, scale multiplier)
+def _pick_ctl_maker(joint_name):
+    """joint 名から適切な maker function と scale multiplier を返す。"""
+    n = joint_name.split(":")[-1].lower()
+    # 完全に区別したいもの: 背骨/首/head
+    if any(k in n for k in ("upper_body", "lower_body", "waist", "neck", "chest")):
+        return _make_ring_curve, 1.2  # 水平リング、少し大きめ
+    if "head" == n or n.endswith("_head") or n == "head":
+        return _make_cube_curve, 0.9
+    if any(n.startswith(k) or ("_" + k) in n for k in
+           ("thumb", "index", "middle", "ring", "pinky", "finger")):
+        return _make_square_curve, 0.7  # 指: 小さめ square
+    # default
+    return _make_cube_curve, 1.0
+
+
 def _set_ctl_color(ctl, color_idx):
     shape = cmds.listRelatives(ctl, s=True, f=False)
     if not shape:
@@ -343,11 +444,14 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
 
         # 自動サイズ
         if auto_scale:
-            ctl_size = _auto_ctl_scale(jnt, mult=scale)
+            base_size = _auto_ctl_scale(jnt, mult=scale)
         else:
-            ctl_size = scale
+            base_size = scale
 
-        ctl = _make_cube_curve(ctl_name, scale=ctl_size)
+        # 骨タイプに応じた shape
+        maker, shape_mult = _pick_ctl_maker(jnt)
+        ctl_size = base_size * shape_mult
+        ctl = maker(ctl_name, scale=ctl_size)
         _set_ctl_color(ctl, color)
 
         npo = cmds.group(em=True, name=npo_name)
@@ -411,7 +515,7 @@ def delete_generated():
             cmds.delete(con); n += 1
         except Exception:
             pass
-    for pattern in ("*_ikfk_oc*", "*_fk_oc*"):
+    for pattern in ("*_ikfk_oc*", "*_fk_oc*", "*_ik_orient_oc*"):
         for con in cmds.ls(pattern, type="orientConstraint") or []:
             try:
                 cmds.delete(con); n += 1
@@ -422,6 +526,14 @@ def delete_generated():
             cmds.delete(ikh); n += 1
         except Exception:
             pass
+    # dual chain 副産物: <joint>_ik / <joint>_fk joints
+    for suffix in ("_ik", "_fk"):
+        for j in cmds.ls("*" + suffix, type="joint") or []:
+            if cmds.objExists(j):
+                try:
+                    cmds.delete(j); n += 1
+                except Exception:
+                    pass
     print(f"[{_PACKAGE}] Deleted generated nodes: {n}")
 
 
@@ -474,41 +586,86 @@ def _dup_clean_chain(joints, suffix):
     return new_joints
 
 
-def setup_ik_fk(start, mid, end, side="C", pv_z_offset=None):
+def _dup_hero_joint(orig, suffix, new_parent=None):
+    """joint を子なしで duplicate、任意の parent に付け直す。world transform は preserve。"""
+    n = cmds.duplicate(orig, po=True, n=orig + suffix)[0]
+    # 子が付いてきたら削除
+    kids = cmds.listRelatives(n, c=True) or []
+    for k in kids:
+        try: cmds.delete(k)
+        except Exception: pass
+    if new_parent is None:
+        try: cmds.parent(n, world=True)
+        except Exception: pass
+    else:
+        try: cmds.parent(n, new_parent)
+        except Exception: pass
+    return n
+
+
+def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     """3-joint chain (start, mid, end) に FK/IK blend rig を構築。
 
-    方針: Maya native の ikHandle.ikBlend を使い、original chain に
-    直接 IK handle を付ける。FK ctl は原 joint を orientConstraint。
-    switch attr で ikBlend と FK weight を反転制御 (0=FK / 1=IK)。
-
-    利点: chain duplication 不要。twist bones を含む arm chain でも
-    local space の不一致問題が発生しない。
+    方針: original chain の 3 hero joint を CLEAN な dual chain (IK 用/FK 用)
+    に duplicate し、それぞれ元の hero joint の親の下に parent。IK solver は
+    clean chain だけを解くので twist bones (arm_twist_L 等) には触れず、
+    メッシュが捻じれない。元 hero joint は orient constraint mo=True で
+    IK/FK chain の rotation を blend 受信する (twist bones は元 joint の
+    子として通常通り追従)。
 
     Args:
         start, mid, end: 元 joint 名 (親→子順)
         side: "L"/"R"/"C" (ctl color 用)
-        pv_z_offset: pole vector の Z offset (None なら arm/leg 名から推定)
+        pv_offset: pole vector のワールド Z offset (None なら mesh diag / 8)
     """
     color = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
-    label = start  # side 込みで衝突回避 (arm_L / arm_R 等)
+    label = start
 
     if not cmds.objExists(ROOT_GROUP):
         cmds.group(em=True, name=ROOT_GROUP)
 
-    # 自動サイズ (chain の平均 bone 長さから算出)
-    _chain_lengths = [_bone_length(j) for j in [start, mid, end]]
-    _chain_lengths = [d for d in _chain_lengths if d is not None]
-    chain_size = sum(_chain_lengths) / len(_chain_lengths) if _chain_lengths else 1.0
-    ik_size = chain_size * 1.5   # IK ctl: 大きめ (掴みやすさ優先)
-    pv_size = chain_size * 0.5   # PV ctl: 小さめ
-    fk_size = chain_size * 0.8   # FK ctl: 中間
+    # 元 start joint の親 (arm_L なら shoulder_C_L 等)
+    orig_parent_list = cmds.listRelatives(start, p=True, type="joint") or []
+    orig_parent = orig_parent_list[0] if orig_parent_list else None
 
-    # --- 1. IK handle on ORIGINAL chain (twist bones を含む path をそのまま利用) ---
-    ik_handle = cmds.ikHandle(sj=start, ee=end,
+    # サイズ (mesh bbox 準拠の auto scale)
+    diag = _scene_mesh_bbox_diag()
+    ik_size = diag / 18.0    # IK ctl 大きめ (掴みやすさ)
+    pv_size = diag / 40.0    # PV ctl やや大きめ (見つけやすさ)
+    fk_size = diag / 45.0    # FK ctl 中間
+
+    # --- 1. Clean dual chain (IK 用, FK 用) ---
+    # 全 hero joint を duplicate → 元 start の親の下に置く → chain 化。
+    # twist bones を含まない clean な 3-joint chain。
+    arm_ik = _dup_hero_joint(start, "_ik", new_parent=orig_parent)
+    elbow_ik = _dup_hero_joint(mid,  "_ik", new_parent=arm_ik)
+    wrist_ik = _dup_hero_joint(end,  "_ik", new_parent=elbow_ik)
+    ik_chain = [arm_ik, elbow_ik, wrist_ik]
+
+    arm_fk = _dup_hero_joint(start, "_fk", new_parent=orig_parent)
+    elbow_fk = _dup_hero_joint(mid,  "_fk", new_parent=arm_fk)
+    wrist_fk = _dup_hero_joint(end,  "_fk", new_parent=elbow_fk)
+    fk_chain = [arm_fk, elbow_fk, wrist_fk]
+
+    # 描画は None にして viewport ノイズ削減
+    for j in ik_chain + fk_chain:
+        try: cmds.setAttr(j + ".drawStyle", 2)
+        except Exception: pass
+
+    # --- 2. IK handle on CLEAN chain ---
+    ik_handle = cmds.ikHandle(sj=arm_ik, ee=wrist_ik,
                               sol="ikRPsolver", n=label + "_ikh")[0]
+    # IK handle は attach_ctrls_grp 下に (元 chain 内に置かないほうが管理しやすい)
+    try: cmds.parent(ik_handle, ROOT_GROUP)
+    except Exception: pass
 
-    # --- 2. IK ctl (end joint 位置) ---
-    ik_ctl = _make_cube_curve(label + "_IK_ctl", scale=ik_size)
+    # --- 3. IK ctl (end joint 位置) — 手/足 IK は水平 box shape ---
+    is_leg = "leg" in label.lower()
+    ik_ctl = _make_flat_box_curve(
+        label + "_IK_ctl", scale=ik_size,
+        x_ratio=1.6 if is_leg else 1.4,
+        z_ratio=2.2 if is_leg else 1.6,
+    )
     _set_ctl_color(ik_ctl, color)
     ik_npo = cmds.group(em=True, name=label + "_IK_npo")
     cmds.parent(ik_ctl, ik_npo)
@@ -517,72 +674,69 @@ def setup_ik_fk(start, mid, end, side="C", pv_z_offset=None):
     cmds.pointConstraint(ik_ctl, ik_handle, mo=False)
     _lock_hide_attrs(ik_ctl, ["sx", "sy", "sz"])
 
-    # --- 3. pole vector ctl ---
-    pv_ctl = _make_cube_curve(label + "_PV_ctl", scale=pv_size)
-    _set_ctl_color(pv_ctl, color)
+    # --- 4. Pole vector ctl (diamond 形状で目立たせる) ---
+    pv_ctl = _make_diamond_curve(label + "_PV_ctl", scale=pv_size)
+    _set_ctl_color(pv_ctl, 20 if side == "L" else 12 if side == "R" else 17)
+    # ↑ PV は色を通常ctl とは変えて識別しやすく (L=lightblue20, R=lightred12, C=yellow17)
     pv_npo = cmds.group(em=True, name=label + "_PV_npo")
     cmds.parent(pv_ctl, pv_npo)
     mid_pos = cmds.xform(mid, q=True, ws=True, t=True)
-    if pv_z_offset is None:
-        lo = label.lower()
-        if "leg" in lo or "knee" in lo or "ankle" in lo:
-            pv_z_offset = 3.0
-        else:
-            pv_z_offset = -3.0
-    cmds.xform(pv_npo, ws=True, t=(mid_pos[0], mid_pos[1], mid_pos[2] + pv_z_offset))
+    if pv_offset is None:
+        base_offset = diag / 8.0  # 大きめ offset (mesh 外に出す)
+    else:
+        base_offset = pv_offset
+    lo = label.lower()
+    if "leg" in lo or "knee" in lo or "ankle" in lo:
+        z_off = +base_offset  # 脚: 前方 (膝側)
+    else:
+        z_off = -base_offset  # 腕: 後方 (肘側)
+    cmds.xform(pv_npo, ws=True,
+               t=(mid_pos[0], mid_pos[1], mid_pos[2] + z_off))
     cmds.parent(pv_npo, ROOT_GROUP)
     cmds.poleVectorConstraint(pv_ctl, ik_handle)
     _lock_hide_attrs(pv_ctl, ["sx", "sy", "sz", "rx", "ry", "rz"])
 
-    # --- 4. FK ctls (original 3 joints それぞれに) ---
+    # --- 5. FK ctls (clean FK chain の各 joint を drive) ---
     fk_ctls = []
-    for j in [start, mid, end]:
-        fk_ctl = _make_cube_curve(j + "_FK_ctl", scale=fk_size)
+    for j in fk_chain:
+        fk_ctl = _make_cube_curve(j + "_ctl", scale=fk_size)
         _set_ctl_color(fk_ctl, color)
-        fk_npo = cmds.group(em=True, name=j + "_FK_npo")
+        fk_npo = cmds.group(em=True, name=j + "_npo")
         cmds.parent(fk_ctl, fk_npo)
         cmds.matchTransform(fk_npo, j, pos=True, rot=True)
+        cmds.orientConstraint(fk_ctl, j, mo=False)
         _lock_hide_attrs(fk_ctl, ["sx", "sy", "sz", "tx", "ty", "tz"])
         fk_ctls.append((fk_npo, fk_ctl))
-    # 階層: mid_npo -> start_ctl, end_npo -> mid_ctl
+    # FK ctl chain 階層 (mid_npo -> start_ctl, end_npo -> mid_ctl)
     cmds.parent(fk_ctls[1][0], fk_ctls[0][1])
     cmds.parent(fk_ctls[2][0], fk_ctls[1][1])
     cmds.parent(fk_ctls[0][0], ROOT_GROUP)
 
-    # --- 5. Switch attribute (IK ctl に付与、 0=FK 1=IK) ---
+    # --- 6. Switch attribute (IK ctl) ---
     if not cmds.attributeQuery("IK_FK", node=ik_ctl, exists=True):
         cmds.addAttr(ik_ctl, ln="IK_FK", at="float", min=0.0, max=1.0, dv=1.0, k=True)
 
     rev = cmds.createNode("reverse", n=label + "_ikfk_rev")
     cmds.connectAttr(ik_ctl + ".IK_FK", rev + ".inputX")
 
-    # --- 6. ikHandle.ikBlend = switch (native FK/IK blend) ---
-    cmds.connectAttr(ik_ctl + ".IK_FK", ik_handle + ".ikBlend")
+    # --- 7. Blend original hero joints between IK chain and FK chain ---
+    # orientConstraint mo=True で local space 差異を初期化時に吸収。
+    # twist bones は元 hero joint の child なので、hero joint 回転すれば自然追従。
+    # IK solver は clean chain だけ動かし、twist bones を直接触らない。
+    for orig, ikj, fkj in zip([start, mid, end], ik_chain, fk_chain):
+        cons = cmds.orientConstraint(fkj, ikj, orig, mo=True,
+                                     n=orig + "_ikfk_oc")[0]
+        wal = cmds.orientConstraint(cons, q=True, wal=True)  # [fkW, ikW]
+        cmds.connectAttr(rev + ".outputX",  cons + "." + wal[0])
+        cmds.connectAttr(ik_ctl + ".IK_FK", cons + "." + wal[1])
 
-    # --- 7. Constraints on hero joints ---
-    # start / mid: FK ctl orient constraint, weight = 1 - switch
-    #   (IK 側は ikHandle が ikBlend で solver 出力を直接 joint に流す)
-    for i, orig_j in enumerate([start, mid]):
-        fk_ctl_j = fk_ctls[i][1]
-        cons = cmds.orientConstraint(fk_ctl_j, orig_j, mo=False,
-                                     n=orig_j + "_fk_oc")[0]
-        wal = cmds.orientConstraint(cons, q=True, wal=True)
-        cmds.connectAttr(rev + ".outputX", cons + "." + wal[0])
+    # end joint に IK ctl の rotation も反映 (手/足の向き制御)
+    end_orient_cons = cmds.orientConstraint(ik_ctl, wrist_ik, mo=True,
+                                            n=end + "_ik_orient_oc")[0]
 
-    # end: dual orient constraint (FK ctl + IK ctl), weights blended by switch
-    #   IK solver は end 位置のみ制御 (rotation は残る) ので orient constraint 併用。
-    fk_end_ctl = fk_ctls[2][1]
-    end_cons = cmds.orientConstraint(fk_end_ctl, ik_ctl, end, mo=False,
-                                     n=end + "_ikfk_oc")[0]
-    wal = cmds.orientConstraint(end_cons, q=True, wal=True)  # [fkW, ikW]
-    cmds.connectAttr(rev + ".outputX", end_cons + "." + wal[0])
-    cmds.connectAttr(ik_ctl + ".IK_FK", end_cons + "." + wal[1])
-
-    # --- 8. Visibility toggle: IK ctls when switch>0, FK ctls when switch<1 ---
-    try:
-        cmds.setAttr(ik_ctl + ".v", lock=False)
-    except Exception:
-        pass
+    # --- 8. Visibility ---
+    try: cmds.setAttr(ik_ctl + ".v", lock=False)
+    except Exception: pass
     try:
         cmds.connectAttr(ik_ctl + ".IK_FK", ik_npo + ".v")
         cmds.connectAttr(ik_ctl + ".IK_FK", pv_npo + ".v")
@@ -595,6 +749,8 @@ def setup_ik_fk(start, mid, end, side="C", pv_z_offset=None):
 
     return {
         "label":     label,
+        "ik_chain":  ik_chain,
+        "fk_chain":  fk_chain,
         "ik_handle": ik_handle,
         "ik_ctl":    ik_ctl,
         "pv_ctl":    pv_ctl,
@@ -763,6 +919,9 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     if cmds is None:
         raise RuntimeError("Must run inside Maya.")
 
+    # scale cache reset (毎回 fresh に mesh bbox を測定)
+    _reset_scale_cache()
+
     # Step 1+2: rename
     if fbx_renamer is None:
         cmds.warning("[attach_ctrls] fbx_renamer not available -- skipping rename")
@@ -774,7 +933,32 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     if delete_junk:
         delete_unnecessary()
 
-    # Step 4: attach FK ctls, exclude IK/FK chain joints
+    # Step 4: root/main ctls を作成 (地面のオクタゴン + 主体 box)
+    #         attach_ctrls_grp の直下、他の ctl の親になる
+    diag = _scene_mesh_bbox_diag()
+    if not cmds.objExists(ROOT_GROUP):
+        cmds.group(em=True, name=ROOT_GROUP)
+    # world ctl (地面) — 大きめオクタゴン
+    world_ctl_name = "world_ctl"
+    if not cmds.objExists(world_ctl_name):
+        world_ctl = _make_octagon_curve(world_ctl_name, scale=diag * 0.28)
+        _set_ctl_color(world_ctl, 13)  # 赤
+        cmds.parent(world_ctl, ROOT_GROUP)
+        _lock_hide_attrs(world_ctl, ["sx","sy","sz","v"])
+    else:
+        world_ctl = world_ctl_name
+    # main ctl (体を包む) — 中サイズ box (床置き)
+    main_ctl_name = "main_ctl"
+    if not cmds.objExists(main_ctl_name):
+        main_ctl = _make_flat_box_curve(main_ctl_name, scale=diag * 0.2,
+                                        x_ratio=1.5, z_ratio=1.5)
+        _set_ctl_color(main_ctl, 17)  # 黄
+        cmds.parent(main_ctl, world_ctl)
+        _lock_hide_attrs(main_ctl, ["sx","sy","sz","v"])
+    else:
+        main_ctl = main_ctl_name
+
+    # Step 5: attach FK ctls, exclude IK/FK chain joints
     chains = find_ik_chains()
     exclude = set()
     for chain in chains.values():
@@ -789,7 +973,19 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
                                         auto_scale=True,
                                         skip_decoration=skip_decoration)
 
-    # Step 5: IK/FK setup
+    # Step 6: ルート系 ctl の親を main_ctl に寄せる
+    # (attach_ctrls_grp 直下の孤立 npo を main_ctl の下に移動)
+    for child in cmds.listRelatives(ROOT_GROUP, c=True, type="transform") or []:
+        if child in (world_ctl_name, "world_ctl"):
+            continue
+        # world_ctl の下は触らない、それ以外の root-level npo だけ移す
+        if child.endswith("_npo"):
+            try:
+                cmds.parent(child, main_ctl)
+            except Exception:
+                pass
+
+    # Step 7: IK/FK setup (IK ctl NPO は独立世界置き = 足接地 目的)
     ik_results = setup_all_ik_fk()
 
     print(f"[{_PACKAGE}] === full_auto_setup complete ===")
