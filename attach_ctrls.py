@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -467,9 +467,14 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
 
     jnt_to_ctl = {}
     created_ctls = []
+    total_j = len(joints)
 
     # Pass 1: create ctl + npo per joint (all under ROOT_GROUP temporarily)
-    for jnt in joints:
+    for _pass1_i, jnt in enumerate(joints):
+        if total_j and (_pass1_i % max(1, total_j // 20) == 0):
+            # attach_controllers 全体を [0, 70]% とし、Pass 1 が [0, 60]% を占める
+            _pw_sub(60.0 * _pass1_i / total_j,
+                    f"Attach controllers {_pass1_i}/{total_j}")
         if not cmds.objExists(jnt):
             continue
         base = _base_name(jnt)
@@ -527,6 +532,7 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
     #   - 途中で ctl 持ち joint に当たればその ctl の下
     #   - 当たらず joint 存在すればその joint の下 (wrist_L 等、IK/FK で
     #     rotate される joint に直接 parent すれば ctl が joint に追従)
+    _pw_sub(60.0, "Attach controllers: reparent")
     for jnt, (npo, ctl) in jnt_to_ctl.items():
         parents = cmds.listRelatives(jnt, p=True, type="joint") or []
         if not parents:
@@ -547,11 +553,13 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
 
     # Pass 3: constraint
     if do_constrain:
+        _pw_sub(80.0, "Attach controllers: constrain")
         for jnt, (npo, ctl) in jnt_to_ctl.items():
             try:
                 cmds.parentConstraint(ctl, jnt, mo=False, n=jnt + "_parentConstraint")
             except Exception as exc:
                 cmds.warning(f"[attach_ctrls] constraint {ctl} -> {jnt} failed: {exc}")
+    _pw_sub(100.0)
 
     print(f"[{_PACKAGE}] Attached controllers: {len(jnt_to_ctl)} joint(s), "
           f"constrain={do_constrain}, scale={scale}")
@@ -907,7 +915,8 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     _twist_candidates = list(range(-180, 181, 5))
     best_twist = 0.0
     best_drift = _total_drift()
-    for twist_try in _twist_candidates:
+    n_cands = len(_twist_candidates)
+    for _i, twist_try in enumerate(_twist_candidates):
         try:
             cmds.setAttr(ik_handle + ".twist", float(twist_try))
             d = _total_drift()
@@ -916,6 +925,10 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                 best_twist = float(twist_try)
         except Exception:
             pass
+        # setup_ik_fk の担当区間内で twist 探索は末尾を占める、20%毎に更新
+        if _i % max(1, n_cands // 5) == 0:
+            _pw_sub(60.0 + 40.0 * _i / n_cands,
+                    f"Solve twist ({label}) {_i}/{n_cands}")
     try:
         cmds.setAttr(ik_handle + ".twist", best_twist)
     except Exception:
@@ -1458,19 +1471,32 @@ def snap_ik_to_fk(chain_label):
 def setup_all_ik_fk():
     """検出できた L/R arm/leg 全てに IK/FK rig を構築。leg には reverse foot も。"""
     chains = find_ik_chains()
+    total = len(chains)
     results = []
-    for label, chain in chains.items():
+    # setup_all_ik_fk は full_auto_setup 側で [55, 100]% を占める前提。
+    # 各 chain を等分割し、chain 内の substep は setup_ik_fk / setup_reverse_foot
+    # が独自区間で報告できるよう _pw_span を切り替える。
+    outer_lo, outer_hi = _PW_SPAN[0], _PW_SPAN[1]
+    for i, (label, chain) in enumerate(chains.items()):
+        # この chain が占める outer 区間
+        chain_lo = outer_lo + (outer_hi - outer_lo) * i / max(1, total)
+        chain_hi = outer_lo + (outer_hi - outer_lo) * (i + 1) / max(1, total)
+        _pw_span(chain_lo, chain_hi)
+        _pw_sub(0.0, f"Setup IK/FK: {label}")
         side = "L" if label.startswith("L") else "R"
         try:
             r = setup_ik_fk(chain[0], chain[1], chain[2], side=side)
             results.append(r)
             # leg なら reverse foot も試みる
             if "leg" in label:
+                _pw_sub(85.0, f"Reverse foot: {label}")
                 rf = setup_reverse_foot(chain[2], r["ik_ctl"], r["ik_handle"], side=side)
                 if rf:
                     r["reverse_foot"] = rf
         except Exception as exc:
             cmds.warning(f"[attach_ctrls] IK setup for {label} failed: {exc}")
+    _pw_span(outer_lo, outer_hi)  # 復元
+    _pw_sub(100.0)
     print(f"[{_PACKAGE}] setup_all_ik_fk: {len(results)}/{len(chains)} chains")
     return results
 
@@ -1568,6 +1594,60 @@ def delete_unnecessary(dry_run=False):
 
 # --- Full auto-setup: rename -> delete unnecessary -> attach FK -> IK/FK ---
 
+# --- Progress display -------------------------------------------------------
+
+# Progress は full_auto_setup 全体を [0, 100] に mapping し、内部関数は各自の
+# "担当区間" 内で [0, 100] を報告する。区間は module-level state で持ち回して
+# 関数シグネチャを汚さない。UI (progressWindow) が使えない batch モードでも
+# try/except で silently skip する。
+_PW_SPAN = [0.0, 100.0]  # 現在の担当区間 (start_pct, end_pct)
+_PW_ACTIVE = False       # progress window 開いているか
+
+def _pw_start(title="Attach Ctrls", status="Setting up...", max_v=100):
+    """外側の progressWindow を開く。full_auto_setup 等トップレベルから呼ぶ。"""
+    global _PW_ACTIVE, _PW_SPAN
+    _PW_SPAN[:] = [0.0, 100.0]
+    _PW_ACTIVE = False
+    if cmds is None: return
+    try:
+        # 前の window が残っていたら閉じる (異常終了対策)
+        try: cmds.progressWindow(endProgress=True)
+        except Exception: pass
+        cmds.progressWindow(title=title, status=status, progress=0,
+                             min=0, max=max_v, isInterruptable=False)
+        _PW_ACTIVE = True
+    except Exception:
+        pass  # batch mode 等で使えない環境は無視
+
+
+def _pw_end():
+    """外側の progressWindow を閉じる。"""
+    global _PW_ACTIVE
+    if not _PW_ACTIVE: return
+    try: cmds.progressWindow(endProgress=True)
+    except Exception: pass
+    _PW_ACTIVE = False
+
+
+def _pw_span(start_pct, end_pct):
+    """今後の substep 報告が start_pct-end_pct 範囲に mapping されるようセット。"""
+    _PW_SPAN[0] = float(start_pct)
+    _PW_SPAN[1] = float(end_pct)
+
+
+def _pw_sub(local_pct, status=None):
+    """現区間内で [0, 100] を報告。外側 window の絶対値に換算されて反映される。"""
+    if not _PW_ACTIVE: return
+    lo, hi = _PW_SPAN
+    outer = lo + (hi - lo) * max(0.0, min(100.0, float(local_pct))) / 100.0
+    try:
+        kw = {"edit": True, "progress": outer}
+        if status is not None: kw["status"] = status
+        cmds.progressWindow(**kw)
+    except Exception:
+        pass
+
+
 def freeze_joint_rotations(joints=None):
     """joint の rotate 値を jointOrient に完全移動させて rotate=0 化。
 
@@ -1592,8 +1672,9 @@ def freeze_joint_rotations(joints=None):
         raise RuntimeError("Must run inside Maya.")
     if joints is None:
         joints = cmds.ls(type="joint") or []
+    total = len(joints)
     n_ok = 0
-    for jnt in joints:
+    for i, jnt in enumerate(joints):
         try:
             rot = cmds.xform(jnt, q=True, ws=True, rotation=True)
             cmds.setAttr(jnt + ".jointOrient", 0, 0, 0, type="double3")
@@ -1605,6 +1686,9 @@ def freeze_joint_rotations(joints=None):
             n_ok += 1
         except Exception as exc:
             cmds.warning(f"[{_PACKAGE}] freeze_joint_rotations({jnt}) failed: {exc}")
+        # 進行報告 (10% 刻み、更新回数を抑えて速度低下防止)
+        if total and (i % max(1, total // 10) == 0):
+            _pw_sub(100.0 * i / total, f"Freeze joint rotations {i}/{total}")
     print(f"[{_PACKAGE}] freeze_joint_rotations: {n_ok}/{len(joints)} joint(s) frozen")
     return n_ok
 
@@ -1628,96 +1712,105 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     # scale cache reset (毎回 fresh に mesh bbox を測定)
     _reset_scale_cache()
 
-    # Step 1+2: rename
-    if fbx_renamer is None:
-        cmds.warning("[attach_ctrls] fbx_renamer not available -- skipping rename")
-    else:
-        fbx_renamer.remove_all_namespaces()
-        fbx_renamer.rename_all_joints()
+    _pw_start(title="Attach Ctrls - Full Auto Setup",
+              status="Rename joints...", max_v=100)
+    try:
+        # Step 1+2: rename (0-5%)
+        _pw_span(0, 5); _pw_sub(0, "Rename joints...")
+        if fbx_renamer is None:
+            cmds.warning("[attach_ctrls] fbx_renamer not available -- skipping rename")
+        else:
+            fbx_renamer.remove_all_namespaces()
+            fbx_renamer.rename_all_joints()
 
-    # Step 2.5: joint の rotate 値を jointOrient に焼き込む (rotate=0 化)。
-    # MMD/FBX import 由来の joint は rotate に値が入ったまま来て、後段の
-    # ikHandle / orient constraint が bind の "曖昧" と誤判定して chain を
-    # 数度動かし、hero drift や arm 反転を起こす原因になる。
-    freeze_joint_rotations()
+        # Step 2.5: freeze rotate to jointOrient (5-15%)
+        _pw_span(5, 15); _pw_sub(0, "Freeze joint rotations...")
+        freeze_joint_rotations()
 
-    # Step 3: cleanup
-    if delete_junk:
-        delete_unnecessary()
+        # Step 3: cleanup (15-25%)
+        _pw_span(15, 25); _pw_sub(0, "Delete unnecessary nodes...")
+        if delete_junk:
+            delete_unnecessary()
 
-    # Step 3.5: joint radius を最小限に (骨の viewport 表示は ctl を邪魔しない程度)
-    # ユーザー要望: 固定 0.016 (mesh scale 依存を外して常に極小)
-    diag = _scene_mesh_bbox_diag()
-    joint_radius = 0.016
-    for j in cmds.ls(type="joint") or []:
-        try:
-            cmds.setAttr(j + ".radius", joint_radius)
-        except Exception:
-            pass
-    print(f"[{_PACKAGE}] joint radius set to {joint_radius:.4f} (diag/1000)")
-
-    # Step 4: root/main ctls を作成 (地面のオクタゴン + 主体 box)
-    #         attach_ctrls_grp の直下、他の ctl の親になる
-    diag = _scene_mesh_bbox_diag()
-    if not cmds.objExists(ROOT_GROUP):
-        cmds.group(em=True, name=ROOT_GROUP)
-    # world ctl (地面) — 大きめオクタゴン (mGear world_ctl 相当、赤)
-    world_ctl_name = "world_ctl"
-    if not cmds.objExists(world_ctl_name):
-        world_ctl = _make_octagon_curve(world_ctl_name, scale=diag * 0.28)
-        _set_ctl_color(world_ctl, COLOR_WORLD)
-        cmds.parent(world_ctl, ROOT_GROUP)
-        _lock_hide_attrs(world_ctl, ["sx","sy","sz","v"])
-    else:
-        world_ctl = world_ctl_name
-    # main ctl (体を包む) — 中サイズ box (mGear body_C0_ctl 相当、黄)
-    main_ctl_name = "main_ctl"
-    if not cmds.objExists(main_ctl_name):
-        main_ctl = _make_flat_box_curve(main_ctl_name, scale=diag * 0.2,
-                                        x_ratio=1.5, z_ratio=1.5)
-        _set_ctl_color(main_ctl, COLOR_C)
-        cmds.parent(main_ctl, world_ctl)
-        _lock_hide_attrs(main_ctl, ["sx","sy","sz","v"])
-    else:
-        main_ctl = main_ctl_name
-
-    # Step 5: attach FK ctls, exclude IK/FK chain joints
-    chains = find_ik_chains()
-    exclude = set()
-    for chain in chains.values():
-        exclude.update(chain)
-
-    all_joints = cmds.ls(type="joint") or []
-    other = [j for j in all_joints
-             if j not in exclude
-             and not j.endswith("_end")]
-    attach_result = attach_controllers(joints=other, scale=scale,
-                                        do_constrain=True,
-                                        auto_scale=True,
-                                        skip_decoration=skip_decoration)
-
-    # Step 6: ルート系 ctl の親を main_ctl に寄せる
-    # (attach_ctrls_grp 直下の孤立 npo を main_ctl の下に移動)
-    for child in cmds.listRelatives(ROOT_GROUP, c=True, type="transform") or []:
-        if child in (world_ctl_name, "world_ctl"):
-            continue
-        # world_ctl の下は触らない、それ以外の root-level npo だけ移す
-        if child.endswith("_npo"):
+        # Step 3.5: joint radius を最小限に (骨の viewport 表示は ctl を邪魔しない程度)
+        # ユーザー要望: 固定 0.016 (mesh scale 依存を外して常に極小)
+        _pw_span(25, 28); _pw_sub(0, "Adjust joint radius...")
+        diag = _scene_mesh_bbox_diag()
+        joint_radius = 0.016
+        for j in cmds.ls(type="joint") or []:
             try:
-                cmds.parent(child, main_ctl)
+                cmds.setAttr(j + ".radius", joint_radius)
             except Exception:
                 pass
+        print(f"[{_PACKAGE}] joint radius set to {joint_radius:.4f} (diag/1000)")
 
-    # Step 7: IK/FK setup (IK ctl NPO は独立世界置き = 足接地 目的)
-    ik_results = setup_all_ik_fk()
+        # Step 4: root/main ctls を作成 (地面のオクタゴン + 主体 box)
+        #         attach_ctrls_grp の直下、他の ctl の親になる
+        _pw_span(28, 30); _pw_sub(0, "Create root/main ctls...")
+        diag = _scene_mesh_bbox_diag()
+        if not cmds.objExists(ROOT_GROUP):
+            cmds.group(em=True, name=ROOT_GROUP)
+        # world ctl (地面) — 大きめオクタゴン (mGear world_ctl 相当、赤)
+        world_ctl_name = "world_ctl"
+        if not cmds.objExists(world_ctl_name):
+            world_ctl = _make_octagon_curve(world_ctl_name, scale=diag * 0.28)
+            _set_ctl_color(world_ctl, COLOR_WORLD)
+            cmds.parent(world_ctl, ROOT_GROUP)
+            _lock_hide_attrs(world_ctl, ["sx","sy","sz","v"])
+        else:
+            world_ctl = world_ctl_name
+        # main ctl (体を包む) — 中サイズ box (mGear body_C0_ctl 相当、黄)
+        main_ctl_name = "main_ctl"
+        if not cmds.objExists(main_ctl_name):
+            main_ctl = _make_flat_box_curve(main_ctl_name, scale=diag * 0.2,
+                                            x_ratio=1.5, z_ratio=1.5)
+            _set_ctl_color(main_ctl, COLOR_C)
+            cmds.parent(main_ctl, world_ctl)
+            _lock_hide_attrs(main_ctl, ["sx","sy","sz","v"])
+        else:
+            main_ctl = main_ctl_name
 
-    print(f"[{_PACKAGE}] === full_auto_setup complete ===")
-    print(f"  FK ctls attached: {len(attach_result)}")
-    print(f"  IK/FK chains    : {len(ik_results)}")
-    for r in ik_results:
-        print(f"    {r['label']:15s} switch: {r['switch']}")
+        # Step 5: attach FK ctls, exclude IK/FK chain joints (30-55%)
+        _pw_span(30, 55); _pw_sub(0, "Attach FK controllers...")
+        chains = find_ik_chains()
+        exclude = set()
+        for chain in chains.values():
+            exclude.update(chain)
 
-    return {"fk_attach": attach_result, "ik_fk": ik_results}
+        all_joints = cmds.ls(type="joint") or []
+        other = [j for j in all_joints
+                 if j not in exclude
+                 and not j.endswith("_end")]
+        attach_result = attach_controllers(joints=other, scale=scale,
+                                            do_constrain=True,
+                                            auto_scale=True,
+                                            skip_decoration=skip_decoration)
+
+        # Step 6: ルート系 ctl の親を main_ctl に寄せる
+        # (attach_ctrls_grp 直下の孤立 npo を main_ctl の下に移動)
+        for child in cmds.listRelatives(ROOT_GROUP, c=True, type="transform") or []:
+            if child in (world_ctl_name, "world_ctl"):
+                continue
+            # world_ctl の下は触らない、それ以外の root-level npo だけ移す
+            if child.endswith("_npo"):
+                try:
+                    cmds.parent(child, main_ctl)
+                except Exception:
+                    pass
+
+        # Step 7: IK/FK setup (IK ctl NPO は独立世界置き = 足接地 目的) (55-100%)
+        _pw_span(55, 100); _pw_sub(0, "Setup IK/FK chains...")
+        ik_results = setup_all_ik_fk()
+
+        print(f"[{_PACKAGE}] === full_auto_setup complete ===")
+        print(f"  FK ctls attached: {len(attach_result)}")
+        print(f"  IK/FK chains    : {len(ik_results)}")
+        for r in ik_results:
+            print(f"    {r['label']:15s} switch: {r['switch']}")
+
+        return {"fk_attach": attach_result, "ik_fk": ik_results}
+    finally:
+        _pw_end()
 
 
 # =========================================================================
