@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.5"
+__version__ = "0.9.6"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -861,19 +861,42 @@ def _compute_pv_position(start_pos, mid_pos, end_pos, distance, fallback_dir=Non
 
 
 def _dup_hero_joint(orig, suffix, new_parent=None):
-    """joint を子なしで duplicate、任意の parent に付け直す。world transform は preserve。"""
-    n = cmds.duplicate(orig, po=True, n=orig + suffix)[0]
-    # 子が付いてきたら削除
-    kids = cmds.listRelatives(n, c=True) or []
-    for k in kids:
-        try: cmds.delete(k)
-        except Exception: pass
-    if new_parent is None:
-        try: cmds.parent(n, world=True)
-        except Exception: pass
+    """orig と同じ world 位置/回転で joint を作り、指定 parent 下に置く。
+
+    STRETCH2 scout 発見: 従来の `cmds.duplicate + cmds.parent` は FBX の world
+    scale=100 + twist bone 混在階層で「intermediate transform を挟む」病理を
+    起こし、IK chain が transform1 の下に取り残されて stretch が完全破綻した
+    (arm 側だけ発生、leg は twist 無しなので免れていた)。
+
+    対策: `cmds.duplicate` の代わりに `cmds.select(new_parent)` してから
+    `cmds.joint()` で直接生成、位置/回転/jointOrient/radius を手でコピーする。
+    これで parent は cmds.joint が正しく設定するため intermediate が生じない。
+    """
+    ws_t = cmds.xform(orig, q=True, ws=True, t=True)
+    ws_r = cmds.xform(orig, q=True, ws=True, ro=True)
+    if new_parent is not None and cmds.objExists(new_parent):
+        cmds.select(new_parent, r=True)
     else:
-        try: cmds.parent(n, new_parent)
-        except Exception: pass
+        cmds.select(cl=True)
+    n = cmds.joint(n=orig + suffix, p=ws_t)
+    # rotation を world で合わせる (freeze_joint_rotations 後は rotate=0,
+    # jointOrient に全て入ってるので orient を継承)
+    try: cmds.xform(n, ws=True, ro=ws_r)
+    except Exception: pass
+    # jointOrient を hero と揃える (IK solve が hero と同じ chain plane を解く)
+    for a in ("jointOrientX", "jointOrientY", "jointOrientZ"):
+        try:
+            v = cmds.getAttr(orig + "." + a)
+            cmds.setAttr(n + "." + a, v)
+        except Exception:
+            pass
+    # rotate を再度 0 に (jointOrient にセットしたので)
+    try: cmds.setAttr(n + ".rotate", 0, 0, 0, type="double3")
+    except Exception: pass
+    # visual radius を hero と同じに (0.016 想定)
+    try:
+        cmds.setAttr(n + ".radius", cmds.getAttr(orig + ".radius"))
+    except Exception: pass
     return n
 
 
@@ -1036,15 +1059,21 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
             cmds.addAttr(ui_host, ln=attr_name, at="float",
                          min=0.0, max=1.0, dv=dv, k=True)
     # mGear dagmenu が探す `<label>_blend` サフィックスを追加 (MENU scout)。
-    # 既存の IK_FK を driver にして値同期。
+    # `_blend` を master、`IK_FK` は driven にする (mGear の IK/FK Switch は
+    # setAttr `_blend` を叩くので、以前の逆方向接続だと "locked or connected"
+    # エラーが出て切替失敗していた)。
     blend_attr = label + "_blend"
     if not cmds.attributeQuery(blend_attr, node=ui_host, exists=True):
         cmds.addAttr(ui_host, ln=blend_attr, at="float",
                      min=0.0, max=1.0, dv=1.0, k=True)
-        try:
-            cmds.connectAttr(ui_host + ".IK_FK", ui_host + "." + blend_attr, f=True)
-        except Exception:
-            pass
+    # _blend → IK_FK: mGear が _blend を叩けば IK_FK が追従し既存の内部配線
+    # (orient blend / stretch gate 等) が反応する
+    try:
+        if not cmds.isConnected(ui_host + "." + blend_attr, ui_host + ".IK_FK"):
+            cmds.connectAttr(ui_host + "." + blend_attr,
+                             ui_host + ".IK_FK", f=True)
+    except Exception:
+        pass
     # コンポーネント配下 ctl リスト用 message array (mGear が
     # `<label>_id0_ctl_cnx` を叩いて全メンバーを取得する)
     ctl_cnx_attr = label + "_id0_ctl_cnx"
@@ -1093,16 +1122,18 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
             pass
 
     # 互換: IK ctl にも IK_FK を持たせる (proxy attribute で双方向編集可)
+    # proxy 先は master の `_blend` (IK_FK は driven なので書けない)。
     if not cmds.attributeQuery("IK_FK", node=ik_ctl, exists=True):
         try:
             # Maya 2019+ の proxy attribute
-            cmds.addAttr(ik_ctl, ln="IK_FK", proxy=ui_host + ".IK_FK", k=True)
+            cmds.addAttr(ik_ctl, ln="IK_FK",
+                         proxy=ui_host + "." + blend_attr, k=True)
         except Exception:
             # フォールバック: proxy 未対応環境なら通常 attr + connect
             cmds.addAttr(ik_ctl, ln="IK_FK", at="float",
                          min=0.0, max=1.0, dv=1.0, k=True)
             try:
-                cmds.connectAttr(ui_host + ".IK_FK",
+                cmds.connectAttr(ui_host + "." + blend_attr,
                                  ik_ctl + ".IK_FK", f=True)
             except Exception:
                 pass
@@ -1217,21 +1248,23 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
             cmds.setAttr(bta + ".input[0]", 1.0)
             cmds.connectAttr(cnd + ".outColorR", bta + ".input[1]")
             cmds.connectAttr(ui_host + ".stretch", bta + ".attributesBlender")
-            # IK chain bones の translate に scale 掛ける (elbow_ik と wrist_ik)
-            for b in (ik_chain[1], ik_chain[2]):
-                rest_t = cmds.getAttr(b + ".translate")[0]
-                md = cmds.createNode("multiplyDivide", n=b + "_stretch_mul")
-                cmds.setAttr(md + ".input1", *rest_t)
-                cmds.connectAttr(bta + ".output", md + ".input2X")
-                cmds.connectAttr(bta + ".output", md + ".input2Y")
-                cmds.connectAttr(bta + ".output", md + ".input2Z")
-                cmds.connectAttr(md + ".output", b + ".translate", f=True)
-            # hero chain (mid, end) の translate も IK モード時に scale 追従。
-            # IK_FK gate で FK 時は bind translate 維持。
+            # IK_FK gate: FK モード時は stretch を切って bind translate 維持
+            # (これが無いと FK モードで IK bone も勝手に伸縮して snap 時に狂う)
             ik_gate = cmds.createNode("blendTwoAttr", n=label + "_stretch_ikgate")
             cmds.setAttr(ik_gate + ".input[0]", 1.0)
             cmds.connectAttr(bta + ".output", ik_gate + ".input[1]")
             cmds.connectAttr(ui_host + ".IK_FK", ik_gate + ".attributesBlender")
+            # IK chain bones の translate に ik_gate 経由で scale 掛ける
+            # (STRETCH2 scout B: bta 直接だと FK モードでも伸びる)
+            for b in (ik_chain[1], ik_chain[2]):
+                rest_t = cmds.getAttr(b + ".translate")[0]
+                md = cmds.createNode("multiplyDivide", n=b + "_stretch_mul")
+                cmds.setAttr(md + ".input1", *rest_t)
+                cmds.connectAttr(ik_gate + ".output", md + ".input2X")
+                cmds.connectAttr(ik_gate + ".output", md + ".input2Y")
+                cmds.connectAttr(ik_gate + ".output", md + ".input2Z")
+                cmds.connectAttr(md + ".output", b + ".translate", f=True)
+            # hero chain (mid, end) の translate も同 ik_gate で駆動
             for h in (mid, end):
                 if cmds.objExists(h):
                     rest_h = cmds.getAttr(h + ".translate")[0]
