@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -505,29 +505,47 @@ def _rewrite_flat_horizontal(ctl_name, world_pos, scale, maker):
 
 
 def _mark_as_ctl(ctl):
-    """mGear (dagMenuProc override) が右クリックで controller menu を出せるよう
-    marker attr を付ける。mGear は message attr `isCtl` を主に検出するので
-    それを bool + message の両方で set。既存 rig との互換性確保。
+    """mGear の右クリック context menu を発火させる。
+    VPMENU scout が mGear 5.0 の `dagmenu.py:742` を実解析した結果:
+
+    1. **primary trigger**: `cmds.objExists("<sel>.isCtl")` bool attr
+    2. **Maya 標準 controller tag** (`cmds.controller`) — pick-walk 連携
+    3. **`rig_controllers_grp` objectSet 登録** — mGear の menu fill() が
+       `cmds.sets(cmds.ls(cmds.listConnections(ctl), type='objectSet'), q=True)`
+       を叩き、空 list だと TypeError で menu 構築が途中失敗する。純正
+       shifter は必ずここに add する。**未登録が「右クリメニュー出ない」真因**
     """
-    for attr, kind, kwargs in (
-        ("isCtl", "bool", {"dv": True, "k": False}),
-        ("is_ctl", "bool", {"dv": True, "k": False}),
-    ):
-        try:
-            if not cmds.attributeQuery(attr, node=ctl, exists=True):
-                cmds.addAttr(ctl, ln=attr, at=kind, **kwargs)
-            cmds.setAttr(ctl + "." + attr, channelBox=False)
-        except Exception:
-            pass
-    # Maya 標準の "controller" tag も付けておく (2019+ で右クリック
-    # pick-walking / marking menu が有効化される)
+    # 1. isCtl bool (mGear の唯一の gate)
+    try:
+        if not cmds.attributeQuery("isCtl", node=ctl, exists=True):
+            cmds.addAttr(ctl, ln="isCtl", at="bool", dv=True, k=False)
+        cmds.setAttr(ctl + ".isCtl", channelBox=False)
+    except Exception:
+        pass
+    # 2. Maya 2019+ controller tag
     try:
         cmds.controller(ctl)
+    except Exception:
+        pass
+    # 3. mGear が要求する rig_controllers_grp objectSet に登録
+    try:
+        set_name = "rig_controllers_grp"
+        if not cmds.objExists(set_name):
+            cmds.sets(name=set_name, empty=True)
+        if not cmds.sets(ctl, isMember=set_name):
+            cmds.sets(ctl, add=set_name)
     except Exception:
         pass
 
 
 def _set_ctl_color(ctl, color_idx):
+    """override color + mGear/Maya の controller marker を一括で付ける。
+    ctl 生成後に必ず呼ばれる場所なので、marker 付与漏れを構造的に防ぐ。"""
+    _mark_as_ctl(ctl)
+    return _set_ctl_color_only(ctl, color_idx)
+
+
+def _set_ctl_color_only(ctl, color_idx):
     shape = cmds.listRelatives(ctl, s=True, f=False)
     if not shape:
         return
@@ -612,7 +630,6 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
 
         ctl = maker(ctl_name, scale=ctl_size)
         _set_ctl_color(ctl, color)
-        _mark_as_ctl(ctl)
 
         npo = cmds.group(em=True, name=npo_name)
         cmds.parent(ctl, npo)
@@ -1402,20 +1419,79 @@ def _detect_foot_landmarks(ankle_joint, toe_joint):
 def _find_toe_joint(ankle_joint):
     """ankle_joint の child joint から toe を推定 (汎用検出)。
     優先: 「toe」を含む名前 > child joint 1 個目
-    無ければ None。"""
+    無ければ None。dummy/shadow/cancel は除外 (MMD 派生の非本命骨)。"""
     kids = cmds.listRelatives(ankle_joint, c=True, type="joint") or []
     if not kids:
         return None
+    _skip = ("dummy", "shadow", "cancel", "sub_", "ik_", "fk_", "twist")
+    def valid(k):
+        short = k.split("|")[-1].lower()
+        return not any(s in short for s in _skip) and not short.endswith("_end")
     for k in kids:
         short = k.split("|")[-1].lower()
-        if any(t in short for t in ("toe", "foot", "tip")) and not short.endswith("_end"):
+        if not valid(k):
+            continue
+        if any(t in short for t in ("toe", "foot", "tip")):
             return k
-    # フォールバック: _end でない最初の child joint
+    # フォールバック: 除外語無しで _end でない最初の child joint
     for k in kids:
-        if not k.split("|")[-1].endswith("_end"):
+        if valid(k):
             return k
-    # _end 含めて最初
+    # 最後の手段
     return kids[0]
+
+
+def _create_rfoot_bones(ankle_joint, landmarks):
+    """ball 骨が無いモデル (MMD 系等) 向けに reverse foot 用 helper joint を生成。
+
+    生成階層 (ankle_joint 直下、skinCluster には追加しない):
+      ankle_joint (hero, skinned)
+      └── ankle_joint_rfBallBone
+           └── ankle_joint_rfToeBone
+
+    Args:
+        ankle_joint: skin される ankle
+        landmarks: `_detect_foot_landmarks` の返り値 dict (heel/ball/tip/ground_y)
+
+    Returns:
+        dict {"rf_ball": name, "rf_toe": name} or None (landmarks 無効時)
+    """
+    if not landmarks:
+        return None
+    ball_pos = landmarks.get("ball")
+    tip_pos = landmarks.get("tip")
+    if not ball_pos or not tip_pos:
+        return None
+    ankle_y = cmds.xform(ankle_joint, q=True, ws=True, t=True)[1]
+    # Y は ankle と同じにする (bind pose で hero と揃える、reverse foot が
+    # 動いた時 toe_ikh 解に差が出ないように)
+    ball_ws = (ball_pos[0], ankle_y, ball_pos[2])
+    toe_ws = (tip_pos[0], ankle_y, tip_pos[2])
+    rf_ball = ankle_joint + "_rfBallBone"
+    rf_toe = ankle_joint + "_rfToeBone"
+    if cmds.objExists(rf_ball):
+        try: cmds.delete(rf_ball)
+        except Exception: pass
+    # 生成: 一旦 selection をクリアして正確な parent を得る
+    try:
+        cmds.select(ankle_joint, r=True)
+        b = cmds.joint(n=rf_ball, p=ball_ws)
+        t = cmds.joint(n=rf_toe, p=toe_ws)
+        # aim を X+ 前方に固定 (bind aim を rest pose として orient joint)
+        cmds.select(b, r=True)
+        cmds.joint(b, e=True, oj="xyz", sao="yup", ch=True, zso=True)
+        cmds.setAttr(b + ".radius", 0.016)
+        cmds.setAttr(t + ".radius", 0.016)
+        # 描画を控えめに (viewport ノイズ削減)
+        try:
+            cmds.setAttr(b + ".drawStyle", 2)
+            cmds.setAttr(t + ".drawStyle", 2)
+        except Exception:
+            pass
+        return {"rf_ball": b, "rf_toe": t}
+    except Exception as exc:
+        cmds.warning(f"[{_PACKAGE}] _create_rfoot_bones failed: {exc}")
+        return None
 
 
 def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
@@ -1436,6 +1512,20 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
 
     # mesh-aware 検出 (skinCluster + vertex サンプリング)
     landmarks = _detect_foot_landmarks(ankle_joint, toe_joint)
+
+    # ball 骨が hero chain に存在しないモデル (MMD 等) 向けに、reverse foot
+    # 用 helper joint (ankle_L_rfBallBone / _rfToeBone) を ankle 直下に生成。
+    # 通常の setup (toe_L_ik dup + SC toe_ikh) は skin joint toe に IK 影響を
+    # 直接与えるため toe rotation の副作用が読みにくい。rfBone 系は独立 chain
+    # として toe_ikh の pivot 用に使い、hero toe は parentConstraint(mo=True)
+    # で追従させる (RFBONE scout 提案)。
+    rf_bones = None
+    has_ball_child = False
+    for k in cmds.listRelatives(ankle_joint, c=True, type="joint") or []:
+        if "ball" in k.lower():
+            has_ball_child = True; break
+    if not has_ball_child and landmarks:
+        rf_bones = _create_rfoot_bones(ankle_joint, landmarks)
     if landmarks:
         heel_pos      = landmarks["heel"]
         ball_pos      = landmarks["ball"]
@@ -1515,44 +1605,64 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     # 「足が縦になる」問題を起こす (TWIST scout 発見)。ik_chain 側の ankle_ik
     # に対応する joint に張って副作用を避ける。もし ankle_ik が無ければ skip。
     ankle_ik = ankle_joint + "_ik"
-    toe_ik = toe_joint + "_ik"
-    # setup_ik_fk は 3-joint chain (leg/knee/ankle) しか dup しないので
-    # toe_L_ik は未生成。それだと SC ikHandle が張れず、ball_ctl を回すと
-    # toe が ankle 階層で丸ごと動く「足全体が動く」バグになる (RFOOT scout
-    # 発見)。ここで toe_ik を ankle_ik の子として自前 dup する。
-    if cmds.objExists(ankle_ik) and not cmds.objExists(toe_ik):
+    toe_ikh = None
+
+    if rf_bones:
+        # 自作 rfoot chain (rfBallBone → rfToeBone) に SC ikh を張って toe_piv
+        # 下にペアレント。hero toe は rfToeBone を mo=True で追従、bind 位置
+        # 保持しつつ ball_ctl 回転が hero toe に伝わる。ankle は既存 leg-IK に
+        # 触れない (rotate は leg-IK が占有)。
+        rf_ball = rf_bones["rf_ball"]; rf_toe = rf_bones["rf_toe"]
         try:
-            toe_ik = _dup_hero_joint(toe_joint, "_ik", new_parent=ankle_ik)
-            try: cmds.setAttr(toe_ik + ".drawStyle", 2)
-            except Exception: pass
-        except Exception as exc:
-            cmds.warning(f"[attach_ctrls] toe_ik dup failed: {exc}")
-            toe_ik = None
-    if ankle_ik and toe_ik and cmds.objExists(ankle_ik) and cmds.objExists(toe_ik):
-        try:
-            toe_ikh = cmds.ikHandle(sj=ankle_ik, ee=toe_ik,
-                                    sol="ikSCsolver", n=label + "_toeIkh")[0]
+            toe_ikh = cmds.ikHandle(sj=rf_ball, ee=rf_toe,
+                                    sol="ikSCsolver", n=label + "_rfToeIkh")[0]
             cmds.parent(toe_ikh, toe_piv)
-            # hero toe joint を toe_ik に parentConstraint (translate + rotate)
-            # で pin。orient だけでは toe が ankle の bind 階層で引きずられて
-            # 「足全体が動く」ままになる。既存 parentConstraint (attach_controllers
-            # Pass 3 で toe_L_ctl から入っている) を削除してから toe_ik を張る。
             if cmds.objExists(toe_joint):
                 for con in (cmds.listConnections(toe_joint + ".translateX",
                             s=True, d=False, type="constraint") or []):
                     try: cmds.delete(con)
                     except Exception: pass
                 try:
-                    cmds.parentConstraint(toe_ik, toe_joint, mo=False,
-                                          n=toe_joint + "_ikfk_pc")
+                    cmds.parentConstraint(rf_toe, toe_joint, mo=True,
+                                          n=toe_joint + "_rfToe_pc")
                 except Exception as e:
-                    cmds.warning(f"[attach_ctrls] toe parentConstraint: {e}")
+                    cmds.warning(f"[attach_ctrls] rfToe pc: {e}")
         except Exception as exc:
-            cmds.warning(f"[attach_ctrls] toe ikHandle failed: {exc}")
+            cmds.warning(f"[attach_ctrls] rfToe ikHandle failed: {exc}")
             toe_ikh = None
     else:
-        cmds.warning(f"[attach_ctrls] toe ikHandle skipped: {ankle_ik}/{toe_ik} not found")
-        toe_ikh = None
+        # ball 骨が既に存在する (mixamo 等) か landmark 検出失敗時: 従来経路
+        # (toe_L_ik を ankle_ik 子として dup + SC ikh)
+        toe_ik = toe_joint + "_ik"
+        if cmds.objExists(ankle_ik) and not cmds.objExists(toe_ik):
+            try:
+                toe_ik = _dup_hero_joint(toe_joint, "_ik", new_parent=ankle_ik)
+                try: cmds.setAttr(toe_ik + ".drawStyle", 2)
+                except Exception: pass
+            except Exception as exc:
+                cmds.warning(f"[attach_ctrls] toe_ik dup failed: {exc}")
+                toe_ik = None
+        if ankle_ik and toe_ik and cmds.objExists(ankle_ik) and cmds.objExists(toe_ik):
+            try:
+                toe_ikh = cmds.ikHandle(sj=ankle_ik, ee=toe_ik,
+                                        sol="ikSCsolver", n=label + "_toeIkh")[0]
+                cmds.parent(toe_ikh, toe_piv)
+                if cmds.objExists(toe_joint):
+                    for con in (cmds.listConnections(toe_joint + ".translateX",
+                                s=True, d=False, type="constraint") or []):
+                        try: cmds.delete(con)
+                        except Exception: pass
+                    try:
+                        cmds.parentConstraint(toe_ik, toe_joint, mo=False,
+                                              n=toe_joint + "_ikfk_pc")
+                    except Exception as e:
+                        cmds.warning(f"[attach_ctrls] toe pc: {e}")
+            except Exception as exc:
+                cmds.warning(f"[attach_ctrls] toe ikHandle failed: {exc}")
+                toe_ikh = None
+        else:
+            cmds.warning(f"[attach_ctrls] toe ikHandle skipped: no ankle_ik/toe_ik")
+            toe_ikh = None
 
     # heel_piv を foot IK ctl の下に置くと ctl (=ankle joint rot 継承) の局所軸で
     # pivot が回転してしまい footRoll が水平スライドになる。ctl と heel_piv の間に
