@@ -276,27 +276,23 @@ try:
         ankle_R_after = cmds.xform("ankle_R", q=True, ws=True, t=True) \
             if cmds.objExists("ankle_R") else None
 
+        # 「接地」判定: waist を回した時 ankle が world 上でどれだけ動くか。
+        # 以前は dist(ankle, IK_ctl) を測っていたが、reverse foot rig は
+        # IK ctl を foot bbox 中央 (heel-tip 中間) に置くため bind pose 時点で
+        # ankle↔ctl が既に ~2.84 unit ズレており、threshold 1.0 は物理的に不可能。
+        # 正しい metric は "ankle が world 固定されるか" = world shift。
         dL = sum((a-b)**2 for a,b in zip(ankle_L_after, ankle_L_before))**0.5
         dR = sum((a-b)**2 for a,b in zip(ankle_R_after, ankle_R_before))**0.5 \
             if ankle_R_after else 0.0
-        # Note: MMD の waistcancel_L/R bone があるため、waist rot 時 leg 側は
-        # 元設計では counter-rotate されるはず。今回の rig では waistcancel も
-        # ただの子として ctl 付いてるので、waist rot は leg にも伝播する。
-        # ただし IK ctl がワールド固定なので、ankle は IK ctl 位置に "戻される"。
-        # ここでは 「waist を回した後も ankle が IK ctl の近くにいる」 を確認する。
-        ik_ctl_L_pos = cmds.xform("leg_L_IK_ctl", q=True, ws=True, t=True)
-        dL_to_ik = sum((a-b)**2 for a,b in zip(ankle_L_after, ik_ctl_L_pos))**0.5
-        dR_to_ik = 0.0
-        if ankle_R_after and cmds.objExists("leg_R_IK_ctl"):
-            ik_ctl_R_pos = cmds.xform("leg_R_IK_ctl", q=True, ws=True, t=True)
-            dR_to_ik = sum((a-b)**2 for a,b in zip(ankle_R_after, ik_ctl_R_pos))**0.5
-
-        planted_L = dL_to_ik < 1.0  # ankle が IK ctl から 1 unit 以内なら「接地」判定
-        planted_R = dR_to_ik < 1.0
-        step("waist_rotation_left_ankle_at_IK_ctl", planted_L,
-             f"waist rot 10deg -> ankle_L to IK_ctl distance = {dL_to_ik:.3f}")
-        step("waist_rotation_right_ankle_at_IK_ctl", planted_R,
-             f"waist rot 10deg -> ankle_R to IK_ctl distance = {dR_to_ik:.3f}")
+        # waistcancel bone があるものの MMD 特有の cancel logic は Maya import で
+        # 消えているので waist rot が leg にも 1.6 unit 伝播する。IK ctl が world
+        # 固定なので IK は ankle を planted に近づける。residual として 1.0 未満なら OK。
+        planted_L = dL < 1.0
+        planted_R = dR < 1.0
+        step("waist_rotation_left_ankle_planted", planted_L,
+             f"waist rot 10deg -> ankle_L world shift = {dL:.3f}")
+        step("waist_rotation_right_ankle_planted", planted_R,
+             f"waist rot 10deg -> ankle_R world shift = {dR:.3f}")
 
         # reset
         try: cmds.setAttr(waist_ctl_name + ".rotateY", 0)

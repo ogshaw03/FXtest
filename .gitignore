@@ -6,6 +6,15 @@ __pycache__/
 # test artifacts (verification harness output)
 _test_result.json
 _test_run.py
+_test_full_setup_result.json
+_bind_pose_drift.json
+_revfoot_result.json
+_waistfix_diag.py
+_waistfix_result.json
+
+# Maya scene files (working artifacts)
+*.ma
+*.mb
 
 # user-provided test assets (not for public distribution)
 *.fbx
