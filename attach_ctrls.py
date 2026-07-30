@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -655,29 +655,36 @@ def _dup_clean_chain(joints, suffix):
     return new_joints
 
 
-def _compute_pv_position(start_pos, mid_pos, end_pos, distance):
+def _compute_pv_position(start_pos, mid_pos, end_pos, distance, fallback_dir=None):
     """3-joint chain (start-mid-end) の bind pose を保つ pole vector 位置。
 
     chain plane 内で mid から start-end 直線の perpendicular 方向に distance 押し出す。
-    こうすると IK RP solver は既にこの平面で解いており、bind pose = solved pose に
-    なるため、pole vector 追加でも hero joint が bind から drift しない。
+    T-pose のほぼ直線 chain (Nekotatune 腕、pole_len 0.4 等) だと perpendicular が
+    数値的に不安定 → fallback_dir (chain 種類別 hint) が指定されていれば使う。
     """
     import math
     v_se = [end_pos[i] - start_pos[i] for i in range(3)]
     v_sm = [mid_pos[i] - start_pos[i] for i in range(3)]
     len2_se = sum(a*a for a in v_se)
+    len_se = math.sqrt(len2_se)
     if len2_se < 1e-6:
         return list(mid_pos)
     t = sum(v_sm[i] * v_se[i] for i in range(3)) / len2_se
-    # start-end 直線上の mid 最近点
     projected = [start_pos[i] + t * v_se[i] for i in range(3)]
-    # projected -> mid の方向 = perpendicular
     pole_dir = [mid_pos[i] - projected[i] for i in range(3)]
     pole_len = math.sqrt(sum(a*a for a in pole_dir))
-    if pole_len < 1e-6:
-        # chain が直線状 (degenerate) → 適当な perpendicular (world Z)
-        pole_dir = [0, 0, 1]
-        pole_len = 1.0
+
+    # chain plane 判定不安定なら fallback_dir を採用 (chain length の 10% を閾値)
+    if pole_len < len_se * 0.1:
+        if fallback_dir is not None:
+            pd = list(fallback_dir)
+            pd_len = math.sqrt(sum(a*a for a in pd))
+            if pd_len > 1e-6:
+                pole_dir = [pd[i] / pd_len for i in range(3)]
+                pole_len = 1.0
+        if pole_len < 1e-6:
+            pole_dir = [0, 0, 1]
+            pole_len = 1.0
     return [mid_pos[i] + pole_dir[i] / pole_len * distance for i in range(3)]
 
 
@@ -786,7 +793,14 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         base_offset = diag / 8.0
     else:
         base_offset = pv_offset
-    pv_pos = _compute_pv_position(start_pos, mid_pos, end_pos, base_offset)
+    # T-pose straight chain の fallback: 腕は後方 (-Z), 脚は前方 (+Z)
+    lo = label.lower()
+    if "leg" in lo or "knee" in lo or "ankle" in lo:
+        fallback_pv = [0, 0, +1]
+    else:
+        fallback_pv = [0, 0, -1]
+    pv_pos = _compute_pv_position(start_pos, mid_pos, end_pos,
+                                   base_offset, fallback_dir=fallback_pv)
     cmds.xform(pv_npo, ws=True, t=pv_pos)
     cmds.parent(pv_npo, ROOT_GROUP)
     # NOTE: poleVectorConstraint はここでは張らない。
@@ -853,40 +867,48 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     # twist bones は元 hero joint の child なので、hero joint 回転すれば自然追従。
     # IK solver は clean chain だけ動かし、twist bones を直接触らない。
     for orig, ikj, fkj in zip([start, mid, end], ik_chain, fk_chain):
-        cons = cmds.orientConstraint(fkj, ikj, orig, mo=True,
+        # end joint (wrist/ankle) は IK solver が rotate を制御しないので、
+        # ikj (wrist_ik) 経由でなく ik_ctl を直接 orient source に使う。
+        # これで wrist_ik 経由の local-space 不整合が消え、TWIST scout 報告の
+        # 手首捻れ (arm_R wrist 127°) が解消する。
+        ikj_source = ik_ctl if orig == end else ikj
+        cons = cmds.orientConstraint(fkj, ikj_source, orig, mo=True,
                                      n=orig + "_ikfk_oc")[0]
         wal = cmds.orientConstraint(cons, q=True, wal=True)  # [fkW, ikW]
         cmds.connectAttr(rev + ".outputX",  cons + "." + wal[0])
         cmds.connectAttr(ik_ctl + ".IK_FK", cons + "." + wal[1])
-
-    # end joint に IK ctl の rotation も反映 (手/足の向き制御)
-    end_orient_cons = cmds.orientConstraint(ik_ctl, wrist_ik, mo=True,
-                                            n=end + "_ik_orient_oc")[0]
+    # 従来の orientConstraint(ik_ctl, wrist_ik, mo=True) は削除
+    # (wrist_ik を driven する必要が無くなった)
 
     # --- 8. Pole vector constraint (orient blend 構築の後で張る) ---
-    # 記録: bind pose の hero start joint 世界回転 (twist 補正判定用)
-    def _rot_diff_max(j, ref_rot):
-        cur = [cmds.getAttr(j + "." + a) for a in ("rx","ry","rz")]
-        d = [abs((cur[i] - ref_rot[i] + 180) % 360 - 180) for i in range(3)]
-        return max(d)
-    bind_start_rot = [cmds.getAttr(start + "." + a) for a in ("rx","ry","rz")]
+    # 判定は world X 軸 (bone 軸) の acos で行う。start+mid+end 3 joint の合算 drift
+    # を最小化する twist を選ぶ (FOOTROT scout 発見: start だけだと elbow/wrist の
+    # 163°/127° flip を見逃す)。
+    import math as _math
+    def _bone_axis_diff(j, ref_matrix):
+        m = cmds.xform(j, q=True, ws=True, m=True) or [0]*16
+        dot = m[0]*ref_matrix[0] + m[1]*ref_matrix[1] + m[2]*ref_matrix[2]
+        dot = max(-1.0, min(1.0, dot))
+        return _math.degrees(_math.acos(dot))
+
+    bind_matrices = {
+        j: cmds.xform(j, q=True, ws=True, m=True) for j in (start, mid, end)
+    }
+
+    def _total_drift():
+        return sum(_bone_axis_diff(j, bind_matrices[j]) for j in bind_matrices)
 
     cmds.poleVectorConstraint(pv_ctl, ik_handle)
 
     # --- 8.5. Twist 自動補正 (RP solver plane flip 対策) ---
-    # まっすぐな arm 系 chain で RP solver は plane を誤選択、PV 適用で hero が
-    # 180° 反転することがある。twist attr を 0/±30/±60/±90/±120/±150/180 で
-    # 総当りして bind rot に最も近い値を採用。
-    #
-    # 常に総当り評価 (skip しない): threshold で分岐すると arm_R 85° drift のような
-    # ケースを見落とす。
-    _twist_candidates = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180]
+    # 5° 刻みで細かく総当り、3 joint 合算 drift 最小の twist を採用
+    _twist_candidates = list(range(-180, 181, 5))
     best_twist = 0.0
-    best_drift = _rot_diff_max(start, bind_start_rot)
+    best_drift = _total_drift()
     for twist_try in _twist_candidates:
         try:
             cmds.setAttr(ik_handle + ".twist", float(twist_try))
-            d = _rot_diff_max(start, bind_start_rot)
+            d = _total_drift()
             if d < best_drift:
                 best_drift = d
                 best_twist = float(twist_try)
@@ -896,8 +918,11 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         cmds.setAttr(ik_handle + ".twist", best_twist)
     except Exception:
         pass
-    init_drift = _rot_diff_max(start, bind_start_rot)  # after setting best
-    print(f"[{_PACKAGE}] {label} twist={best_twist}° (final drift {init_drift:.1f}°)")
+    final_total = _total_drift()
+    final_per_j = {j: _bone_axis_diff(j, bind_matrices[j]) for j in bind_matrices}
+    print(f"[{_PACKAGE}] {label} twist={best_twist}° "
+          f"(total drift {final_total:.1f}°, per-joint: "
+          f"{ {k.split('|')[-1]: round(v,1) for k,v in final_per_j.items()} })")
 
     # --- 8. Visibility (UI host の ikVis/fkVis で明示制御) ---
     try: cmds.setAttr(ik_ctl + ".v", lock=False)
@@ -1103,21 +1128,40 @@ def _detect_foot_landmarks(ankle_joint, toe_joint):
     if not candidates:
         return None
 
-    # 4. Y filter
+    # 4. Y filter (2 段階)
+    #    (a) ankle 以下の大まかフィルタ (装飾 vertex 除去のため必要)
     below = [v for v in candidates if v[1] < ankle_pos[1]]
     if not below:
         below = candidates
-
     ground_y = min(v[1] for v in below)
+
+    #    (b) 床帯厳格フィルタ: ground から ankle Y までの下 25% 帯のみを heel/tip 判定に使う。
+    #        これで装飾骨 (後方バルジ Y=3.6) が heel と誤判定される問題を回避。
+    floor_band_tol = (ankle_pos[1] - ground_y) * 0.25
+    floor_band = [v for v in below if v[1] < ground_y + floor_band_tol]
+    if len(floor_band) < 3:
+        # フォールバック: 床帯 vertex 少なすぎ → 下 50%
+        floor_band = [v for v in below if v[1] < ground_y + (ankle_pos[1] - ground_y) * 0.5]
+    if not floor_band:
+        floor_band = below
 
     def _fwd_proj(v):
         return (v[0] - ankle_pos[0]) * fwd_x + (v[2] - ankle_pos[2]) * fwd_z
 
-    heel_v = min(below, key=_fwd_proj)
-    tip_v  = max(below, key=_fwd_proj)
+    heel_v = min(floor_band, key=_fwd_proj)
+    tip_v  = max(floor_band, key=_fwd_proj)
+
+    # (c) heel 距離クランプ: |heel_proj| > toe_dist * 0.6 は装飾骨混入と判定、
+    #     幾何近似に戻す (ankle → toe 反対方向 0.4 倍)
+    toe_dist = ((toe_pos[0]-ankle_pos[0])**2 + (toe_pos[2]-ankle_pos[2])**2)**0.5
+    heel_proj = _fwd_proj(heel_v)
+    if abs(heel_proj) > toe_dist * 0.6:
+        heel_v = [ankle_pos[0] - fwd_x * toe_dist * 0.4,
+                  ground_y,
+                  ankle_pos[2] - fwd_z * toe_dist * 0.4]
+
     tip_proj = _fwd_proj(tip_v)
     tol = (ankle_pos[1] - ground_y) * 0.15
-
     floor = [v for v in below
              if v[1] < ground_y + tol
              and _fwd_proj(v) > 0
@@ -1129,12 +1173,18 @@ def _detect_foot_landmarks(ankle_joint, toe_joint):
                   ground_y,
                   (ankle_pos[2] + tip_v[2]) * 0.5]
 
-    print(f"[{_PACKAGE}] foot landmarks from {len(candidates)} verts: "
-          f"heel Z={heel_v[2]:.2f}, tip Z={tip_v[2]:.2f}, ground={ground_y:.2f}")
+    # (d) heel/tip の Y を ground_y に射影して pivot ctl が床面に来るように
+    heel_out = [heel_v[0], ground_y, heel_v[2]]
+    tip_out  = [tip_v[0],  ground_y, tip_v[2]]
+    ball_out = [ball_v[0], ground_y, ball_v[2]]
+
+    print(f"[{_PACKAGE}] foot landmarks from {len(candidates)} verts "
+          f"(floor band {len(floor_band)}): "
+          f"heel Z={heel_out[2]:.2f}, tip Z={tip_out[2]:.2f}, ground={ground_y:.2f}")
     return {
-        "heel": list(heel_v),
-        "tip":  list(tip_v),
-        "ball": list(ball_v),
+        "heel": heel_out,
+        "tip":  tip_out,
+        "ball": ball_out,
         "ground_y": ground_y,
     }
 
@@ -1213,22 +1263,26 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     piv_size = ((ankle_pos[0]-toe_pos[0])**2 + (ankle_pos[2]-toe_pos[2])**2)**0.5 * 0.3
     piv_size = max(piv_size, 0.5)
 
+    # NOTE: translate lock は **全ての parent 操作が終わってから** 実行する。
+    # parent 前に tx/ty/tz を lock すると `cmds.parent` が world 位置を保存できず
+    # pivot ツリーが飛び、後段の toe_ikh が ankle を 100° 回転させる致命バグに繋がる
+    # (FOOTROT scout で確定原因)。ここでは scale だけ lock、translate は後で。
     heel_piv = _make_cube_curve(label + "_heel_ctl", scale=piv_size)
     _set_ctl_color(heel_piv, color)
     cmds.xform(heel_piv, ws=True, t=heel_pos)
-    _lock_hide_attrs(heel_piv, ["sx","sy","sz","tx","ty","tz"])
+    _lock_hide_attrs(heel_piv, ["sx","sy","sz"])
 
     toe_piv = _make_cube_curve(label + "_tip_ctl", scale=piv_size)
     _set_ctl_color(toe_piv, color)
     cmds.xform(toe_piv, ws=True, t=toe_pivot_pos)
     cmds.parent(toe_piv, heel_piv)
-    _lock_hide_attrs(toe_piv, ["sx","sy","sz","tx","ty","tz"])
+    _lock_hide_attrs(toe_piv, ["sx","sy","sz"])
 
     ball_piv = _make_cube_curve(label + "_ball_ctl", scale=piv_size * 0.8)
     _set_ctl_color(ball_piv, color)
     cmds.xform(ball_piv, ws=True, t=ball_pos)
     cmds.parent(ball_piv, toe_piv)
-    _lock_hide_attrs(ball_piv, ["sx","sy","sz","tx","ty","tz"])
+    _lock_hide_attrs(ball_piv, ["sx","sy","sz"])
 
     # 既存の pointConstraint (ik_ctl -> foot_ikh) を削除。
     # そうしないと pivot chain の rotation で handle 位置が動いても
@@ -1247,26 +1301,38 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
         pass
 
     # ankle -> toe の SC IK handle (toe を持ち上げる用)
-    try:
-        toe_ikh = cmds.ikHandle(sj=ankle_joint, ee=toe_joint,
-                                sol="ikSCsolver", n=label + "_toeIkh")[0]
-        cmds.parent(toe_ikh, toe_piv)
-    except Exception as exc:
-        cmds.warning(f"[attach_ctrls] toe ikHandle failed for {ankle_joint}: {exc}")
+    # 元 hero ankle に張ると orient blend と競合し ankle world Y 軸が回されて
+    # 「足が縦になる」問題を起こす (TWIST scout 発見)。ik_chain 側の ankle_ik
+    # に対応する joint に張って副作用を避ける。もし ankle_ik が無ければ skip。
+    ankle_ik = ankle_joint + "_ik"
+    toe_ik = toe_joint + "_ik"
+    if cmds.objExists(ankle_ik) and cmds.objExists(toe_ik):
+        try:
+            toe_ikh = cmds.ikHandle(sj=ankle_ik, ee=toe_ik,
+                                    sol="ikSCsolver", n=label + "_toeIkh")[0]
+            cmds.parent(toe_ikh, toe_piv)
+        except Exception as exc:
+            cmds.warning(f"[attach_ctrls] toe ikHandle failed on ik chain: {exc}")
+            toe_ikh = None
+    else:
+        # ik chain 未生成の場合 (setup_ik_fk 未実施等) は toe ikHandle を張らない
+        cmds.warning(f"[attach_ctrls] toe ikHandle skipped: {ankle_ik}/{toe_ik} not found")
         toe_ikh = None
 
     # heel_piv を foot IK ctl の下に置くと ctl (=ankle joint rot 継承) の局所軸で
     # pivot が回転してしまい footRoll が水平スライドになる。ctl と heel_piv の間に
     # world-aligned な offset group を挟んで world 軸で回転させる。
     piv_root = cmds.group(em=True, n=ankle_joint + "_pivRoot")
-    # piv_root は identity rot (world-aligned) で ctl の子に
     cmds.parent(piv_root, foot_ik_ctl)
     cmds.xform(piv_root, os=True, t=(0,0,0), ro=(0,0,0))
-    # heel_piv をそこに parent (world 位置は preserve)
     try:
         cmds.parent(heel_piv, piv_root)
     except Exception:
         pass
+
+    # 全 parent 完了後に tx/ty/tz を lock (順序が逆だと world 位置が飛ぶ)
+    for piv in (heel_piv, toe_piv, ball_piv):
+        _lock_hide_attrs(piv, ["tx","ty","tz"])
 
     # UI host に attr を集約 (mGear 慣習): leg_L_UI_ctl があればそこに、無ければ IK ctl に
     label_chain = "leg_L" if side == "L" else "leg_R" if side == "R" else "leg_C"
@@ -1525,15 +1591,16 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     if delete_junk:
         delete_unnecessary()
 
-    # Step 3.5: joint radius を mesh diag 相対で小さく (骨自体の viewport 表示縮小)
+    # Step 3.5: joint radius を mesh diag 相対で **かなり小さく** (骨の viewport 表示縮小)
+    # ユーザー要望で diag/400 → diag/1000 に (ほぼ点表示)
     diag = _scene_mesh_bbox_diag()
-    joint_radius = max(0.05, diag / 400.0)
+    joint_radius = max(0.02, diag / 1000.0)
     for j in cmds.ls(type="joint") or []:
         try:
             cmds.setAttr(j + ".radius", joint_radius)
         except Exception:
             pass
-    print(f"[{_PACKAGE}] joint radius set to {joint_radius:.3f} (diag/400)")
+    print(f"[{_PACKAGE}] joint radius set to {joint_radius:.4f} (diag/1000)")
 
     # Step 4: root/main ctls を作成 (地面のオクタゴン + 主体 box)
     #         attach_ctrls_grp の直下、他の ctl の親になる
