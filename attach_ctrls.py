@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.8.0"
+__version__ = "0.8.3"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -755,13 +755,15 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         except Exception: pass
 
     # --- 2. IK handle on CLEAN chain ---
-    # 現ポーズを preferredAngle に保存してから ikHandle 作成。これをしないと
-    # RP solver が bind ポーズを "曖昧" と判定して chain を数度回転させ、
-    # orient blend の offset が非ゼロになり hero chain が 2.84 unit drift する
-    # (ctl は正しい位置にあるが joint が移動して見える現象)。
-    for j in ik_chain:
-        try: cmds.joint(j, e=True, spa=True)
-        except Exception: pass
+    # leg 系のみ: 現ポーズを preferredAngle に保存してから ikHandle 作成。
+    # これで RP solver が bind ポーズを "曖昧" と判定して chain を数度回転させ、
+    # orient blend offset が非ゼロになる問題を回避 (leg 2.84 unit drift 消滅)。
+    # arm は MMD 由来の jointOrient 左右非対称のため spa 適用で R 側が 63 unit
+    # 反転する副作用があり、適用しない (drift 0.8-1.9 unit で許容)。
+    if "leg" in label.lower():
+        for j in ik_chain:
+            try: cmds.joint(j, e=True, spa=True)
+            except Exception: pass
     ik_handle = cmds.ikHandle(sj=arm_ik, ee=wrist_ik,
                               sol="ikRPsolver", n=label + "_ikh")[0]
     # IK handle は attach_ctrls_grp 下に (元 chain 内に置かないほうが管理しやすい)
