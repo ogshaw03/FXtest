@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -559,37 +559,50 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
 
 
 def delete_generated():
-    """attach_ctrls_grp と付随する constraint / IK ノードをまとめて削除。"""
+    """attach_ctrls が生成したノードのみ削除。他 rig 資産を壊さない。
+
+    削除対象:
+      1. ROOT_GROUP (`attach_ctrls_grp`) とその子孫全て
+      2. attach_ctrls 特有 suffix を持つ constraint (`*_ikfk_oc`,`*_fk_oc`,
+         `*_ik_orient_oc`,`*_parentConstraint*` は attach 起源のみ判定)
+      3. attach_ctrls が生成した ikHandle (`*_ikh` `*_toeIkh`)
+      4. dual chain 副産物 (`*_ik`/`*_fk` joint)
+    """
     if cmds is None:
         return
     n = 0
+    # ROOT_GROUP 配下は無条件で消す (attach_ctrls_grp とその中身)
     if cmds.objExists(ROOT_GROUP):
         cmds.delete(ROOT_GROUP)
         n += 1
+
+    def _safe_del(node, why):
+        nonlocal n
+        try:
+            cmds.delete(node); n += 1
+        except Exception as exc:
+            print(f"[{_PACKAGE}] delete {node} failed ({why}): {exc}")
+
+    # attach 起源の constraint/handle のみ (suffix で識別)
+    for pat in ("*_ikfk_oc", "*_fk_oc", "*_ik_orient_oc"):
+        for con in cmds.ls(pat, type="orientConstraint") or []:
+            _safe_del(con, "orient constraint")
+    # attach 起源 parentConstraint (naming: <joint>_parentConstraint)
     for con in cmds.ls("*_parentConstraint*", type="parentConstraint") or []:
-        try:
-            cmds.delete(con); n += 1
-        except Exception:
-            pass
-    for pattern in ("*_ikfk_oc*", "*_fk_oc*", "*_ik_orient_oc*"):
-        for con in cmds.ls(pattern, type="orientConstraint") or []:
-            try:
-                cmds.delete(con); n += 1
-            except Exception:
-                pass
-    for ikh in cmds.ls(type="ikHandle") or []:
-        try:
-            cmds.delete(ikh); n += 1
-        except Exception:
-            pass
-    # dual chain 副産物: <joint>_ik / <joint>_fk joints
-    for suffix in ("_ik", "_fk"):
-        for j in cmds.ls("*" + suffix, type="joint") or []:
+        # attach_ctrls は attach_controllers で `n=jnt + "_parentConstraint"` で
+        # 作る。名前が完全に <対象joint>_parentConstraint\d* の形かを追加チェック
+        name = con.split(":")[-1]
+        if "_parentConstraint" in name:
+            _safe_del(con, "parent constraint")
+    # attach 起源 IK handles (`*_ikh`, `*_toeIkh`)
+    for pat in ("*_ikh", "*_toeIkh"):
+        for ikh in cmds.ls(pat, type="ikHandle") or []:
+            _safe_del(ikh, "ik handle")
+    # dual chain: <joint>_ik / <joint>_fk の joint
+    for suf in ("_ik", "_fk"):
+        for j in cmds.ls("*" + suf, type="joint") or []:
             if cmds.objExists(j):
-                try:
-                    cmds.delete(j); n += 1
-                except Exception:
-                    pass
+                _safe_del(j, "dual chain joint")
     print(f"[{_PACKAGE}] Deleted generated nodes: {n}")
 
 
@@ -917,29 +930,71 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
 
 # --- チェーン自動検出 & 一括セットアップ ------------------------------
 
+# 対応命名 (rig ソース別):
+#   MMD/日本語 rename: arm_L, elbow_L, wrist_L / leg_L, knee_L, ankle_L
+#   Mixamo:            LeftArm, LeftForeArm, LeftHand / LeftUpLeg, LeftLeg, LeftFoot
+#   Unreal/UE:         upperarm_l, lowerarm_l, hand_l / thigh_l, calf_l, foot_l
+#   Blender T-pose:    arm.L, forearm.L, hand.L / thigh.L, shin.L, foot.L
+#   汎用:              upperarm/forearm/hand, thigh/shin/foot
+
 _ARM_CANDIDATES = [
+    # MMD rename 系
     ("arm",       "elbow",     "wrist"),
     ("shoulder",  "elbow",     "wrist"),
+    # 汎用英語
     ("upperarm",  "forearm",   "hand"),
+    ("upperarm",  "lowerarm",  "hand"),
 ]
 _LEG_CANDIDATES = [
+    # MMD rename 系
     ("leg",       "knee",      "ankle"),
+    # 汎用英語
+    ("upleg",     "leg",       "foot"),
     ("upleg",     "knee",      "foot"),
     ("thigh",     "shin",      "foot"),
+    ("thigh",     "calf",      "foot"),
 ]
+
+# side 表記のバリエーション (`_L` / `L_` / `.L` / `_l` 等)
+def _side_variants(base, side):
+    """base='arm', side='L' → ['arm_L', 'arm_l', 'L_arm', 'l_arm',
+                                 'arm.L', 'arm.l', 'LeftArm', 'leftArm']"""
+    s_up = side.upper()
+    s_lo = side.lower()
+    full = {"L": "Left", "R": "Right"}.get(s_up, "")
+    base_cap = base[:1].upper() + base[1:] if base else base
+    variants = [
+        f"{base}_{s_up}",   # arm_L
+        f"{base}_{s_lo}",   # arm_l  (UE)
+        f"{s_up}_{base}",   # L_arm
+        f"{s_lo}_{base}",   # l_arm
+        f"{base}.{s_up}",   # arm.L  (Blender)
+        f"{base}.{s_lo}",   # arm.l
+    ]
+    if full:
+        variants += [
+            f"{full}{base_cap}",  # LeftArm (Mixamo)
+            f"{full.lower()}{base_cap}",  # leftArm
+        ]
+    return variants
 
 
 def _try_find(triples, side):
-    for start, mid, end in triples:
-        names = [f"{start}_{side}", f"{mid}_{side}", f"{end}_{side}"]
-        chain = _find_chain_by_names(names)
-        if chain:
-            return chain
+    """triples の各組合せを各 side バリエーションで試す。"""
+    for start_kw, mid_kw, end_kw in triples:
+        for s_var, m_var, e_var in zip(
+                _side_variants(start_kw, side),
+                _side_variants(mid_kw, side),
+                _side_variants(end_kw, side)):
+            chain = _find_chain_by_names([s_var, m_var, e_var])
+            if chain:
+                return chain
     return None
 
 
 def find_ik_chains():
-    """L/R arm と L/R leg を自動検出して { "L_arm": [j,j,j], ... } を返す。"""
+    """L/R arm と L/R leg を自動検出して { "L_arm": [j,j,j], ... } を返す。
+    複数命名規則 (MMD rename / Mixamo / Unreal / Blender) 全部試す。"""
     out = {}
     for side in ("L", "R"):
         a = _try_find(_ARM_CANDIDATES, side)
@@ -951,44 +1006,204 @@ def find_ik_chains():
     return out
 
 
+def _detect_foot_landmarks(ankle_joint, toe_joint):
+    """足メッシュから heel/tip/ball 位置を skinCluster + vertex サンプリングで検出。
+
+    汎用アルゴリズム (どのモデルでも動く):
+      1. ankle_joint に接続された skinCluster を探索 (無ければ 全 skinCluster から)
+      2. ankle + 子孫 joint に weight > 0.5 の vertex 収集 (最大 500 サンプル)
+      3. Y filter: ankle.y 以下 (boot 上端 vertex 除去)
+      4. 足底 Y = filtered vertex の min Y
+      5. Forward = (toe - ankle) XZ 正規化
+      6. Heel = forward 投影最負 / Tip = 最正
+      7. Ball = 足底近傍 & forward 正 & tip の 85% 以内で最後方
+
+    Returns: {heel, tip, ball, ground_y} or None (skinCluster 無い等の失敗時)。
+    """
+    ankle_pos = cmds.xform(ankle_joint, q=True, ws=True, t=True)
+    toe_pos = cmds.xform(toe_joint, q=True, ws=True, t=True)
+
+    fwd_x = toe_pos[0] - ankle_pos[0]
+    fwd_z = toe_pos[2] - ankle_pos[2]
+    fwd_mag = (fwd_x**2 + fwd_z**2) ** 0.5
+    if fwd_mag < 0.01:
+        return None
+    fwd_x /= fwd_mag
+    fwd_z /= fwd_mag
+
+    # 1. skinCluster 検出
+    scs = cmds.listConnections(ankle_joint + ".worldMatrix",
+                                type="skinCluster", d=True, s=False) or []
+    scs = list(set(scs))
+    if not scs:
+        for sc in cmds.ls(type="skinCluster") or []:
+            try:
+                infs = cmds.skinCluster(sc, q=True, inf=True) or []
+                if ankle_joint in infs:
+                    scs.append(sc)
+            except Exception:
+                pass
+    if not scs:
+        return None
+
+    # 2. ankle + descendant joint
+    influences = {ankle_joint}
+    for j in cmds.listRelatives(ankle_joint, ad=True, type="joint") or []:
+        influences.add(j)
+
+    # 3. 影響 vertex 収集
+    candidates = []
+    for sc in scs:
+        try:
+            geo = cmds.skinCluster(sc, q=True, g=True) or []
+            if not geo:
+                continue
+            mesh_shape = geo[0]
+        except Exception:
+            continue
+        try:
+            n_verts = cmds.polyEvaluate(mesh_shape, v=True)
+        except Exception:
+            n_verts = 0
+        if not n_verts:
+            continue
+        try:
+            sc_infs = cmds.skinCluster(sc, q=True, inf=True) or []
+        except Exception:
+            sc_infs = []
+        # ankle 世界位置近傍の vertex に絞ってから weight 判定 (計算量削減 + 精度向上)
+        # 予め ankle 中心の radius = bone_length * 3 で bbox pre-filter
+        toe_dist = ((ankle_pos[0]-toe_pos[0])**2 +
+                    (ankle_pos[1]-toe_pos[1])**2 +
+                    (ankle_pos[2]-toe_pos[2])**2) ** 0.5
+        radius = max(toe_dist * 2.5, 5.0)
+        target_ids = [i for i, inf in enumerate(sc_infs) if inf in influences]
+        if not target_ids:
+            continue
+        # 全 vertex を走査 (mesh に対して 1 回だけ) → radius filter → weight 判定
+        for vi in range(n_verts):
+            try:
+                wp = cmds.pointPosition(f"{mesh_shape}.vtx[{vi}]", w=True)
+                # ankle からの距離で早期スキップ
+                dx = wp[0] - ankle_pos[0]
+                dy = wp[1] - ankle_pos[1]
+                dz = wp[2] - ankle_pos[2]
+                if dx*dx + dy*dy + dz*dz > radius * radius:
+                    continue
+                weights = cmds.skinPercent(sc, f"{mesh_shape}.vtx[{vi}]",
+                                            q=True, v=True)
+                if not weights:
+                    continue
+                total_w = sum(weights[i] for i in target_ids if i < len(weights))
+                if total_w > 0.5:
+                    candidates.append(wp)
+            except Exception:
+                continue
+
+    if not candidates:
+        return None
+
+    # 4. Y filter
+    below = [v for v in candidates if v[1] < ankle_pos[1]]
+    if not below:
+        below = candidates
+
+    ground_y = min(v[1] for v in below)
+
+    def _fwd_proj(v):
+        return (v[0] - ankle_pos[0]) * fwd_x + (v[2] - ankle_pos[2]) * fwd_z
+
+    heel_v = min(below, key=_fwd_proj)
+    tip_v  = max(below, key=_fwd_proj)
+    tip_proj = _fwd_proj(tip_v)
+    tol = (ankle_pos[1] - ground_y) * 0.15
+
+    floor = [v for v in below
+             if v[1] < ground_y + tol
+             and _fwd_proj(v) > 0
+             and _fwd_proj(v) < tip_proj * 0.85]
+    if floor:
+        ball_v = min(floor, key=_fwd_proj)
+    else:
+        ball_v = [(ankle_pos[0] + tip_v[0]) * 0.5,
+                  ground_y,
+                  (ankle_pos[2] + tip_v[2]) * 0.5]
+
+    print(f"[{_PACKAGE}] foot landmarks from {len(candidates)} verts: "
+          f"heel Z={heel_v[2]:.2f}, tip Z={tip_v[2]:.2f}, ground={ground_y:.2f}")
+    return {
+        "heel": list(heel_v),
+        "tip":  list(tip_v),
+        "ball": list(ball_v),
+        "ground_y": ground_y,
+    }
+
+
+def _find_toe_joint(ankle_joint):
+    """ankle_joint の child joint から toe を推定 (汎用検出)。
+    優先: 「toe」を含む名前 > child joint 1 個目
+    無ければ None。"""
+    kids = cmds.listRelatives(ankle_joint, c=True, type="joint") or []
+    if not kids:
+        return None
+    for k in kids:
+        short = k.split("|")[-1].lower()
+        if any(t in short for t in ("toe", "foot", "tip")) and not short.endswith("_end"):
+            return k
+    # フォールバック: _end でない最初の child joint
+    for k in kids:
+        if not k.split("|")[-1].endswith("_end"):
+            return k
+    # _end 含めて最初
+    return kids[0]
+
+
 def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     """Reverse foot rig: heel/ball/toe の pivot chain と footRoll attr を付与。
 
-    joint 想定 (MMD 標準):
-      ankle_L → toe_L (child)
-    heel 位置は ankle 位置 - (toe - ankle) の 0.4 倍 後方 (Z-) で概算、Y=0。
-    ball 位置は ankle と toe の中間、Y=0。
+    汎用: ankle joint の child joint を toe として自動検出 (MMD の `toe_L`、
+    Mixamo の `LeftToeBase`、T-pose export の `foot_end` 等いずれも対応)。
+    heel 位置は ankle 位置 - (toe - ankle) の 0.4 倍 後方 で概算、
+    Y は mesh 全体の bbox 最下端 (足元) を採用。
     """
-    toe_joint = ankle_joint.replace("ankle", "toe")
-    if not cmds.objExists(toe_joint):
-        return None  # toe が無ければスキップ
+    toe_joint = _find_toe_joint(ankle_joint)
+    if toe_joint is None:
+        cmds.warning(f"[{_PACKAGE}] setup_reverse_foot: no toe child under {ankle_joint}")
+        return None
 
     ankle_pos = cmds.xform(ankle_joint, q=True, ws=True, t=True)
     toe_pos = cmds.xform(toe_joint, q=True, ws=True, t=True)
 
-    # 地面 Y: mesh 全体の最下端 (足元) を使う。Y=0 固定だと空中に浮く。
-    ground_y = 0.0
-    try:
-        meshes = cmds.ls(type="mesh") or []
-        tforms = set()
-        for m in meshes:
-            p = cmds.listRelatives(m, p=True, f=True) or []
-            if p: tforms.add(p[0])
-        if tforms:
-            bb = cmds.exactWorldBoundingBox(list(tforms))
-            ground_y = bb[1]  # ymin
-    except Exception:
-        pass
-
-    # heel: ankle 後方 (toe と反対方向) 0.4 倍、Y=ground
-    back_vec = [ankle_pos[i] - toe_pos[i] for i in range(3)]
-    heel_pos = [ankle_pos[0] + back_vec[0] * 0.4,
-                ground_y,
-                ankle_pos[2] + back_vec[2] * 0.4]
-    ball_pos = [(ankle_pos[0] + toe_pos[0]) * 0.5,
-                ground_y,
-                (ankle_pos[2] + toe_pos[2]) * 0.5]
-    toe_pivot_pos = [toe_pos[0], ground_y, toe_pos[2]]
+    # mesh-aware 検出 (skinCluster + vertex サンプリング)
+    landmarks = _detect_foot_landmarks(ankle_joint, toe_joint)
+    if landmarks:
+        heel_pos      = landmarks["heel"]
+        ball_pos      = landmarks["ball"]
+        toe_pivot_pos = [landmarks["tip"][0], landmarks["ground_y"], landmarks["tip"][2]]
+        ground_y      = landmarks["ground_y"]
+    else:
+        # フォールバック: skinCluster 無い / 検出失敗 → 幾何近似 + scene bbox Y
+        ground_y = 0.0
+        try:
+            meshes = cmds.ls(type="mesh") or []
+            tforms = set()
+            for m in meshes:
+                p = cmds.listRelatives(m, p=True, f=True) or []
+                if p: tforms.add(p[0])
+            if tforms:
+                bb = cmds.exactWorldBoundingBox(list(tforms))
+                ground_y = bb[1]
+        except Exception:
+            pass
+        back_vec = [ankle_pos[i] - toe_pos[i] for i in range(3)]
+        heel_pos = [ankle_pos[0] + back_vec[0] * 0.4,
+                    ground_y,
+                    ankle_pos[2] + back_vec[2] * 0.4]
+        ball_pos = [(ankle_pos[0] + toe_pos[0]) * 0.5,
+                    ground_y,
+                    (ankle_pos[2] + toe_pos[2]) * 0.5]
+        toe_pivot_pos = [toe_pos[0], ground_y, toe_pos[2]]
+        print(f"[{_PACKAGE}] foot landmarks fallback (no skinCluster on {ankle_joint})")
 
     label = ankle_joint  # e.g. ankle_L
     color = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
@@ -1107,48 +1322,64 @@ def _create_ui_host_ctl(label, world_pos, size, side):
     return host
 
 
-def snap_fk_to_ik(chain_label):
-    """FK ctls を現 IK 姿勢に snap (IK→FK 切替直前に呼ぶ)。
-    chain_label 例: "arm_L", "leg_R"
+def _resolve_chain_joints(chain_label):
+    """chain_label (find_ik_chains のキー、例 'L_arm') か直接 start joint 名から
+    (start, mid, end) の joint 名を動的に返す。
     """
-    mid_map = {"arm_L":"elbow_L","arm_R":"elbow_R","leg_L":"knee_L","leg_R":"knee_R"}
-    end_map = {"arm_L":"wrist_L","arm_R":"wrist_R","leg_L":"ankle_L","leg_R":"ankle_R"}
-    if chain_label not in mid_map:
-        cmds.warning(f"[attach_ctrls] snap_fk_to_ik: unknown chain '{chain_label}'")
+    chains = find_ik_chains()
+    # まず find_ik_chains のキー (L_arm, R_leg 等) で探す
+    for lbl in (chain_label, chain_label.replace("_", "_")):
+        if lbl in chains:
+            return tuple(chains[lbl])
+    # 直接 start joint 名で渡された場合 (arm_L, leg_R 等) → chains 値と一致確認
+    for triple in chains.values():
+        if triple[0] == chain_label:
+            return tuple(triple)
+    return None
+
+
+def snap_fk_to_ik(chain_label):
+    """FK ctls を現 IK 姿勢に snap。orient constraint offset 補正付き。"""
+    triple = _resolve_chain_joints(chain_label)
+    if not triple:
+        cmds.warning(f"[attach_ctrls] snap_fk_to_ik: chain '{chain_label}' not found")
         return
-    start_j = chain_label; mid_j = mid_map[chain_label]; end_j = end_map[chain_label]
-    for orig in [start_j, mid_j, end_j]:
+    start_j, mid_j, end_j = triple
+    for orig in triple:
         fk_ctl = orig + "_fk_ctl"
-        if cmds.objExists(fk_ctl) and cmds.objExists(orig):
-            # orig の現 world 回転を fk_ctl に転写
-            wm = cmds.xform(orig, q=True, ws=True, m=True)
-            cmds.xform(fk_ctl, ws=True, m=wm)
-    ui = chain_label + "_UI_ctl"
+        if not (cmds.objExists(fk_ctl) and cmds.objExists(orig)):
+            continue
+        # orig の現 world matrix を fk_ctl に転写。
+        # fk_ctl は fk_npo の子なので、fk_ctl.matrix = orig_wm * inv(fk_npo_wm)
+        # cmds.xform ws=True m=... はこれを自動計算してくれる。
+        orig_wm = cmds.xform(orig, q=True, ws=True, m=True)
+        cmds.xform(fk_ctl, ws=True, m=orig_wm)
+    # UI host は start joint に basicallyy 対応。start_j + "_UI_ctl" で探す
+    ui = start_j + "_UI_ctl"
     if cmds.objExists(ui) and cmds.attributeQuery("IK_FK", node=ui, exists=True):
         cmds.setAttr(ui + ".IK_FK", 0)
-    print(f"[{_PACKAGE}] snap_fk_to_ik: {chain_label} -> IK_FK=0")
+    print(f"[{_PACKAGE}] snap_fk_to_ik: {start_j} -> IK_FK=0")
 
 
 def snap_ik_to_fk(chain_label):
-    """IK ctl (+ pole vector) を現 FK 姿勢に snap (FK→IK 切替直前に呼ぶ)。"""
-    end_map = {"arm_L":"wrist_L","arm_R":"wrist_R","leg_L":"ankle_L","leg_R":"ankle_R"}
-    mid_map = {"arm_L":"elbow_L","arm_R":"elbow_R","leg_L":"knee_L","leg_R":"knee_R"}
-    if chain_label not in end_map:
+    """IK ctl (+ pole vector) を現 FK 姿勢に snap。"""
+    triple = _resolve_chain_joints(chain_label)
+    if not triple:
+        cmds.warning(f"[attach_ctrls] snap_ik_to_fk: chain '{chain_label}' not found")
         return
-    end_j = end_map[chain_label]; mid_j = mid_map[chain_label]
-    ik_ctl = chain_label + "_IK_ctl"
-    pv_ctl = chain_label + "_PV_ctl"
+    start_j, mid_j, end_j = triple
+    ik_ctl = start_j + "_IK_ctl"
+    pv_ctl = start_j + "_PV_ctl"
     if cmds.objExists(ik_ctl) and cmds.objExists(end_j):
         wm = cmds.xform(end_j, q=True, ws=True, m=True)
         cmds.xform(ik_ctl, ws=True, m=wm)
     if cmds.objExists(pv_ctl) and cmds.objExists(mid_j):
-        # PV は mid の world 位置に (方向情報は保持しない簡易 snap)
         wp = cmds.xform(mid_j, q=True, ws=True, t=True)
         cmds.xform(pv_ctl, ws=True, t=wp)
-    ui = chain_label + "_UI_ctl"
+    ui = start_j + "_UI_ctl"
     if cmds.objExists(ui) and cmds.attributeQuery("IK_FK", node=ui, exists=True):
         cmds.setAttr(ui + ".IK_FK", 1)
-    print(f"[{_PACKAGE}] snap_ik_to_fk: {chain_label} -> IK_FK=1")
+    print(f"[{_PACKAGE}] snap_ik_to_fk: {start_j} -> IK_FK=1")
 
 
 def setup_all_ik_fk():
