@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -53,11 +53,13 @@ _GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{_GITHUB_OWNER}/{_GITHUB_
 
 ROOT_GROUP = "attach_ctrls_grp"
 
-# Maya drawing override color indices
-COLOR_L = 6   # blue
-COLOR_R = 13  # red
+# Maya drawing override color indices (mGear 系配色に合わせる)
+COLOR_L = 18  # light blue
+COLOR_R = 20  # light rose
 COLOR_C = 17  # yellow
-COLOR_DECOR = 2  # dark grey (装飾骨用、視覚的に控えめ)
+COLOR_WORLD = 13  # red (top-level world ctl)
+COLOR_DECOR = 2  # dark grey (装飾骨、視覚的に控えめ)
+COLOR_UI = 25  # olive (UI host ctl、目立つ集約 attr host)
 
 # 装飾骨判定パターン (skip_decoration=True 時に attach_controllers から除外)
 # 部分一致 (short name の lowercase に含まれれば装飾扱い)
@@ -756,7 +758,8 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
 
     # --- 4. Pole vector ctl (diamond 形状で目立たせる) ---
     pv_ctl = _make_diamond_curve(label + "_PV_ctl", scale=pv_size)
-    _set_ctl_color(pv_ctl, 20 if side == "L" else 12 if side == "R" else 17)
+    # PV は通常 side 色より少し変えて識別性を上げる (light green vs light blue/rose)
+    _set_ctl_color(pv_ctl, 14 if side == "L" else 15 if side == "R" else 17)
     # ↑ PV は色を通常ctl とは変えて識別しやすく (L=lightblue20, R=lightred12, C=yellow17)
     pv_npo = cmds.group(em=True, name=label + "_PV_npo")
     cmds.parent(pv_ctl, pv_npo)
@@ -796,12 +799,41 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     cmds.parent(fk_ctls[2][0], fk_ctls[1][1])
     cmds.parent(fk_ctls[0][0], ROOT_GROUP)
 
-    # --- 6. Switch attribute (IK ctl) ---
+    # --- 6. Switch attribute (UI host ctl に集約、mGear 慣習に合わせる) ---
+    # UI host は chain の end joint 付近に配置 (掴みやすさ)
+    end_pos = cmds.xform(end, q=True, ws=True, t=True)
+    ui_offset = diag / 25.0  # 少し離した位置に浮かべる
+    ui_pos = (end_pos[0] + (ui_offset if side == "L" else -ui_offset),
+              end_pos[1] + ui_offset * 0.5, end_pos[2])
+    ui_host = _create_ui_host_ctl(label, ui_pos, ik_size * 0.6, side)
+    # divider (Channel Box 見出し) + 主要 attr
+    if not cmds.attributeQuery("__" + label + "__", node=ui_host, exists=True):
+        cmds.addAttr(ui_host, ln="__" + label + "__", at="enum", en=label,
+                     k=False, category="divider")
+        cmds.setAttr(ui_host + ".__" + label + "__", channelBox=True)
+    for attr_name, dv in [("IK_FK", 1.0), ("stretch", 0.0),
+                          ("ikVis", 1.0), ("fkVis", 0.0)]:
+        if not cmds.attributeQuery(attr_name, node=ui_host, exists=True):
+            cmds.addAttr(ui_host, ln=attr_name, at="float",
+                         min=0.0, max=1.0, dv=dv, k=True)
+
+    # 互換: IK ctl にも IK_FK を持たせる (proxy attribute で双方向編集可)
     if not cmds.attributeQuery("IK_FK", node=ik_ctl, exists=True):
-        cmds.addAttr(ik_ctl, ln="IK_FK", at="float", min=0.0, max=1.0, dv=1.0, k=True)
+        try:
+            # Maya 2019+ の proxy attribute
+            cmds.addAttr(ik_ctl, ln="IK_FK", proxy=ui_host + ".IK_FK", k=True)
+        except Exception:
+            # フォールバック: proxy 未対応環境なら通常 attr + connect
+            cmds.addAttr(ik_ctl, ln="IK_FK", at="float",
+                         min=0.0, max=1.0, dv=1.0, k=True)
+            try:
+                cmds.connectAttr(ui_host + ".IK_FK",
+                                 ik_ctl + ".IK_FK", f=True)
+            except Exception:
+                pass
 
     rev = cmds.createNode("reverse", n=label + "_ikfk_rev")
-    cmds.connectAttr(ik_ctl + ".IK_FK", rev + ".inputX")
+    cmds.connectAttr(ui_host + ".IK_FK", rev + ".inputX")
 
     # --- 7. Blend original hero joints between IK chain and FK chain ---
     # orientConstraint mo=True で local space 差異を初期化時に吸収。
@@ -854,13 +886,16 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     init_drift = _rot_diff_max(start, bind_start_rot)  # after setting best
     print(f"[{_PACKAGE}] {label} twist={best_twist}° (final drift {init_drift:.1f}°)")
 
-    # --- 8. Visibility ---
+    # --- 8. Visibility (UI host の ikVis/fkVis で明示制御) ---
     try: cmds.setAttr(ik_ctl + ".v", lock=False)
     except Exception: pass
     try:
-        cmds.connectAttr(ik_ctl + ".IK_FK", ik_npo + ".v")
-        cmds.connectAttr(ik_ctl + ".IK_FK", pv_npo + ".v")
-        cmds.connectAttr(rev + ".outputX",  fk_ctls[0][0] + ".v")
+        cmds.connectAttr(ui_host + ".ikVis", ik_npo + ".v")
+        cmds.connectAttr(ui_host + ".ikVis", pv_npo + ".v")
+        cmds.connectAttr(ui_host + ".fkVis", fk_ctls[0][0] + ".v")
+        # ikVis/fkVis を IK_FK に自動追従 (デフォルト): switch=1 → ikVis=1, fkVis=0
+        cmds.connectAttr(ui_host + ".IK_FK", ui_host + ".ikVis", f=True)
+        cmds.connectAttr(rev + ".outputX", ui_host + ".fkVis", f=True)
     except Exception as exc:
         cmds.warning(f"[attach_ctrls] visibility connect failed: {exc}")
 
@@ -875,7 +910,8 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         "ik_ctl":    ik_ctl,
         "pv_ctl":    pv_ctl,
         "fk_ctls":   [c for _, c in fk_ctls],
-        "switch":    ik_ctl + ".IK_FK",
+        "ui_host":   ui_host,
+        "switch":    ui_host + ".IK_FK",  # UI host が master
     }
 
 
@@ -954,15 +990,30 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
                 (ankle_pos[2] + toe_pos[2]) * 0.5]
     toe_pivot_pos = [toe_pos[0], ground_y, toe_pos[2]]
 
-    label = ankle_joint
-    heel_piv = cmds.group(em=True, n=label + "_heelPiv")
+    label = ankle_joint  # e.g. ankle_L
+    color = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
+
+    # 可視 ctl として heel/tip/ball を生成 (mGear の heel_ctl/tip_ctl/bk*_ctl 相当)
+    # size は toe-ankle 距離ベース
+    piv_size = ((ankle_pos[0]-toe_pos[0])**2 + (ankle_pos[2]-toe_pos[2])**2)**0.5 * 0.3
+    piv_size = max(piv_size, 0.5)
+
+    heel_piv = _make_cube_curve(label + "_heel_ctl", scale=piv_size)
+    _set_ctl_color(heel_piv, color)
     cmds.xform(heel_piv, ws=True, t=heel_pos)
-    toe_piv = cmds.group(em=True, n=label + "_toePiv")
+    _lock_hide_attrs(heel_piv, ["sx","sy","sz","tx","ty","tz"])
+
+    toe_piv = _make_cube_curve(label + "_tip_ctl", scale=piv_size)
+    _set_ctl_color(toe_piv, color)
     cmds.xform(toe_piv, ws=True, t=toe_pivot_pos)
     cmds.parent(toe_piv, heel_piv)
-    ball_piv = cmds.group(em=True, n=label + "_ballPiv")
+    _lock_hide_attrs(toe_piv, ["sx","sy","sz","tx","ty","tz"])
+
+    ball_piv = _make_cube_curve(label + "_ball_ctl", scale=piv_size * 0.8)
+    _set_ctl_color(ball_piv, color)
     cmds.xform(ball_piv, ws=True, t=ball_pos)
     cmds.parent(ball_piv, toe_piv)
+    _lock_hide_attrs(ball_piv, ["sx","sy","sz","tx","ty","tz"])
 
     # 既存の pointConstraint (ik_ctl -> foot_ikh) を削除。
     # そうしないと pivot chain の rotation で handle 位置が動いても
@@ -1002,22 +1053,27 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     except Exception:
         pass
 
-    # attrs on foot IK ctl
+    # UI host に attr を集約 (mGear 慣習): leg_L_UI_ctl があればそこに、無ければ IK ctl に
+    label_chain = "leg_L" if side == "L" else "leg_R" if side == "R" else "leg_C"
+    ui_host_name = label_chain + "_UI_ctl"
+    host = ui_host_name if cmds.objExists(ui_host_name) else foot_ik_ctl
+
+    # divider (Channel Box 見出し)
+    div_name = "__foot__"
+    if not cmds.attributeQuery(div_name, node=host, exists=True):
+        cmds.addAttr(host, ln=div_name, at="enum", en="foot", k=False)
+        cmds.setAttr(host + "." + div_name, channelBox=True)
     for attr, dv in [("footRoll", 0.0), ("toeRoll", 0.0),
                      ("heelRoll", 0.0), ("footBank", 0.0)]:
-        if not cmds.attributeQuery(attr, node=foot_ik_ctl, exists=True):
-            cmds.addAttr(foot_ik_ctl, ln=attr, at="float", k=True, dv=dv)
+        if not cmds.attributeQuery(attr, node=host, exists=True):
+            cmds.addAttr(host, ln=attr, at="float", k=True, dv=dv)
 
-    # 接続:
-    #   heelRoll -> heel_piv.rotateX (かかとを地面に付けたまま足首上げ)
-    #   footRoll -> ball_piv.rotateX (ボール位置で足全体を前傾)
-    #   toeRoll  -> toe_piv.rotateX  (爪先立ち)
-    #   footBank -> heel_piv.rotateZ (横倒し)
+    # 接続 (host の attr から pivot ctl の rotate に)
     try:
-        cmds.connectAttr(foot_ik_ctl + ".heelRoll", heel_piv + ".rotateX")
-        cmds.connectAttr(foot_ik_ctl + ".footRoll", ball_piv + ".rotateX")
-        cmds.connectAttr(foot_ik_ctl + ".toeRoll",  toe_piv  + ".rotateX")
-        cmds.connectAttr(foot_ik_ctl + ".footBank", heel_piv + ".rotateZ")
+        cmds.connectAttr(host + ".heelRoll", heel_piv + ".rotateX")
+        cmds.connectAttr(host + ".footRoll", ball_piv + ".rotateX")
+        cmds.connectAttr(host + ".toeRoll",  toe_piv  + ".rotateX")
+        cmds.connectAttr(host + ".footBank", heel_piv + ".rotateZ")
     except Exception as exc:
         cmds.warning(f"[attach_ctrls] reverse foot connect failed: {exc}")
 
@@ -1027,6 +1083,72 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
         "heel_piv": heel_piv, "ball_piv": ball_piv, "toe_piv": toe_piv,
         "toe_ikh": toe_ikh,
     }
+
+
+def _create_ui_host_ctl(label, world_pos, size, side):
+    """mGear armUI/legUI 相当の設定 host ctl を生成 (小さい平面 square)。
+
+    ここに IK_FK / foot roll 系 attr を集約して Channel Box を整理する。
+    形状は degree-1 quad (見つけやすい浮遊パネル)。
+    """
+    host_name = label + "_UI_ctl"
+    if cmds.objExists(host_name):
+        return host_name
+    s = size * 0.5
+    pts = [(-s,0,-s), (s,0,-s), (s,0,s), (-s,0,s), (-s,0,-s),
+           (0,0,-s), (0,0,s), (s,0,0), (-s,0,0)]  # 井桁
+    host = cmds.curve(d=1, p=pts, n=host_name)
+    _set_ctl_color(host, COLOR_UI)
+    host_npo = cmds.group(em=True, n=label + "_UI_npo")
+    cmds.parent(host, host_npo)
+    cmds.xform(host_npo, ws=True, t=world_pos)
+    cmds.parent(host_npo, ROOT_GROUP)
+    _lock_hide_attrs(host, ["tx","ty","tz","rx","ry","rz","sx","sy","sz"])
+    return host
+
+
+def snap_fk_to_ik(chain_label):
+    """FK ctls を現 IK 姿勢に snap (IK→FK 切替直前に呼ぶ)。
+    chain_label 例: "arm_L", "leg_R"
+    """
+    mid_map = {"arm_L":"elbow_L","arm_R":"elbow_R","leg_L":"knee_L","leg_R":"knee_R"}
+    end_map = {"arm_L":"wrist_L","arm_R":"wrist_R","leg_L":"ankle_L","leg_R":"ankle_R"}
+    if chain_label not in mid_map:
+        cmds.warning(f"[attach_ctrls] snap_fk_to_ik: unknown chain '{chain_label}'")
+        return
+    start_j = chain_label; mid_j = mid_map[chain_label]; end_j = end_map[chain_label]
+    for orig in [start_j, mid_j, end_j]:
+        fk_ctl = orig + "_fk_ctl"
+        if cmds.objExists(fk_ctl) and cmds.objExists(orig):
+            # orig の現 world 回転を fk_ctl に転写
+            wm = cmds.xform(orig, q=True, ws=True, m=True)
+            cmds.xform(fk_ctl, ws=True, m=wm)
+    ui = chain_label + "_UI_ctl"
+    if cmds.objExists(ui) and cmds.attributeQuery("IK_FK", node=ui, exists=True):
+        cmds.setAttr(ui + ".IK_FK", 0)
+    print(f"[{_PACKAGE}] snap_fk_to_ik: {chain_label} -> IK_FK=0")
+
+
+def snap_ik_to_fk(chain_label):
+    """IK ctl (+ pole vector) を現 FK 姿勢に snap (FK→IK 切替直前に呼ぶ)。"""
+    end_map = {"arm_L":"wrist_L","arm_R":"wrist_R","leg_L":"ankle_L","leg_R":"ankle_R"}
+    mid_map = {"arm_L":"elbow_L","arm_R":"elbow_R","leg_L":"knee_L","leg_R":"knee_R"}
+    if chain_label not in end_map:
+        return
+    end_j = end_map[chain_label]; mid_j = mid_map[chain_label]
+    ik_ctl = chain_label + "_IK_ctl"
+    pv_ctl = chain_label + "_PV_ctl"
+    if cmds.objExists(ik_ctl) and cmds.objExists(end_j):
+        wm = cmds.xform(end_j, q=True, ws=True, m=True)
+        cmds.xform(ik_ctl, ws=True, m=wm)
+    if cmds.objExists(pv_ctl) and cmds.objExists(mid_j):
+        # PV は mid の world 位置に (方向情報は保持しない簡易 snap)
+        wp = cmds.xform(mid_j, q=True, ws=True, t=True)
+        cmds.xform(pv_ctl, ws=True, t=wp)
+    ui = chain_label + "_UI_ctl"
+    if cmds.objExists(ui) and cmds.attributeQuery("IK_FK", node=ui, exists=True):
+        cmds.setAttr(ui + ".IK_FK", 1)
+    print(f"[{_PACKAGE}] snap_ik_to_fk: {chain_label} -> IK_FK=1")
 
 
 def setup_all_ik_fk():
@@ -1187,21 +1309,21 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     diag = _scene_mesh_bbox_diag()
     if not cmds.objExists(ROOT_GROUP):
         cmds.group(em=True, name=ROOT_GROUP)
-    # world ctl (地面) — 大きめオクタゴン
+    # world ctl (地面) — 大きめオクタゴン (mGear world_ctl 相当、赤)
     world_ctl_name = "world_ctl"
     if not cmds.objExists(world_ctl_name):
         world_ctl = _make_octagon_curve(world_ctl_name, scale=diag * 0.28)
-        _set_ctl_color(world_ctl, 13)  # 赤
+        _set_ctl_color(world_ctl, COLOR_WORLD)
         cmds.parent(world_ctl, ROOT_GROUP)
         _lock_hide_attrs(world_ctl, ["sx","sy","sz","v"])
     else:
         world_ctl = world_ctl_name
-    # main ctl (体を包む) — 中サイズ box (床置き)
+    # main ctl (体を包む) — 中サイズ box (mGear body_C0_ctl 相当、黄)
     main_ctl_name = "main_ctl"
     if not cmds.objExists(main_ctl_name):
         main_ctl = _make_flat_box_curve(main_ctl_name, scale=diag * 0.2,
                                         x_ratio=1.5, z_ratio=1.5)
-        _set_ctl_color(main_ctl, 17)  # 黄
+        _set_ctl_color(main_ctl, COLOR_C)
         cmds.parent(main_ctl, world_ctl)
         _lock_hide_attrs(main_ctl, ["sx","sy","sz","v"])
     else:
