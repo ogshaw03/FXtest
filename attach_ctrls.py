@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -471,30 +471,43 @@ def _pick_ctl_maker(joint_name):
     return _make_cube_curve, None, False
 
 
-def _rewrite_flat_horizontal(ctl_name, world_pos, scale, maker):
+def _rewrite_flat_horizontal(ctl_name, world_pos, scale, maker,
+                              x_ratio=None, z_ratio=None, ground_y=None):
     """matchTransform 後 (ctl が joint 回転を継承した状態) の shape の CV を
     world XZ 平面に強制配置する。transform 階層 (npo の rotate) は保持するので
-    parentConstraint 追従は継続、見た目のみ水平化。"""
+    parentConstraint 追従は継続、見た目のみ水平化。
+
+    Args:
+        x_ratio / z_ratio: flat_box 系で default (1.4/1.0 or 2.4/1.6) を上書き。
+                            leg IK ctl (1.6/2.2) 等呼び出し側の比率と一致させる。
+        ground_y: None なら world_pos[1] (joint 高) に置く、指定あれば地面 Y
+                    に置いて足元フラット box にする。
+    """
     import math
     p = world_pos
+    y = ground_y if ground_y is not None else p[1]
     if maker is _make_ring_curve or maker is _make_octagon_curve:
         sides = 16 if maker is _make_ring_curve else 8
         pts = [(p[0] + math.cos(2*math.pi*i/sides) * scale,
-                p[1],
+                y,
                 p[2] + math.sin(2*math.pi*i/sides) * scale)
                for i in range(sides + 1)]
     elif maker is _make_wide_flat_box_curve:
-        sx = scale * 2.4 * 0.5
-        sz = scale * 1.6 * 0.5
-        pts = [(p[0]-sx, p[1], p[2]-sz), (p[0]+sx, p[1], p[2]-sz),
-               (p[0]+sx, p[1], p[2]+sz), (p[0]-sx, p[1], p[2]+sz),
-               (p[0]-sx, p[1], p[2]-sz)]
+        xr = x_ratio if x_ratio is not None else 2.4
+        zr = z_ratio if z_ratio is not None else 1.6
+        sx = scale * xr * 0.5
+        sz = scale * zr * 0.5
+        pts = [(p[0]-sx, y, p[2]-sz), (p[0]+sx, y, p[2]-sz),
+               (p[0]+sx, y, p[2]+sz), (p[0]-sx, y, p[2]+sz),
+               (p[0]-sx, y, p[2]-sz)]
     elif maker is _make_flat_box_curve:
-        sx = scale * 1.4 * 0.5
-        sz = scale * 1.0 * 0.5
-        pts = [(p[0]-sx, p[1], p[2]-sz), (p[0]+sx, p[1], p[2]-sz),
-               (p[0]+sx, p[1], p[2]+sz), (p[0]-sx, p[1], p[2]+sz),
-               (p[0]-sx, p[1], p[2]-sz)]
+        xr = x_ratio if x_ratio is not None else 1.4
+        zr = z_ratio if z_ratio is not None else 1.0
+        sx = scale * xr * 0.5
+        sz = scale * zr * 0.5
+        pts = [(p[0]-sx, y, p[2]-sz), (p[0]+sx, y, p[2]-sz),
+               (p[0]+sx, y, p[2]+sz), (p[0]-sx, y, p[2]+sz),
+               (p[0]-sx, y, p[2]-sz)]
     else:
         return
     for i, pt in enumerate(pts):
@@ -634,14 +647,19 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
         npo = cmds.group(em=True, name=npo_name)
         cmds.parent(ctl, npo)
 
-        cmds.matchTransform(npo, jnt, pos=True, rot=True)
+        if flat_horizontal:
+            # WORLD-ALIGN (WAIST scout): bone tilt (waist 44°/lower_body 30°等)
+            # を継承させないため npo/ctl を world identity で置く。joint bind
+            # rot は Pass 3 の parentConstraint mo=True で吸収させる。これで
+            # waist_ctl.rotateY=10 が pure world yaw になる (旧 tilted 軸 →
+            # roll 7° 混入を解消)。
+            joint_ws = cmds.xform(jnt, q=True, ws=True, t=True)
+            cmds.xform(npo, ws=True, t=joint_ws, ro=(0, 0, 0))
+        else:
+            cmds.matchTransform(npo, jnt, pos=True, rot=True)
         cmds.parent(npo, ROOT_GROUP)
 
-        # flat 系 ctl は matchTransform で joint 回転を継承してしまい
-        # 傾いて見える (MMD joint rotate.x が焼き込まれている問題) ので
-        # shape CV を world 水平平面に再配置する。
         if flat_horizontal:
-            joint_ws = cmds.xform(jnt, q=True, ws=True, t=True)
             _rewrite_flat_horizontal(ctl, joint_ws, ctl_size, maker)
         elif _needs_mesh_front_offset(jnt):
             # 胸 (breast) 等 joint が mesh 内部に埋まる骨は、shape の CV だけを
@@ -686,11 +704,15 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
                 cmds.warning(f"[attach_ctrls] parent {npo} -> {target} failed: {exc}")
 
     # Pass 3: constraint
+    # flat_horizontal 系 (waist/spine 系) は npo を world identity にしたので
+    # joint bind rot との差分を parentConstraint mo=True で吸収させる (WAIST scout)。
     if do_constrain:
         _pw_sub(80.0, "Attach controllers: constrain")
         for jnt, (npo, ctl) in jnt_to_ctl.items():
+            _, _, _flat = _pick_ctl_maker(jnt)
             try:
-                cmds.parentConstraint(ctl, jnt, mo=False, n=jnt + "_parentConstraint")
+                cmds.parentConstraint(ctl, jnt, mo=bool(_flat),
+                                      n=jnt + "_parentConstraint")
             except Exception as exc:
                 cmds.warning(f"[attach_ctrls] constraint {ctl} -> {jnt} failed: {exc}")
     _pw_sub(100.0)
@@ -927,6 +949,18 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     cmds.parent(ik_npo, ROOT_GROUP)
     cmds.pointConstraint(ik_ctl, ik_handle, mo=False)
     _lock_hide_attrs(ik_ctl, ["sx", "sy", "sz"])
+    # leg は足元に敷く水平 box にする (bone 継承の斜め表示 63° を解消、FOOTCTL)
+    if is_leg:
+        end_ws = cmds.xform(end, q=True, ws=True, t=True)
+        gy = end_ws[1]
+        try:
+            _lm = _detect_foot_landmarks(end, _find_toe_joint(end))
+            if _lm:
+                gy = _lm.get("ground_y", end_ws[1])
+        except Exception:
+            pass
+        _rewrite_flat_horizontal(ik_ctl, end_ws, ik_size, _make_flat_box_curve,
+                                  x_ratio=1.6, z_ratio=2.2, ground_y=gy)
 
     # --- 4. Pole vector ctl (diamond 形状で目立たせる) ---
     pv_ctl = _make_diamond_curve(label + "_PV_ctl", scale=pv_size)
@@ -1001,6 +1035,62 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         if not cmds.attributeQuery(attr_name, node=ui_host, exists=True):
             cmds.addAttr(ui_host, ln=attr_name, at="float",
                          min=0.0, max=1.0, dv=dv, k=True)
+    # mGear dagmenu が探す `<label>_blend` サフィックスを追加 (MENU scout)。
+    # 既存の IK_FK を driver にして値同期。
+    blend_attr = label + "_blend"
+    if not cmds.attributeQuery(blend_attr, node=ui_host, exists=True):
+        cmds.addAttr(ui_host, ln=blend_attr, at="float",
+                     min=0.0, max=1.0, dv=1.0, k=True)
+        try:
+            cmds.connectAttr(ui_host + ".IK_FK", ui_host + "." + blend_attr, f=True)
+        except Exception:
+            pass
+    # コンポーネント配下 ctl リスト用 message array (mGear が
+    # `<label>_id0_ctl_cnx` を叩いて全メンバーを取得する)
+    ctl_cnx_attr = label + "_id0_ctl_cnx"
+    if not cmds.attributeQuery(ctl_cnx_attr, node=ui_host, exists=True):
+        cmds.addAttr(ui_host, ln=ctl_cnx_attr, at="message",
+                     multi=True, im=False)
+    # mth joints (snap target = bind pose 保持 duplicate)
+    mth_joints = []
+    for orig in (start, mid, end):
+        mth_name = orig + "_mth"
+        if not cmds.objExists(mth_name):
+            try:
+                m = _dup_hero_joint(orig, "_mth", new_parent=orig)
+                try: cmds.setAttr(m + ".drawStyle", 2)
+                except Exception: pass
+                mth_joints.append(m)
+            except Exception:
+                mth_joints.append(None)
+        else:
+            mth_joints.append(mth_name)
+
+    def _tag_mgear_ctl(ctl, role, mth_joint):
+        for a in ("ctl_role", "uiHost"):
+            if not cmds.attributeQuery(a, node=ctl, exists=True):
+                try: cmds.addAttr(ctl, ln=a, dt="string")
+                except Exception: pass
+        try:
+            cmds.setAttr(ctl + ".ctl_role", role, type="string")
+            cmds.setAttr(ctl + ".uiHost", ui_host, type="string")
+        except Exception:
+            pass
+        if not cmds.attributeQuery("match_ref", node=ctl, exists=True):
+            try: cmds.addAttr(ctl, ln="match_ref", at="message")
+            except Exception: pass
+        if mth_joint and cmds.objExists(mth_joint):
+            try:
+                cmds.connectAttr(mth_joint + ".message", ctl + ".match_ref", f=True)
+            except Exception:
+                pass
+        try:
+            idx = cmds.getAttr(ui_host + "." + ctl_cnx_attr, size=True) or 0
+            cmds.connectAttr(ctl + ".message",
+                             ui_host + "." + ctl_cnx_attr + "[" + str(idx) + "]",
+                             f=True)
+        except Exception:
+            pass
 
     # 互換: IK ctl にも IK_FK を持たせる (proxy attribute で双方向編集可)
     if not cmds.attributeQuery("IK_FK", node=ik_ctl, exists=True):
@@ -1037,6 +1127,12 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         cmds.connectAttr(ik_ctl + ".IK_FK", cons + "." + wal[1])
     # 従来の orientConstraint(ik_ctl, wrist_ik, mo=True) は削除
     # (wrist_ik を driven する必要が無くなった)
+
+    # mGear dagmenu 用に各 ctl を tag (MENU scout 優先度A: IK/FK Switch 発火)
+    _tag_mgear_ctl(ik_ctl, "ik", mth_joints[2])
+    _tag_mgear_ctl(pv_ctl, "upv", mth_joints[1])
+    for (_, fk_ctl), mth, role in zip(fk_ctls, mth_joints, ["fk0","fk1","fk2"]):
+        _tag_mgear_ctl(fk_ctl, role, mth)
 
     # --- 8. Pole vector constraint (orient blend 構築の後で張る) ---
     # 判定は world X 軸 (bone 軸) の acos で行う。start+mid+end 3 joint の合算 drift
@@ -1462,11 +1558,14 @@ def _create_rfoot_bones(ankle_joint, landmarks):
     tip_pos = landmarks.get("tip")
     if not ball_pos or not tip_pos:
         return None
-    ankle_y = cmds.xform(ankle_joint, q=True, ws=True, t=True)[1]
-    # Y は ankle と同じにする (bind pose で hero と揃える、reverse foot が
-    # 動いた時 toe_ikh 解に差が出ないように)
-    ball_ws = (ball_pos[0], ankle_y, ball_pos[2])
-    toe_ws = (tip_pos[0], ankle_y, tip_pos[2])
+    # Y は地面 (ground_y) 高さ。ankle Y に置くと rf chain と toe_piv (地面)
+    # の乖離が大きく SC 解が大角度スイングして hero toe が地面下 -3.6 unit
+    # まで沈む (RFOOT2 scout P2)。ground_y に揃えると rf chain が地面沿いで
+    # 動き、hero toe の drift も小さく収まる。
+    rf_y = landmarks.get("ground_y",
+                          cmds.xform(ankle_joint, q=True, ws=True, t=True)[1])
+    ball_ws = (ball_pos[0], rf_y, ball_pos[2])
+    toe_ws = (tip_pos[0], rf_y, tip_pos[2])
     rf_ball = ankle_joint + "_rfBallBone"
     rf_toe = ankle_joint + "_rfToeBone"
     if cmds.objExists(rf_ball):
@@ -1527,9 +1626,13 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     if not has_ball_child and landmarks:
         rf_bones = _create_rfoot_bones(ankle_joint, landmarks)
     if landmarks:
-        heel_pos      = landmarks["heel"]
-        ball_pos      = landmarks["ball"]
-        toe_pivot_pos = [landmarks["tip"][0], landmarks["ground_y"], landmarks["tip"][2]]
+        # X は ankle_pos[0] にクランプして L/R bank 対称化
+        # (heel_pos の X が足外縁 3 unit 外側になり bank が非対称になる問題、
+        # RFOOT2 scout P3 の対応)
+        ax = ankle_pos[0]
+        heel_pos      = [ax, landmarks["ground_y"], landmarks["heel"][2]]
+        ball_pos      = [ax, landmarks["ground_y"], landmarks["ball"][2]]
+        toe_pivot_pos = [ax, landmarks["ground_y"], landmarks["tip"][2]]
         ground_y      = landmarks["ground_y"]
     else:
         # フォールバック: skinCluster 無い / 検出失敗 → 幾何近似 + scene bbox Y
@@ -1567,18 +1670,22 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     # parent 前に tx/ty/tz を lock すると `cmds.parent` が world 位置を保存できず
     # pivot ツリーが飛び、後段の toe_ikh が ankle を 100° 回転させる致命バグに繋がる
     # (FOOTROT scout で確定原因)。ここでは scale だけ lock、translate は後で。
-    heel_piv = _make_cube_curve(label + "_heel_ctl", scale=piv_size)
+    # pivot ctl は地面に置く flat_box にして cube 埋没 (P4) を回避
+    heel_piv = _make_flat_box_curve(label + "_heel_ctl", scale=piv_size,
+                                    x_ratio=1.0, z_ratio=1.0)
     _set_ctl_color(heel_piv, color)
     cmds.xform(heel_piv, ws=True, t=heel_pos)
     _lock_hide_attrs(heel_piv, ["sx","sy","sz"])
 
-    toe_piv = _make_cube_curve(label + "_tip_ctl", scale=piv_size)
+    toe_piv = _make_flat_box_curve(label + "_tip_ctl", scale=piv_size,
+                                    x_ratio=1.0, z_ratio=1.0)
     _set_ctl_color(toe_piv, color)
     cmds.xform(toe_piv, ws=True, t=toe_pivot_pos)
     cmds.parent(toe_piv, heel_piv)
     _lock_hide_attrs(toe_piv, ["sx","sy","sz"])
 
-    ball_piv = _make_cube_curve(label + "_ball_ctl", scale=piv_size * 0.8)
+    ball_piv = _make_flat_box_curve(label + "_ball_ctl", scale=piv_size * 0.8,
+                                     x_ratio=1.0, z_ratio=1.0)
     _set_ctl_color(ball_piv, color)
     cmds.xform(ball_piv, ws=True, t=ball_pos)
     cmds.parent(ball_piv, toe_piv)
@@ -1623,7 +1730,11 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
                     try: cmds.delete(con)
                     except Exception: pass
                 try:
+                    # skipTranslate: hero toe の translate は ankle 直下維持
+                    # (parentConstraint で位置を持ってくると rf_toe が地面
+                    # 沿いで動くので hero toe が -3.6 unit 沈む問題を回避)
                     cmds.parentConstraint(rf_toe, toe_joint, mo=True,
+                                          skipTranslate=["x", "y", "z"],
                                           n=toe_joint + "_rfToe_pc")
                 except Exception as e:
                     cmds.warning(f"[attach_ctrls] rfToe pc: {e}")
