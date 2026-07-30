@@ -27,8 +27,15 @@ try:
 except ImportError:  # pragma: no cover
     cmds = None  # type: ignore
 
+# fbx_renamer は同じ user scripts dir に install される。install.py で
+# _REMOTE_FILES に列挙されているので存在保証あり。
+try:
+    import fbx_renamer  # type: ignore
+except ImportError:
+    fbx_renamer = None  # type: ignore
 
-__version__ = "0.1.0"
+
+__version__ = "0.2.0"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -295,21 +302,297 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True):
 
 
 def delete_generated():
-    """attach_ctrls_grp と付随する constraint をまとめて削除。"""
+    """attach_ctrls_grp と付随する constraint / IK ノードをまとめて削除。"""
     if cmds is None:
         return
     n = 0
     if cmds.objExists(ROOT_GROUP):
         cmds.delete(ROOT_GROUP)
         n += 1
-    # constraint も掃除
     for con in cmds.ls("*_parentConstraint*", type="parentConstraint") or []:
         try:
-            cmds.delete(con)
-            n += 1
+            cmds.delete(con); n += 1
+        except Exception:
+            pass
+    for pattern in ("*_ikfk_oc*", "*_fk_oc*"):
+        for con in cmds.ls(pattern, type="orientConstraint") or []:
+            try:
+                cmds.delete(con); n += 1
+            except Exception:
+                pass
+    for ikh in cmds.ls(type="ikHandle") or []:
+        try:
+            cmds.delete(ikh); n += 1
         except Exception:
             pass
     print(f"[{_PACKAGE}] Deleted generated nodes: {n}")
+
+
+# =========================================================================
+# IK/FK setup (dual-chain blend)
+# ------------------------------------------------------------------------
+# 元 chain (bind joint) は保持。IK 用/FK 用の 3-joint clean chain を
+# duplicate で作成し、元 joint は orientConstraint で FK/IK rotation を
+# weight ブレンド。switch = 0..1 で完全 FK ↔ 完全 IK 切替可能。
+# =========================================================================
+
+def _find_chain(end_name, length=3):
+    """end_name から joint parent を length-1 回さかのぼって chain を返す。
+    途中に twist bones 等が挟まっていても、直接の joint parent を辿るのみ。
+    MMD の twist 直系対策として、bone 名を明示する _find_chain_by_names を推奨。"""
+    if not cmds.objExists(end_name):
+        return None
+    chain = [end_name]
+    cur = end_name
+    for _ in range(length - 1):
+        p = cmds.listRelatives(cur, p=True, type="joint") or []
+        if not p:
+            return None
+        chain.insert(0, p[0])
+        cur = p[0]
+    return chain
+
+
+def _find_chain_by_names(names):
+    """names 全て存在すれば list で返す (twist bones はスキップされる)。"""
+    for n in names:
+        if not cmds.objExists(n):
+            return None
+    return list(names)
+
+
+def _dup_clean_chain(joints, suffix):
+    """joints (親→子順) を worldspace 位置を保ちつつ 3-joint clean chain として
+    duplicate する。twist bones 等の中間 joint は含めない。"""
+    new_joints = []
+    for j in joints:
+        n = cmds.duplicate(j, po=True, n=j + suffix)[0]
+        # duplicate 直後は同じ world 位置。ただし親は元 joint の親のままなので
+        # 一旦 world に取り出す。
+        cmds.parent(n, world=True)
+        new_joints.append(n)
+    # 親子付け (world 位置は preserve される)
+    for i in range(1, len(new_joints)):
+        cmds.parent(new_joints[i], new_joints[i - 1])
+    return new_joints
+
+
+def setup_ik_fk(start, mid, end, side="C", pv_z_offset=None):
+    """3-joint chain (start, mid, end) に FK/IK blend rig を構築。
+
+    方針: Maya native の ikHandle.ikBlend を使い、original chain に
+    直接 IK handle を付ける。FK ctl は原 joint を orientConstraint。
+    switch attr で ikBlend と FK weight を反転制御 (0=FK / 1=IK)。
+
+    利点: chain duplication 不要。twist bones を含む arm chain でも
+    local space の不一致問題が発生しない。
+
+    Args:
+        start, mid, end: 元 joint 名 (親→子順)
+        side: "L"/"R"/"C" (ctl color 用)
+        pv_z_offset: pole vector の Z offset (None なら arm/leg 名から推定)
+    """
+    color = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
+    label = start  # side 込みで衝突回避 (arm_L / arm_R 等)
+
+    if not cmds.objExists(ROOT_GROUP):
+        cmds.group(em=True, name=ROOT_GROUP)
+
+    # --- 1. IK handle on ORIGINAL chain (twist bones を含む path をそのまま利用) ---
+    ik_handle = cmds.ikHandle(sj=start, ee=end,
+                              sol="ikRPsolver", n=label + "_ikh")[0]
+
+    # --- 2. IK ctl (end joint 位置) ---
+    ik_ctl = _make_cube_curve(label + "_IK_ctl", scale=1.5)
+    _set_ctl_color(ik_ctl, color)
+    ik_npo = cmds.group(em=True, name=label + "_IK_npo")
+    cmds.parent(ik_ctl, ik_npo)
+    cmds.matchTransform(ik_npo, end, pos=True, rot=True)
+    cmds.parent(ik_npo, ROOT_GROUP)
+    cmds.pointConstraint(ik_ctl, ik_handle, mo=False)
+    _lock_hide_attrs(ik_ctl, ["sx", "sy", "sz"])
+
+    # --- 3. pole vector ctl ---
+    pv_ctl = _make_cube_curve(label + "_PV_ctl", scale=0.4)
+    _set_ctl_color(pv_ctl, color)
+    pv_npo = cmds.group(em=True, name=label + "_PV_npo")
+    cmds.parent(pv_ctl, pv_npo)
+    mid_pos = cmds.xform(mid, q=True, ws=True, t=True)
+    if pv_z_offset is None:
+        lo = label.lower()
+        if "leg" in lo or "knee" in lo or "ankle" in lo:
+            pv_z_offset = 3.0
+        else:
+            pv_z_offset = -3.0
+    cmds.xform(pv_npo, ws=True, t=(mid_pos[0], mid_pos[1], mid_pos[2] + pv_z_offset))
+    cmds.parent(pv_npo, ROOT_GROUP)
+    cmds.poleVectorConstraint(pv_ctl, ik_handle)
+    _lock_hide_attrs(pv_ctl, ["sx", "sy", "sz", "rx", "ry", "rz"])
+
+    # --- 4. FK ctls (original 3 joints それぞれに) ---
+    fk_ctls = []
+    for j in [start, mid, end]:
+        fk_ctl = _make_cube_curve(j + "_FK_ctl", scale=0.7)
+        _set_ctl_color(fk_ctl, color)
+        fk_npo = cmds.group(em=True, name=j + "_FK_npo")
+        cmds.parent(fk_ctl, fk_npo)
+        cmds.matchTransform(fk_npo, j, pos=True, rot=True)
+        _lock_hide_attrs(fk_ctl, ["sx", "sy", "sz", "tx", "ty", "tz"])
+        fk_ctls.append((fk_npo, fk_ctl))
+    # 階層: mid_npo -> start_ctl, end_npo -> mid_ctl
+    cmds.parent(fk_ctls[1][0], fk_ctls[0][1])
+    cmds.parent(fk_ctls[2][0], fk_ctls[1][1])
+    cmds.parent(fk_ctls[0][0], ROOT_GROUP)
+
+    # --- 5. Switch attribute (IK ctl に付与、 0=FK 1=IK) ---
+    if not cmds.attributeQuery("IK_FK", node=ik_ctl, exists=True):
+        cmds.addAttr(ik_ctl, ln="IK_FK", at="float", min=0.0, max=1.0, dv=1.0, k=True)
+
+    rev = cmds.createNode("reverse", n=label + "_ikfk_rev")
+    cmds.connectAttr(ik_ctl + ".IK_FK", rev + ".inputX")
+
+    # --- 6. ikHandle.ikBlend = switch (native FK/IK blend) ---
+    cmds.connectAttr(ik_ctl + ".IK_FK", ik_handle + ".ikBlend")
+
+    # --- 7. Constraints on hero joints ---
+    # start / mid: FK ctl orient constraint, weight = 1 - switch
+    #   (IK 側は ikHandle が ikBlend で solver 出力を直接 joint に流す)
+    for i, orig_j in enumerate([start, mid]):
+        fk_ctl_j = fk_ctls[i][1]
+        cons = cmds.orientConstraint(fk_ctl_j, orig_j, mo=False,
+                                     n=orig_j + "_fk_oc")[0]
+        wal = cmds.orientConstraint(cons, q=True, wal=True)
+        cmds.connectAttr(rev + ".outputX", cons + "." + wal[0])
+
+    # end: dual orient constraint (FK ctl + IK ctl), weights blended by switch
+    #   IK solver は end 位置のみ制御 (rotation は残る) ので orient constraint 併用。
+    fk_end_ctl = fk_ctls[2][1]
+    end_cons = cmds.orientConstraint(fk_end_ctl, ik_ctl, end, mo=False,
+                                     n=end + "_ikfk_oc")[0]
+    wal = cmds.orientConstraint(end_cons, q=True, wal=True)  # [fkW, ikW]
+    cmds.connectAttr(rev + ".outputX", end_cons + "." + wal[0])
+    cmds.connectAttr(ik_ctl + ".IK_FK", end_cons + "." + wal[1])
+
+    # --- 8. Visibility toggle: IK ctls when switch>0, FK ctls when switch<1 ---
+    try:
+        cmds.setAttr(ik_ctl + ".v", lock=False)
+    except Exception:
+        pass
+    try:
+        cmds.connectAttr(ik_ctl + ".IK_FK", ik_npo + ".v")
+        cmds.connectAttr(ik_ctl + ".IK_FK", pv_npo + ".v")
+        cmds.connectAttr(rev + ".outputX",  fk_ctls[0][0] + ".v")
+    except Exception as exc:
+        cmds.warning(f"[attach_ctrls] visibility connect failed: {exc}")
+
+    print(f"[{_PACKAGE}] IK/FK rig: {label}  IK={ik_ctl}  PV={pv_ctl}  "
+          f"FK={[c for _, c in fk_ctls]}  switch={ik_ctl}.IK_FK")
+
+    return {
+        "label":     label,
+        "ik_handle": ik_handle,
+        "ik_ctl":    ik_ctl,
+        "pv_ctl":    pv_ctl,
+        "fk_ctls":   [c for _, c in fk_ctls],
+        "switch":    ik_ctl + ".IK_FK",
+    }
+
+
+# --- チェーン自動検出 & 一括セットアップ ------------------------------
+
+_ARM_CANDIDATES = [
+    ("arm",       "elbow",     "wrist"),
+    ("shoulder",  "elbow",     "wrist"),
+    ("upperarm",  "forearm",   "hand"),
+]
+_LEG_CANDIDATES = [
+    ("leg",       "knee",      "ankle"),
+    ("upleg",     "knee",      "foot"),
+    ("thigh",     "shin",      "foot"),
+]
+
+
+def _try_find(triples, side):
+    for start, mid, end in triples:
+        names = [f"{start}_{side}", f"{mid}_{side}", f"{end}_{side}"]
+        chain = _find_chain_by_names(names)
+        if chain:
+            return chain
+    return None
+
+
+def find_ik_chains():
+    """L/R arm と L/R leg を自動検出して { "L_arm": [j,j,j], ... } を返す。"""
+    out = {}
+    for side in ("L", "R"):
+        a = _try_find(_ARM_CANDIDATES, side)
+        if a:
+            out[f"{side}_arm"] = a
+        lg = _try_find(_LEG_CANDIDATES, side)
+        if lg:
+            out[f"{side}_leg"] = lg
+    return out
+
+
+def setup_all_ik_fk():
+    """検出できた L/R arm/leg 全てに IK/FK rig を構築。"""
+    chains = find_ik_chains()
+    results = []
+    for label, chain in chains.items():
+        side = "L" if label.startswith("L") else "R"
+        try:
+            r = setup_ik_fk(chain[0], chain[1], chain[2], side=side)
+            results.append(r)
+        except Exception as exc:
+            cmds.warning(f"[attach_ctrls] IK setup for {label} failed: {exc}")
+    print(f"[{_PACKAGE}] setup_all_ik_fk: {len(results)}/{len(chains)} chains")
+    return results
+
+
+# --- Full auto-setup: rename -> attach FK -> setup IK/FK ---------------
+
+def full_auto_setup(scale=1.0):
+    """FBX 直後の状態から完全 rig setup を 1 コマンドで実行。
+    1. namespace 除去
+    2. joint 名 rename (fbx_renamer 経由)
+    3. IK/FK chain を除いた全 joint に FK cube ctl 付与
+    4. L/R arm/leg で IK/FK blend rig 構築
+    """
+    if cmds is None:
+        raise RuntimeError("Must run inside Maya.")
+
+    # Step 1+2: rename
+    if fbx_renamer is None:
+        cmds.warning("[attach_ctrls] fbx_renamer not available -- skipping rename")
+    else:
+        fbx_renamer.remove_all_namespaces()
+        fbx_renamer.rename_all_joints()
+
+    # Step 3: attach FK ctls, but exclude joints that will be part of IK/FK chains
+    #         (they will get their own FK ctl in setup_all_ik_fk via fk_chain)
+    chains = find_ik_chains()
+    exclude = set()
+    for chain in chains.values():
+        exclude.update(chain)
+
+    all_joints = cmds.ls(type="joint") or []
+    other = [j for j in all_joints
+             if j not in exclude
+             and not j.endswith("_end")
+             and not j.endswith("_ik")
+             and not j.endswith("_fk")]
+    attach_result = attach_controllers(joints=other, scale=scale, do_constrain=True)
+
+    # Step 4: IK/FK setup
+    ik_results = setup_all_ik_fk()
+
+    print(f"[{_PACKAGE}] === full_auto_setup complete ===")
+    print(f"  FK ctls attached: {len(attach_result)}")
+    print(f"  IK/FK chains    : {len(ik_results)}")
+    for r in ik_results:
+        print(f"    {r['label']:15s} switch: {r['switch']}")
+
+    return {"fk_attach": attach_result, "ik_fk": ik_results}
 
 
 # =========================================================================
@@ -321,12 +604,11 @@ _UI_CONSTRAIN = "attach_ctrls_ui_constrain"
 
 
 def _build_body() -> None:
-    cmds.separator(h=4, style="none")
-    cmds.text(l="1) Outliner か viewport で骨を選択",
-              al="left")
-    cmds.text(l="2) 下のパラメータを調整して [Attach] を押す",
-              al="left")
-    cmds.separator(h=6, style="none")
+    # ============ Section 0: FULL AUTO (推奨) ============
+    cmds.text(l="=== Full Auto Setup (FBX 直後推奨) ===",
+              al="left", fn="boldLabelFont")
+    cmds.text(l="rename → 全 joint に FK ctl → L/R arm+leg に IK/FK rig を一括構築",
+              al="left", fn="smallObliqueLabelFont")
 
     cmds.floatSliderGrp(
         _UI_SCALE,
@@ -335,24 +617,70 @@ def _build_body() -> None:
         value=1.0, cw3=(80, 60, 120),
         ann="キューブコントローラーのサイズ (unit)",
     )
-    cmds.checkBoxGrp(
-        _UI_CONSTRAIN,
-        label="Constrain", label1="parentConstraint (joint follows ctl)",
-        value1=True, cw2=(80, 260),
-    )
-    cmds.separator(h=6, style="none")
 
-    cmds.rowLayout(nc=2, adj=1, cw2=(240, 120),
+    cmds.rowLayout(nc=2, adj=1, cw2=(280, 100),
                    ct2=("both", "both"), co2=(4, 4))
-    cmds.button(l="Attach controllers to selected", h=36, c=_ui_attach,
-                bgc=(0.20, 0.55, 0.95))
-    cmds.button(l="Delete generated", h=36, c=_ui_delete,
+    cmds.button(l="⚡ FULL AUTO SETUP", h=40, c=_ui_full_auto,
+                bgc=(0.90, 0.55, 0.10))
+    cmds.button(l="Delete ALL", h=40, c=_ui_delete,
                 bgc=(0.55, 0.20, 0.20))
     cmds.setParent("..")
 
+    cmds.separator(h=10, style="in")
+
+    # ============ Section 1: 個別ステップ (advanced) ============
+    cmds.text(l="=== 個別ステップ (advanced) ===",
+              al="left", fn="boldLabelFont")
+
+    cmds.rowLayout(nc=2, adj=1, cw2=(190, 190),
+                   ct2=("both", "both"), co2=(2, 2))
+    cmds.button(l="① Rename joints (dry-run)", h=28, c=_ui_rename_dry)
+    cmds.button(l="① Rename joints", h=28, c=_ui_rename,
+                bgc=(0.20, 0.55, 0.85))
+    cmds.setParent("..")
+
+    cmds.checkBoxGrp(
+        _UI_CONSTRAIN,
+        label="Attach:", label1="parentConstraint (joint follows ctl)",
+        value1=True, cw2=(60, 280),
+    )
+    cmds.rowLayout(nc=2, adj=1, cw2=(190, 190),
+                   ct2=("both", "both"), co2=(2, 2))
+    cmds.button(l="② Attach FK ctls to selected", h=28, c=_ui_attach,
+                bgc=(0.20, 0.55, 0.85))
+    cmds.button(l="③ Setup IK/FK (L/R arm+leg)", h=28, c=_ui_ikfk,
+                bgc=(0.20, 0.85, 0.55))
+    cmds.setParent("..")
+
     cmds.separator(h=6, style="none")
-    cmds.text(l="側判定: 左/右 (MMD), L_/R_, _L/_R, left/right → 該当なしは C(黄)",
+    cmds.text(l="IK/FK 切替: IK ctl の 'IK_FK' アトリビュート (0=FK, 1=IK)",
               al="left", fn="smallObliqueLabelFont")
+    cmds.text(l="側判定: 左/右, L_/R_, _L/_R, left/right → 該当なしは C(黄)",
+              al="left", fn="smallObliqueLabelFont")
+
+
+def _ui_full_auto(*_):
+    scale = cmds.floatSliderGrp(_UI_SCALE, q=True, value=True)
+    full_auto_setup(scale=scale)
+
+
+def _ui_rename(*_):
+    if fbx_renamer is None:
+        cmds.warning("fbx_renamer not available")
+        return
+    fbx_renamer.remove_all_namespaces()
+    fbx_renamer.rename_all_joints()
+
+
+def _ui_rename_dry(*_):
+    if fbx_renamer is None:
+        cmds.warning("fbx_renamer not available")
+        return
+    fbx_renamer.rename_all_joints(dry_run=True)
+
+
+def _ui_ikfk(*_):
+    setup_all_ik_fk()
 
 
 def _ui_attach(*_):

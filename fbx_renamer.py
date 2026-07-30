@@ -176,14 +176,18 @@ _MMD_BONE_MAP = {
     "耳": "ear",
     "猫": "cat",
 
+    # --- MMD 標準の cancel bone / 補助ラベル ---
+    "キャンセル": "cancel",
+    "ダミー": "dummy",
+    "補助": "aux",
+
     # --- 汎用ラベル ---
     "先": "tip",
-    "操作": "op",
     "操作中心": "op_center",
+    "操作": "op",
     "中心": "center",
     "半身": "body_half",
     "作": "make",
-    "ダミー": "dummy",
     "球": "ball",
     "IK": "IK",
     "EX": "EX",

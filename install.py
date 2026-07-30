@@ -24,6 +24,12 @@ _GITHUB_BRANCH = "main"
 
 _MODULE = "attach_ctrls"
 _SHELF_BUTTON_LABEL = "AttachCtrl"
+
+# 配布ファイル一覧 (repo ルートからの相対パス、_MODULE.py が先頭)
+_REMOTE_FILES = (
+    "attach_ctrls.py",   # メインツール
+    "fbx_renamer.py",    # attach_ctrls から import される helper
+)
 # --- END CUSTOMIZE -------------------------------------------------------
 
 
@@ -81,46 +87,56 @@ def _resolve_latest_sha() -> str:
 
 
 def _fetch_module(dest_root: str) -> None:
+    """Download every file in _REMOTE_FILES to dest_root."""
     from urllib.request import Request, urlopen
 
     env_flag = f"{_MODULE.upper()}_USE_LOCAL"
     use_local = os.environ.get(env_flag) == "1"
-    src_local = os.path.join(_REPO_ROOT, _MODULE_FILE)
-    target = os.path.join(dest_root, _MODULE_FILE)
 
-    if use_local and os.path.isfile(src_local):
-        print(f"[{_MODULE}] {env_flag}=1 -> copying local {src_local}")
-        with open(src_local, "rb") as fh:
-            data = fh.read()
-    else:
-        sha = _resolve_latest_sha()
-        url = f"{_GITHUB_RAW_BASE}/{sha}/{_MODULE_FILE}"
-        print(f"[{_MODULE}] downloading {url}")
-        req = Request(url, headers={
-            "Cache-Control": "no-cache",
-            "User-Agent": f"{_MODULE}-installer/{sha[:10]}",
-        })
-        try:
-            data = urlopen(req, timeout=30).read()
-        except Exception as exc:
-            raise RuntimeError(f"Failed to download {url}: {exc}")
+    sha = None if use_local else _resolve_latest_sha()
 
-    _atomic_write_bytes(target, data)
-    print(f"[{_MODULE}]   -> {target} ({len(data)} bytes)")
+    for rel_path in _REMOTE_FILES:
+        src_local = os.path.join(_REPO_ROOT, rel_path)
+        target = os.path.join(dest_root, rel_path.replace("/", os.sep))
+
+        if use_local and os.path.isfile(src_local):
+            print(f"[{_MODULE}] {env_flag}=1 -> copying local {src_local}")
+            with open(src_local, "rb") as fh:
+                data = fh.read()
+        else:
+            url = f"{_GITHUB_RAW_BASE}/{sha}/{rel_path}"
+            print(f"[{_MODULE}] downloading {url}")
+            req = Request(url, headers={
+                "Cache-Control": "no-cache",
+                "User-Agent": f"{_MODULE}-installer/{(sha or 'local')[:10]}",
+            })
+            try:
+                data = urlopen(req, timeout=30).read()
+            except Exception as exc:
+                raise RuntimeError(f"Failed to download {url}: {exc}")
+
+        _atomic_write_bytes(target, data)
+        print(f"[{_MODULE}]   -> {target} ({len(data)} bytes)")
 
 
 def _verify_install(dest_root: str) -> None:
-    p = os.path.join(dest_root, _MODULE_FILE)
-    if not os.path.isfile(p) or os.path.getsize(p) == 0:
-        raise RuntimeError(f"Install verification failed -- {p} missing/empty")
+    for rel in _REMOTE_FILES:
+        p = os.path.join(dest_root, rel.replace("/", os.sep))
+        if not os.path.isfile(p) or os.path.getsize(p) == 0:
+            raise RuntimeError(f"Install verification failed -- {p} missing/empty")
 
 
 def _clean_pycache(dest_root: str) -> None:
+    """Remove stale .pyc for every module in _REMOTE_FILES."""
     pycache = os.path.join(dest_root, "__pycache__")
     if not os.path.isdir(pycache):
         return
+    module_bases = tuple(
+        os.path.basename(rel).replace(".py", "") + "."
+        for rel in _REMOTE_FILES if rel.endswith(".py")
+    )
     for name in os.listdir(pycache):
-        if name.startswith(f"{_MODULE}.") and name.endswith(".pyc"):
+        if name.startswith(module_bases) and name.endswith(".pyc"):
             try:
                 _force_writable(os.path.join(pycache, name))
                 os.remove(os.path.join(pycache, name))
@@ -129,7 +145,11 @@ def _clean_pycache(dest_root: str) -> None:
 
 
 def _flush_imports() -> None:
-    sys.modules.pop(_MODULE, None)
+    for rel in _REMOTE_FILES:
+        if not rel.endswith(".py"):
+            continue
+        mod = os.path.basename(rel).replace(".py", "")
+        sys.modules.pop(mod, None)
 
 
 def _read_installed_version(dest_root: str) -> str:
