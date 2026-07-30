@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.tmp_install
+
+# test artifacts (verification harness output)
+_test_result.json
+_test_run.py
+
+# user-provided test assets (not for public distribution)
+*.fbx
