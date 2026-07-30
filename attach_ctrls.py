@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -57,6 +57,72 @@ ROOT_GROUP = "attach_ctrls_grp"
 COLOR_L = 6   # blue
 COLOR_R = 13  # red
 COLOR_C = 17  # yellow
+COLOR_DECOR = 2  # dark grey (装飾骨用、視覚的に控えめ)
+
+# 装飾骨判定パターン (skip_decoration=True 時に attach_controllers から除外)
+# 部分一致 (short name の lowercase に含まれれば装飾扱い)
+_DECORATION_TOKENS = (
+    "hair", "front_hair", "back_hair", "side_hair",
+    "ribbon", "skirt", "sleeve", "necktie", "coat",
+    "cat_ear", "ear", "tail",
+    "cancel",  # MMD の cancel bone (物理補助)
+)
+
+# 完全一致で装飾判定するもの (H1..H99 のヘアチェーン等)
+def _is_hair_chain(short_name):
+    if len(short_name) < 2:
+        return False
+    if short_name[0] in ("H", "h") and short_name[1:].isdigit():
+        return True
+    # "H15_end" みたいなのも hair chain
+    if short_name.endswith("_end"):
+        core = short_name[:-4]
+        if len(core) >= 2 and core[0] in ("H","h") and core[1:].isdigit():
+            return True
+    return False
+
+
+def _is_decoration(joint_name):
+    short = joint_name.split("|")[-1]
+    if _is_hair_chain(short):
+        return True
+    lo = short.lower()
+    # side/suffix 除去
+    for suf in ("_l", "_r", "_c", "_end"):
+        if lo.endswith(suf):
+            lo = lo[:-len(suf)]
+    for tok in _DECORATION_TOKENS:
+        if tok in lo:
+            return True
+    return False
+
+
+# --- Auto ctl scale (bone length ベース) ---
+
+def _bone_length(joint):
+    """joint から最初の child joint までの距離。無ければ parent 距離。0 なら None。"""
+    p = cmds.xform(joint, q=True, ws=True, t=True)
+    kids = cmds.listRelatives(joint, c=True, type="joint") or []
+    if kids:
+        cp = cmds.xform(kids[0], q=True, ws=True, t=True)
+        d = sum((a-b)**2 for a,b in zip(p, cp))**0.5
+        if d > 0.001:
+            return d
+    parents = cmds.listRelatives(joint, p=True, type="joint") or []
+    if parents:
+        pp = cmds.xform(parents[0], q=True, ws=True, t=True)
+        d = sum((a-b)**2 for a,b in zip(p, pp))**0.5
+        if d > 0.001:
+            return d
+    return None
+
+
+def _auto_ctl_scale(joint, mult=1.0, min_s=0.2, max_s=20.0):
+    """bone length に応じた ctl サイズ。leaf/root は fallback。"""
+    d = _bone_length(joint)
+    if d is None:
+        return max(min_s, min(max_s, 1.0 * mult))
+    return max(min_s, min(max_s, d * 1.0 * mult))
 
 
 # =========================================================================
@@ -223,13 +289,16 @@ def _lock_hide_attrs(ctl, attrs):
             pass
 
 
-def attach_controllers(joints=None, scale=1.0, do_constrain=True):
+def attach_controllers(joints=None, scale=1.0, do_constrain=True,
+                        auto_scale=True, skip_decoration=False):
     """選択された joint に mGear 風のコントローラを一括セットアップ。
 
     Args:
-        joints:        処理対象 joint リスト。None なら現在の selection を使う。
-        scale:         キューブ ctl のスケール (1.0 = 1 unit)。
-        do_constrain:  True なら joint を ctl に parentConstraint する。
+        joints:          処理対象 joint リスト。None なら現在の selection を使う。
+        scale:           auto_scale=True の時は multiplier、False の時は絶対サイズ。
+        do_constrain:    True なら joint を ctl に parentConstraint する。
+        auto_scale:      True なら bone 長さから ctl サイズを自動計算。
+        skip_decoration: True なら hair/ribbon/skirt/etc の装飾骨は ctl 付けない。
 
     Returns:
         dict {joint: (npo, ctl)}
@@ -261,10 +330,24 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True):
             cmds.warning(f"[attach_ctrls] {ctl_name} already exists; skipping {jnt}")
             continue
 
-        side = _detect_side(base)
-        color = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
+        # 装飾骨スキップ
+        is_decor = _is_decoration(jnt)
+        if skip_decoration and is_decor:
+            continue
 
-        ctl = _make_cube_curve(ctl_name, scale=scale)
+        side = _detect_side(base)
+        if is_decor:
+            color = COLOR_DECOR
+        else:
+            color = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
+
+        # 自動サイズ
+        if auto_scale:
+            ctl_size = _auto_ctl_scale(jnt, mult=scale)
+        else:
+            ctl_size = scale
+
+        ctl = _make_cube_curve(ctl_name, scale=ctl_size)
         _set_ctl_color(ctl, color)
 
         npo = cmds.group(em=True, name=npo_name)
@@ -398,12 +481,20 @@ def setup_ik_fk(start, mid, end, side="C", pv_z_offset=None):
     if not cmds.objExists(ROOT_GROUP):
         cmds.group(em=True, name=ROOT_GROUP)
 
+    # 自動サイズ (chain の平均 bone 長さから算出)
+    _chain_lengths = [_bone_length(j) for j in [start, mid, end]]
+    _chain_lengths = [d for d in _chain_lengths if d is not None]
+    chain_size = sum(_chain_lengths) / len(_chain_lengths) if _chain_lengths else 1.0
+    ik_size = chain_size * 1.5   # IK ctl: 大きめ (掴みやすさ優先)
+    pv_size = chain_size * 0.5   # PV ctl: 小さめ
+    fk_size = chain_size * 0.8   # FK ctl: 中間
+
     # --- 1. IK handle on ORIGINAL chain (twist bones を含む path をそのまま利用) ---
     ik_handle = cmds.ikHandle(sj=start, ee=end,
                               sol="ikRPsolver", n=label + "_ikh")[0]
 
     # --- 2. IK ctl (end joint 位置) ---
-    ik_ctl = _make_cube_curve(label + "_IK_ctl", scale=1.5)
+    ik_ctl = _make_cube_curve(label + "_IK_ctl", scale=ik_size)
     _set_ctl_color(ik_ctl, color)
     ik_npo = cmds.group(em=True, name=label + "_IK_npo")
     cmds.parent(ik_ctl, ik_npo)
@@ -413,7 +504,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_z_offset=None):
     _lock_hide_attrs(ik_ctl, ["sx", "sy", "sz"])
 
     # --- 3. pole vector ctl ---
-    pv_ctl = _make_cube_curve(label + "_PV_ctl", scale=0.4)
+    pv_ctl = _make_cube_curve(label + "_PV_ctl", scale=pv_size)
     _set_ctl_color(pv_ctl, color)
     pv_npo = cmds.group(em=True, name=label + "_PV_npo")
     cmds.parent(pv_ctl, pv_npo)
@@ -432,7 +523,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_z_offset=None):
     # --- 4. FK ctls (original 3 joints それぞれに) ---
     fk_ctls = []
     for j in [start, mid, end]:
-        fk_ctl = _make_cube_curve(j + "_FK_ctl", scale=0.7)
+        fk_ctl = _make_cube_curve(j + "_FK_ctl", scale=fk_size)
         _set_ctl_color(fk_ctl, color)
         fk_npo = cmds.group(em=True, name=j + "_FK_npo")
         cmds.parent(fk_ctl, fk_npo)
@@ -549,14 +640,111 @@ def setup_all_ik_fk():
     return results
 
 
-# --- Full auto-setup: rename -> attach FK -> setup IK/FK ---------------
+# --- 不要ノード削除 -----------------------------------------------------
 
-def full_auto_setup(scale=1.0):
+def _is_skinned(joint):
+    """joint が skinCluster に接続されているか。"""
+    try:
+        conns = cmds.listConnections(joint + ".worldMatrix",
+                                     type="skinCluster", d=True, s=False) or []
+        return len(conns) > 0
+    except Exception:
+        return False
+
+
+def delete_unnecessary(dry_run=False):
+    """FBX import 由来の不要ノードを掃除。
+    - locator ノード (rig で使わない)
+    - 未 skinning の _end / shadow_ / _end 系 leaf joint
+    削除順は子から親 (依存壊さないため)。
+    """
+    if cmds is None:
+        return []
+
+    deleted = []
+    skipped_safety = []
+
+    # 1. locator transforms (typically MMD の空 helper)
+    # ただし joint 子孫を持つ locator (character root として使われている等) は
+    # 削除すると骨全体を殺してしまうので skip。
+    loc_shapes = cmds.ls(type="locator", long=True) or []
+    loc_transforms = set()
+    for ls in loc_shapes:
+        parents = cmds.listRelatives(ls, p=True, f=True) or []
+        for p in parents:
+            loc_transforms.add(p)
+    for lt in loc_transforms:
+        if not cmds.objExists(lt):
+            continue
+        # 安全: joint descendant がある transform は skip
+        joint_desc = cmds.listRelatives(lt, ad=True, type="joint") or []
+        if joint_desc:
+            skipped_safety.append(lt.split("|")[-1])
+            continue
+        # 安全: skinCluster に接続されている shape descendant があれば skip
+        try:
+            all_desc = cmds.listRelatives(lt, ad=True) or []
+            has_skin = any(
+                cmds.listConnections(d, type="skinCluster") for d in all_desc
+            )
+        except Exception:
+            has_skin = False
+        if has_skin:
+            skipped_safety.append(lt.split("|")[-1])
+            continue
+        try:
+            deleted.append(lt.split("|")[-1])
+            if not dry_run:
+                cmds.delete(lt)
+        except Exception:
+            pass
+
+    # 2. unskinned helper joints (shadow_ / _end)
+    #    深い joint から先に削除 (子から親)
+    all_joints = cmds.ls(type="joint", long=True) or []
+    scored = [(j.count("|"), j) for j in all_joints]
+    scored.sort(reverse=True)
+
+    for _, j in scored:
+        if not cmds.objExists(j):
+            continue
+        short = j.split("|")[-1]
+        candidate = (short.startswith("shadow_")
+                     or short.endswith("_end")
+                     or short.startswith("dummy_"))
+        if not candidate:
+            continue
+        if _is_skinned(j):
+            continue
+        # 子が skinning されていたら残す
+        kids = cmds.listRelatives(j, ad=True, type="joint") or []
+        if any(_is_skinned(k) for k in kids):
+            continue
+        deleted.append(j)
+        if not dry_run:
+            try: cmds.delete(j)
+            except Exception: pass
+
+    tag = "DRY-RUN" if dry_run else "DELETED"
+    print(f"[{_PACKAGE}] {tag} unnecessary nodes: {len(deleted)}  "
+          f"(safety-skipped: {len(skipped_safety)})")
+    return deleted
+
+
+# --- Full auto-setup: rename -> delete unnecessary -> attach FK -> IK/FK ---
+
+def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     """FBX 直後の状態から完全 rig setup を 1 コマンドで実行。
     1. namespace 除去
     2. joint 名 rename (fbx_renamer 経由)
-    3. IK/FK chain を除いた全 joint に FK cube ctl 付与
-    4. L/R arm/leg で IK/FK blend rig 構築
+    3. 不要ノード削除 (locator + 未skin _end/shadow/dummy)
+    4. IK/FK chain を除いた全 joint に FK cube ctl 付与 (auto-scale)
+    5. L/R arm/leg で IK/FK blend rig 構築
+
+    Args:
+        scale:           auto_scale multiplier (1.0 = bone 長さ準拠)
+        skip_decoration: hair/ribbon/skirt/coat/ear/tail 系を除外
+        delete_junk:     不要ノード削除を実行するか
     """
     if cmds is None:
         raise RuntimeError("Must run inside Maya.")
@@ -568,8 +756,11 @@ def full_auto_setup(scale=1.0):
         fbx_renamer.remove_all_namespaces()
         fbx_renamer.rename_all_joints()
 
-    # Step 3: attach FK ctls, but exclude joints that will be part of IK/FK chains
-    #         (they will get their own FK ctl in setup_all_ik_fk via fk_chain)
+    # Step 3: cleanup
+    if delete_junk:
+        delete_unnecessary()
+
+    # Step 4: attach FK ctls, exclude IK/FK chain joints
     chains = find_ik_chains()
     exclude = set()
     for chain in chains.values():
@@ -578,12 +769,13 @@ def full_auto_setup(scale=1.0):
     all_joints = cmds.ls(type="joint") or []
     other = [j for j in all_joints
              if j not in exclude
-             and not j.endswith("_end")
-             and not j.endswith("_ik")
-             and not j.endswith("_fk")]
-    attach_result = attach_controllers(joints=other, scale=scale, do_constrain=True)
+             and not j.endswith("_end")]
+    attach_result = attach_controllers(joints=other, scale=scale,
+                                        do_constrain=True,
+                                        auto_scale=True,
+                                        skip_decoration=skip_decoration)
 
-    # Step 4: IK/FK setup
+    # Step 5: IK/FK setup
     ik_results = setup_all_ik_fk()
 
     print(f"[{_PACKAGE}] === full_auto_setup complete ===")
@@ -601,21 +793,34 @@ def full_auto_setup(scale=1.0):
 
 _UI_SCALE = "attach_ctrls_ui_scale"
 _UI_CONSTRAIN = "attach_ctrls_ui_constrain"
+_UI_SKIP_DECOR = "attach_ctrls_ui_skip_decor"
+_UI_DELETE_JUNK = "attach_ctrls_ui_delete_junk"
 
 
 def _build_body() -> None:
     # ============ Section 0: FULL AUTO (推奨) ============
     cmds.text(l="=== Full Auto Setup (FBX 直後推奨) ===",
               al="left", fn="boldLabelFont")
-    cmds.text(l="rename → 全 joint に FK ctl → L/R arm+leg に IK/FK rig を一括構築",
+    cmds.text(l="rename → 不要削除 → 全 joint に auto-scale FK ctl → L/R arm+leg IK/FK",
               al="left", fn="smallObliqueLabelFont")
 
     cmds.floatSliderGrp(
         _UI_SCALE,
-        label="Ctrl Scale", field=True,
-        min=0.1, max=10.0, fieldMinValue=0.01, fieldMaxValue=100.0,
+        label="Size ×", field=True,
+        min=0.1, max=5.0, fieldMinValue=0.01, fieldMaxValue=100.0,
         value=1.0, cw3=(80, 60, 120),
-        ann="キューブコントローラーのサイズ (unit)",
+        ann="ctl サイズ倍率 (1.0 = bone 長さ準拠、大きくすると全 ctl が拡大)",
+    )
+    cmds.checkBoxGrp(
+        _UI_SKIP_DECOR,
+        label="Skip:", label1="装飾骨 (hair/ribbon/skirt/coat/ear/tail 等)",
+        value1=False, cw2=(60, 280),
+        ann="装飾系の骨は ctl を付けない (視覚的にすっきり)",
+    )
+    cmds.checkBoxGrp(
+        _UI_DELETE_JUNK,
+        label="Del:", label1="locator + 未skin _end/shadow/dummy 自動削除",
+        value1=True, cw2=(60, 280),
     )
 
     cmds.rowLayout(nc=2, adj=1, cw2=(280, 100),
@@ -632,11 +837,13 @@ def _build_body() -> None:
     cmds.text(l="=== 個別ステップ (advanced) ===",
               al="left", fn="boldLabelFont")
 
-    cmds.rowLayout(nc=2, adj=1, cw2=(190, 190),
-                   ct2=("both", "both"), co2=(2, 2))
-    cmds.button(l="① Rename joints (dry-run)", h=28, c=_ui_rename_dry)
-    cmds.button(l="① Rename joints", h=28, c=_ui_rename,
+    cmds.rowLayout(nc=3, adj=1, cw3=(130, 130, 130),
+                   ct3=("both", "both", "both"), co3=(2, 2, 2))
+    cmds.button(l="① Rename (dry)", h=26, c=_ui_rename_dry)
+    cmds.button(l="① Rename", h=26, c=_ui_rename,
                 bgc=(0.20, 0.55, 0.85))
+    cmds.button(l="② Del junk", h=26, c=_ui_del_junk,
+                bgc=(0.55, 0.35, 0.20))
     cmds.setParent("..")
 
     cmds.checkBoxGrp(
@@ -646,22 +853,24 @@ def _build_body() -> None:
     )
     cmds.rowLayout(nc=2, adj=1, cw2=(190, 190),
                    ct2=("both", "both"), co2=(2, 2))
-    cmds.button(l="② Attach FK ctls to selected", h=28, c=_ui_attach,
+    cmds.button(l="③ Attach FK ctls to selected", h=28, c=_ui_attach,
                 bgc=(0.20, 0.55, 0.85))
-    cmds.button(l="③ Setup IK/FK (L/R arm+leg)", h=28, c=_ui_ikfk,
+    cmds.button(l="④ Setup IK/FK (L/R arm+leg)", h=28, c=_ui_ikfk,
                 bgc=(0.20, 0.85, 0.55))
     cmds.setParent("..")
 
     cmds.separator(h=6, style="none")
-    cmds.text(l="IK/FK 切替: IK ctl の 'IK_FK' アトリビュート (0=FK, 1=IK)",
+    cmds.text(l="IK/FK 切替: IK ctl の 'IK_FK' attr (0=FK, 1=IK)",
               al="left", fn="smallObliqueLabelFont")
-    cmds.text(l="側判定: 左/右, L_/R_, _L/_R, left/right → 該当なしは C(黄)",
+    cmds.text(l="装飾骨は暗灰色。IK モードで waist を回すと足が接地したまま追従。",
               al="left", fn="smallObliqueLabelFont")
 
 
 def _ui_full_auto(*_):
     scale = cmds.floatSliderGrp(_UI_SCALE, q=True, value=True)
-    full_auto_setup(scale=scale)
+    skip_dec = cmds.checkBoxGrp(_UI_SKIP_DECOR, q=True, value1=True)
+    del_junk = cmds.checkBoxGrp(_UI_DELETE_JUNK, q=True, value1=True)
+    full_auto_setup(scale=scale, skip_decoration=skip_dec, delete_junk=del_junk)
 
 
 def _ui_rename(*_):
@@ -679,6 +888,10 @@ def _ui_rename_dry(*_):
     fbx_renamer.rename_all_joints(dry_run=True)
 
 
+def _ui_del_junk(*_):
+    delete_unnecessary()
+
+
 def _ui_ikfk(*_):
     setup_all_ik_fk()
 
@@ -686,7 +899,9 @@ def _ui_ikfk(*_):
 def _ui_attach(*_):
     scale = cmds.floatSliderGrp(_UI_SCALE, q=True, value=True)
     do_constrain = cmds.checkBoxGrp(_UI_CONSTRAIN, q=True, value1=True)
-    attach_controllers(scale=scale, do_constrain=do_constrain)
+    skip_dec = cmds.checkBoxGrp(_UI_SKIP_DECOR, q=True, value1=True)
+    attach_controllers(scale=scale, do_constrain=do_constrain,
+                        auto_scale=True, skip_decoration=skip_dec)
 
 
 def _ui_delete(*_):

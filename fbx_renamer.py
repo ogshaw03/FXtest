@@ -206,6 +206,16 @@ def _strip_namespace(name):
     return name.split(":")[-1]
 
 
+_FULLWIDTH_DIGIT_MAP = {chr(0xFF10 + i): str(i) for i in range(10)}
+_FULLWIDTH_TRANSLATE = str.maketrans(_FULLWIDTH_DIGIT_MAP)
+
+
+def _normalize_fullwidth(name):
+    """全角数字 (U+FF10-U+FF19) を半角 0-9 に正規化。
+    MMD 骨名で「親指１」(全角) と「親指1」(半角) が混在するのでマップ検索前に統一。"""
+    return name.translate(_FULLWIDTH_TRANSLATE)
+
+
 def _decode_fbxasc(name):
     """FBXASC### を実文字に戻す。
 
@@ -297,6 +307,7 @@ def clean_name(name):
     """短名 1 個を通しで整形して返す (rename は行わない)。"""
     n = _strip_namespace(name)
     n = _decode_fbxasc(n)
+    n = _normalize_fullwidth(n)   # 全角数字 -> 半角 (MMD map ヒット率向上)
     n = _translate_mmd(n)
     n = _ascii_safe(n)
     n = _sanitize(n)
