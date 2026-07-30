@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -362,14 +362,28 @@ def attach_controllers(joints=None, scale=1.0, do_constrain=True,
         created_ctls.append(ctl_name)
 
     # Pass 2: 骨階層に合わせて npo を親子付け直し
+    # 親 joint が jnt_to_ctl にあれば normal (親 ctl の下)
+    # 無ければ (IK chain 除外 or 削除された等)、親 joint を上に辿り
+    #   - 途中で ctl 持ち joint に当たればその ctl の下
+    #   - 当たらず joint 存在すればその joint の下 (wrist_L 等、IK/FK で
+    #     rotate される joint に直接 parent すれば ctl が joint に追従)
     for jnt, (npo, ctl) in jnt_to_ctl.items():
         parents = cmds.listRelatives(jnt, p=True, type="joint") or []
-        if parents and parents[0] in jnt_to_ctl:
-            parent_ctl = jnt_to_ctl[parents[0]][1]
+        if not parents:
+            continue
+        immediate_parent = parents[0]
+        target = None
+        if immediate_parent in jnt_to_ctl:
+            target = jnt_to_ctl[immediate_parent][1]  # 親 ctl
+        else:
+            # 除外骨 (IK chain の hero joint 等) が親 → その joint 直下に parent
+            # これで指 ctl が wrist_L に追従、toe ctl が ankle_L に追従、等
+            target = immediate_parent
+        if target:
             try:
-                cmds.parent(npo, parent_ctl)
+                cmds.parent(npo, target)
             except Exception as exc:
-                cmds.warning(f"[attach_ctrls] parent {npo} -> {parent_ctl} failed: {exc}")
+                cmds.warning(f"[attach_ctrls] parent {npo} -> {target} failed: {exc}")
 
     # Pass 3: constraint
     if do_constrain:
