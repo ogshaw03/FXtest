@@ -141,7 +141,7 @@ try:
         functional_check += 2
 
         # FK: rotate FK ctl -> hero joint world orient changes
-        cmds.setAttr(chain_label + "_UI_ctl." + chain_label + "_blend", 0)
+        cmds.setAttr(chain_label + "_UI_ctl.IK_FK", 0)
         for a in ("rotateX","rotateY","rotateZ"):
             cmds.setAttr(fk_ctl_mid + "." + a, 0)
         # 世界回転で比較する (local rotate は twist bones との親空間差で正確に測れないケースあり)
@@ -159,7 +159,7 @@ try:
         cmds.setAttr(fk_ctl_mid + ".rotateX", 0)
 
         # IK
-        cmds.setAttr(chain_label + "_UI_ctl." + chain_label + "_blend", 1)
+        cmds.setAttr(chain_label + "_UI_ctl.IK_FK", 1)
         for a in ("translateX","translateY","translateZ"):
             cmds.setAttr(ik_ctl + "." + a, 0)
         ctl_ws = cmds.xform(ik_ctl, q=True, ws=True, t=True)
@@ -193,7 +193,7 @@ try:
         if not cmds.objExists(ik_ctl):
             continue
         # 初期化 -> IK ON
-        cmds.setAttr(chain_label + "_UI_ctl." + chain_label + "_blend", 1)
+        cmds.setAttr(chain_label + "_UI_ctl.IK_FK", 1)
         for a in ("translateX","translateY","translateZ"):
             cmds.setAttr(ik_ctl + "." + a, 0)
         # twist bones の rot を記録
@@ -227,7 +227,7 @@ try:
             finger_names.append(cand)
     if finger_names and cmds.objExists("arm_L_IK_ctl") and cmds.objExists("wrist_L"):
         # IK ON, move IK ctl, verify finger follows
-        cmds.setAttr("arm_L_UI_ctl.arm_L_blend", 1)
+        cmds.setAttr("arm_L_UI_ctl.IK_FK", 1)
         for a in ("translateX","translateY","translateZ"):
             cmds.setAttr("arm_L_IK_ctl." + a, 0)
         finger_before = {n: cmds.xform(n, q=True, ws=True, t=True) for n in finger_names}
@@ -262,7 +262,7 @@ try:
             if cmds.objExists(ctl):
                 side_lbl = "leg_L" if "leg_L" in ctl else "leg_R"
                 try:
-                    cmds.setAttr(side_lbl + "_UI_ctl." + side_lbl + "_blend", 1)
+                    cmds.setAttr(side_lbl + "_UI_ctl.IK_FK", 1)
                 except Exception:
                     pass
                 for a in ("translateX","translateY","translateZ"):

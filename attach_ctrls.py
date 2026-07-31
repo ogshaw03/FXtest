@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.11"
+__version__ = "0.9.12"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -518,40 +518,24 @@ def _rewrite_flat_horizontal(ctl_name, world_pos, scale, maker,
 
 
 def _mark_as_ctl(ctl):
-    """mGear の右クリック context menu を発火させる。
-    VPMENU scout が mGear 5.0 の `dagmenu.py:742` を実解析した結果:
-
-    1. **primary trigger**: `cmds.objExists("<sel>.isCtl")` bool attr
-    2. **Maya 標準 controller tag** (`cmds.controller`) — pick-walk 連携
-    3. **`rig_controllers_grp` objectSet 登録** — mGear の menu fill() が
-       `cmds.sets(cmds.ls(cmds.listConnections(ctl), type='objectSet'), q=True)`
-       を叩き、空 list だと TypeError で menu 構築が途中失敗する。純正
-       shifter は必ずここに add する。**未登録が「右クリメニュー出ない」真因**
+    """v0.9.12 自作化: mGear 依存 (isCtl / rig_controllers_grp) を撤去、
+    controller tag (Maya 標準 pick-walk) + `attach_ctrl` marker (delete_generated
+    が識別に使う) + Mirror Pose 用 `invTx..invSz` の 3 種のみ残置。
     """
-    # 1. isCtl bool (mGear の唯一の gate)
+    # 1. attach_ctrls 起源判定用 marker (delete_generated が使用)
     try:
-        if not cmds.attributeQuery("isCtl", node=ctl, exists=True):
-            cmds.addAttr(ctl, ln="isCtl", at="bool", dv=True, k=False)
-        cmds.setAttr(ctl + ".isCtl", channelBox=False)
+        if not cmds.attributeQuery("attach_ctrl", node=ctl, exists=True):
+            cmds.addAttr(ctl, ln="attach_ctrl", at="bool", dv=True, k=False)
+        cmds.setAttr(ctl + ".attach_ctrl", channelBox=False)
     except Exception:
         pass
-    # 2. Maya 2019+ controller tag
+    # 2. Maya 2019+ controller tag (pick-walk / marking menu 連携、mGear 非依存)
     try:
         cmds.controller(ctl)
     except Exception:
         pass
-    # 3. mGear が要求する rig_controllers_grp objectSet に登録
-    try:
-        set_name = "rig_controllers_grp"
-        if not cmds.objExists(set_name):
-            cmds.sets(name=set_name, empty=True)
-        if not cmds.sets(ctl, isMember=set_name):
-            cmds.sets(ctl, add=set_name)
-    except Exception:
-        pass
-    # 4. v0.9.11 Mirror Pose 対応: `invTx..invSz` 9 bool attr。
-    # side が R の ctl は default で invTx=1, invRy=1, invRz=1 (YZ 平面で
-    # ミラーする mGear 慣習)。L/C は全 0。
+    # 3. Mirror Pose 用 `invTx..invSz` 9 bool attr。
+    # side が R の ctl は default で invTx=1, invRy=1, invRz=1 (YZ 平面 mirror)。
     try:
         _short = ctl.split(":")[-1].split("|")[-1]
         _side_r = _short.endswith("_R") or _short.endswith("_R_ctl") or \
@@ -574,7 +558,7 @@ def _mark_as_ctl(ctl):
 
 
 def _set_ctl_color(ctl, color_idx):
-    """override color + mGear/Maya の controller marker を一括で付ける。
+    """override color + controller marker を一括で付ける (v0.9.12: 自作化)。
     ctl 生成後に必ず呼ばれる場所なので、marker 付与漏れを構造的に防ぐ。"""
     _mark_as_ctl(ctl)
     return _set_ctl_color_only(ctl, color_idx)
@@ -784,21 +768,22 @@ def delete_generated():
     for pat in ("*_ikh", "*_toeIkh"):
         for ikh in cmds.ls(pat, type="ikHandle") or []:
             _safe_del(ikh, "ik handle")
-    # dual chain: <joint>_ik / <joint>_fk / <joint>_mth の joint
-    # (_mth = mGear IK/FK match target、AUDIT #2 で削除漏れが判明)
+    # dual chain: <joint>_ik / <joint>_fk の joint
     # 加えて reverse foot 用 helper (<ankle>_rfBallBone / _rfToeBone)
-    for suf in ("_ik", "_fk", "_mth", "_rfBallBone", "_rfToeBone"):
+    # (v0.9.12: mGear 用 `_mth` は撤去済)
+    for suf in ("_ik", "_fk", "_rfBallBone", "_rfToeBone"):
         for j in cmds.ls("*" + suf, type="joint") or []:
             if cmds.objExists(j):
                 _safe_del(j, "generated joint")
     # attach_ctrls 起源 ctl (isCtl marker + Pass 2 で親 joint 下に移動されて
     # ROOT_GROUP 削除で残った *_ctl / *_npo) を全部掃討する (AUDIT2 NEW: 2回目
     # setup で 90+ warning "already exists; skipping" の原因)。
+    # v0.9.12: 自作 marker `attach_ctrl` で判定 (旧 `isCtl` 廃止)。
     for ctl in cmds.ls("*_ctl", type="transform") or []:
         if not cmds.objExists(ctl):
             continue
         try:
-            has_marker = cmds.attributeQuery("isCtl", node=ctl, exists=True)
+            has_marker = cmds.attributeQuery("attach_ctrl", node=ctl, exists=True)
         except Exception:
             has_marker = False
         if has_marker:
@@ -807,9 +792,6 @@ def delete_generated():
     for npo in cmds.ls("*_npo", type="transform") or []:
         if cmds.objExists(npo):
             _safe_del(npo, "orphan npo")
-    # rig_controllers_grp / attach_ctrls 起源の objectSet も片付け
-    if cmds.objExists("rig_controllers_grp"):
-        _safe_del("rig_controllers_grp", "controllers set")
     print(f"[{_PACKAGE}] Deleted generated nodes: {n}")
 
 
@@ -1069,12 +1051,19 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     pv_pos = _compute_pv_position(start_pos, mid_pos, end_pos,
                                    base_offset, fallback_dir=fallback_pv)
     cmds.xform(pv_npo, ws=True, t=pv_pos)
-    cmds.parent(pv_npo, ROOT_GROUP)
-    # NOTE: poleVectorConstraint はここでは張らない。
-    #       張ると IK 再ソルブが走り clean chain の rotate が bind から drift、
-    #       そのまま mo=True で orient blend を作ると offset が不整合になり、
-    #       PV を動かすたびに hero joint (wrist_L 等) が振り回される。
-    #       → step 7 の orient blend 構築が済んだ後 (step 8) で PV constraint を張る。
+    # v0.9.12 Bug 2: pv_npo を chain の親骨 (orig_parent) 下に parent。
+    # ROOT_GROUP (world 固定) だと腰が下がった時 PV は動かず膝が chain plane
+    # 外へ大きく飛ぶ (leg で knee Z+17.5)。腕/脚とも hip/shoulder 系に追従
+    # させれば bend 幾何が保持される。
+    pv_parent = orig_parent if (orig_parent and cmds.objExists(orig_parent)) else ROOT_GROUP
+    cmds.parent(pv_npo, pv_parent)
+    # v0.9.12 Bug 1: poleVectorConstraint を **orient constraint より前** に
+    # 張る。以前の設計は「後で張ると再ソルブが走る」と誤診断していたが、
+    # 実際は逆で、PV constraint 無しで作った ikHandle が RP solver default
+    # で 32° twist を焼き付け、続く orient constraint mo=True がクリーンな
+    # offset を捕えられず arm hero elbow が 0.386 unit ズレる。PV を先に
+    # 張れば ik chain は bind に近い姿勢で解け offset が正しく取れる。
+    cmds.poleVectorConstraint(pv_ctl, ik_handle)
     _lock_hide_attrs(pv_ctl, ["sx", "sy", "sz", "rx", "ry", "rz"])
 
     # --- 5. FK ctls (clean FK chain の各 joint を drive) ---
@@ -1119,81 +1108,20 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     if not cmds.attributeQuery("volume", node=ui_host, exists=True):
         cmds.addAttr(ui_host, ln="volume", at="float",
                      min=0.0, max=1.0, dv=0.0, k=True)
-    # mGear dagmenu が探す `<label>_blend` サフィックスを追加 (MENU scout)。
-    # `_blend` を master、`IK_FK` は driven にする (mGear の IK/FK Switch は
-    # setAttr `_blend` を叩くので、以前の逆方向接続だと "locked or connected"
-    # エラーが出て切替失敗していた)。
-    blend_attr = label + "_blend"
-    if not cmds.attributeQuery(blend_attr, node=ui_host, exists=True):
-        cmds.addAttr(ui_host, ln=blend_attr, at="float",
-                     min=0.0, max=1.0, dv=1.0, k=True)
-    # _blend → IK_FK: mGear が _blend を叩けば IK_FK が追従し既存の内部配線
-    # (orient blend / stretch gate 等) が反応する
+    # v0.9.12: mGear 撤去。`IK_FK` を master 直接、`_blend` エイリアス廃止、
+    # `_id0_ctl_cnx` message array 廃止、`_mth` joint 廃止 (snap は現 hero
+    # joint 位置を直接使う)、`_tag_mgear_ctl` 廃止。
+    # IK_FK を keyable にして直接ユーザが編集可能に (旧 driven lock 撤去)。
     try:
-        if not cmds.isConnected(ui_host + "." + blend_attr, ui_host + ".IK_FK"):
-            cmds.connectAttr(ui_host + "." + blend_attr,
-                             ui_host + ".IK_FK", f=True)
+        cmds.setAttr(ui_host + ".IK_FK", k=True, channelBox=True)
     except Exception:
         pass
-    # BEHAV-A: IK_FK / ikVis / fkVis は driven (locked) なので Channel Box
-    # から setAttr するとエラー。keyable/channelBox 両方 False にして
-    # ユーザは `_blend` のみを触る運用に統一。
-    for driven in ("IK_FK", "ikVis", "fkVis"):
+    # ikVis / fkVis は依然として IK_FK/rev で driven なので隠す
+    for driven in ("ikVis", "fkVis"):
         try:
             cmds.setAttr(ui_host + "." + driven, k=False, channelBox=False)
         except Exception:
             pass
-    # コンポーネント配下 ctl リスト用 message array (mGear が
-    # `<label>_id0_ctl_cnx` を叩いて全メンバーを取得する)
-    ctl_cnx_attr = label + "_id0_ctl_cnx"
-    if not cmds.attributeQuery(ctl_cnx_attr, node=ui_host, exists=True):
-        cmds.addAttr(ui_host, ln=ctl_cnx_attr, at="message",
-                     multi=True, im=False)
-    # mth joints (snap target = bind pose 保持 duplicate)
-    mth_joints = []
-    for orig in (start, mid, end):
-        mth_name = orig + "_mth"
-        if not cmds.objExists(mth_name):
-            try:
-                m = _dup_hero_joint(orig, "_mth", new_parent=orig)
-                try: cmds.setAttr(m + ".drawStyle", 2)
-                except Exception: pass
-                mth_joints.append(m)
-            except Exception:
-                mth_joints.append(None)
-        else:
-            mth_joints.append(mth_name)
-
-    def _tag_mgear_ctl(ctl, role, mth_joint):
-        for a in ("ctl_role", "uiHost"):
-            if not cmds.attributeQuery(a, node=ctl, exists=True):
-                try: cmds.addAttr(ctl, ln=a, dt="string")
-                except Exception: pass
-        try:
-            cmds.setAttr(ctl + ".ctl_role", role, type="string")
-            cmds.setAttr(ctl + ".uiHost", ui_host, type="string")
-        except Exception:
-            pass
-        if not cmds.attributeQuery("match_ref", node=ctl, exists=True):
-            try: cmds.addAttr(ctl, ln="match_ref", at="message")
-            except Exception: pass
-        if mth_joint and cmds.objExists(mth_joint):
-            try:
-                cmds.connectAttr(mth_joint + ".message", ctl + ".match_ref", f=True)
-            except Exception:
-                pass
-        try:
-            idx = cmds.getAttr(ui_host + "." + ctl_cnx_attr, size=True) or 0
-            cmds.connectAttr(ctl + ".message",
-                             ui_host + "." + ctl_cnx_attr + "[" + str(idx) + "]",
-                             f=True)
-        except Exception:
-            pass
-
-    # v0.9.7: ik_ctl.IK_FK proxy を削除 (SPIDERMAN scout + ユーザ意向:
-    # 「IKFKSwitch が色んな controller に紐付いててややこしい」)。
-    # switch は UI host (option ctl) 一本に集約、UI host 選択 → 右クリ →
-    # mGear IK/FK Switch という一貫フローに統一。
 
     rev = cmds.createNode("reverse", n=label + "_ikfk_rev")
     cmds.connectAttr(ui_host + ".IK_FK", rev + ".inputX")
@@ -1216,11 +1144,8 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     # 従来の orientConstraint(ik_ctl, wrist_ik, mo=True) は削除
     # (wrist_ik を driven する必要が無くなった)
 
-    # mGear dagmenu 用に各 ctl を tag (MENU scout 優先度A: IK/FK Switch 発火)
-    _tag_mgear_ctl(ik_ctl, "ik", mth_joints[2])
-    _tag_mgear_ctl(pv_ctl, "upv", mth_joints[1])
-    for (_, fk_ctl), mth, role in zip(fk_ctls, mth_joints, ["fk0","fk1","fk2"]):
-        _tag_mgear_ctl(fk_ctl, role, mth)
+    # v0.9.12: mGear tag (`_tag_mgear_ctl` / ctl_role / uiHost / match_ref /
+    # _mth joint dup) は撤去。自作 UI (snap ボタン / mirror_pose 関数) で対応。
 
     # --- 8. Pole vector constraint (orient blend 構築の後で張る) ---
     # 判定は world X 軸 (bone 軸) の acos で行う。start+mid+end 3 joint の合算 drift
@@ -1228,19 +1153,37 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     # 163°/127° flip を見逃す)。
     import math as _math
     def _bone_axis_diff(j, ref_matrix):
+        """world matrix の 3 軸 (X/Y/Z) それぞれの dot を平均、twist も検知。
+        以前は X 軸だけ測定していたが Y-axis twist を素通ししていた (v0.9.12 Bug 1)。"""
         m = cmds.xform(j, q=True, ws=True, m=True) or [0]*16
-        dot = m[0]*ref_matrix[0] + m[1]*ref_matrix[1] + m[2]*ref_matrix[2]
-        dot = max(-1.0, min(1.0, dot))
-        return _math.degrees(_math.acos(dot))
+        _angles = []
+        for _row in (0, 4, 8):  # X, Y, Z 軸それぞれの row (matrix row-major)
+            dot = m[_row]*ref_matrix[_row] + m[_row+1]*ref_matrix[_row+1] + m[_row+2]*ref_matrix[_row+2]
+            dot = max(-1.0, min(1.0, dot))
+            _angles.append(_math.degrees(_math.acos(dot)))
+        return sum(_angles) / 3.0
+
+    def _pos_diff(j, ref_pos):
+        p = cmds.xform(j, q=True, ws=True, t=True) or [0,0,0]
+        return _math.sqrt(sum((p[i]-ref_pos[i])**2 for i in range(3)))
 
     bind_matrices = {
         j: cmds.xform(j, q=True, ws=True, m=True) for j in (start, mid, end)
     }
+    bind_positions = {
+        j: cmds.xform(j, q=True, ws=True, t=True) for j in (start, mid, end)
+    }
 
     def _total_drift():
-        return sum(_bone_axis_diff(j, bind_matrices[j]) for j in bind_matrices)
+        # 3-axis rotate drift + position drift の合成 (v0.9.12: twist と
+        # 位置ズレを両方検知)。position は unit なのでそのまま加算 (角度と
+        # 位置は比較尺度違うが、scan の相対比較には十分)。
+        _rot = sum(_bone_axis_diff(j, bind_matrices[j]) for j in bind_matrices)
+        _pos = sum(_pos_diff(j, bind_positions[j]) for j in bind_positions)
+        return _rot + _pos
 
-    cmds.poleVectorConstraint(pv_ctl, ik_handle)
+    # (v0.9.12 Bug 1: poleVectorConstraint は step 4 で orient constraint
+    #  より前に既に張られている。二重張りしない)
 
     # --- 8.5. Twist 自動補正 (RP solver plane flip 対策) ---
     # AUDIT #11: v0.9.0 の freeze_joint_rotations で bind pose が identity 化
@@ -1251,8 +1194,22 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     best_twist = 0.0
     best_drift = _total_drift()
     _pw_sub(80.0, f"Solve twist ({label})")
-    if best_drift > 5.0:
-        for twist_try in range(-180, 181, 15):  # 25 候補に絞る
+    # v0.9.12 Bug 1 対処: PV constraint 張っても RP solver が chain 方向次第で
+    # twist 焼き込みしがち (arm 側で観測、32° や 50° の Y twist)。drift 閾値を
+    # 1° に絞って必要なら常に scan する。粗い step (15°) → 細かい step (3°) 二段
+    if best_drift > 1.0:
+        # 粗い探索
+        for twist_try in range(-180, 181, 15):
+            try:
+                cmds.setAttr(ik_handle + ".twist", float(twist_try))
+                d = _total_drift()
+                if d < best_drift:
+                    best_drift = d
+                    best_twist = float(twist_try)
+            except Exception:
+                pass
+        # 細かい探索 (best_twist ± 15° を 3° step で)
+        for twist_try in range(int(best_twist) - 15, int(best_twist) + 16, 3):
             try:
                 cmds.setAttr(ik_handle + ".twist", float(twist_try))
                 d = _total_drift()
@@ -1419,9 +1376,8 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     except Exception as exc:
         cmds.warning(f"[attach_ctrls] visibility connect failed: {exc}")
 
-    # AUDIT #13: 古い `switch=<ik_ctl>.IK_FK` print を UI host 参照に更新
     print(f"[{_PACKAGE}] IK/FK rig: {label}  IK={ik_ctl}  PV={pv_ctl}  "
-          f"FK={[c for _, c in fk_ctls]}  switch={ui_host}.{blend_attr}")
+          f"FK={[c for _, c in fk_ctls]}  switch={ui_host}.IK_FK")
 
     return {
         "label":     label,
@@ -2067,12 +2023,11 @@ def snap_fk_to_ik(chain_label):
         orig_wm = cmds.xform(orig, q=True, ws=True, m=True)
         cmds.xform(fk_ctl, ws=True, m=orig_wm)
     # UI host は start joint に basicallyy 対応。start_j + "_UI_ctl" で探す
-    # v0.9.8: _blend (master) を叩く。IK_FK は driven で locked (BEHAV-B)。
+    # v0.9.12: IK_FK 直接 (master、旧 `_blend` エイリアス廃止)
     ui = start_j + "_UI_ctl"
-    blend_attr = start_j + "_blend"
-    if cmds.objExists(ui) and cmds.attributeQuery(blend_attr, node=ui, exists=True):
-        cmds.setAttr(ui + "." + blend_attr, 0)
-    print(f"[{_PACKAGE}] snap_fk_to_ik: {start_j} -> {blend_attr}=0")
+    if cmds.objExists(ui) and cmds.attributeQuery("IK_FK", node=ui, exists=True):
+        cmds.setAttr(ui + ".IK_FK", 0)
+    print(f"[{_PACKAGE}] snap_fk_to_ik: {start_j} -> IK_FK=0")
 
 
 def _opposite_side_name(ctl_name):
@@ -2153,10 +2108,9 @@ def snap_ik_to_fk(chain_label):
         wp = cmds.xform(mid_j, q=True, ws=True, t=True)
         cmds.xform(pv_ctl, ws=True, t=wp)
     ui = start_j + "_UI_ctl"
-    blend_attr = start_j + "_blend"
-    if cmds.objExists(ui) and cmds.attributeQuery(blend_attr, node=ui, exists=True):
-        cmds.setAttr(ui + "." + blend_attr, 1)
-    print(f"[{_PACKAGE}] snap_ik_to_fk: {start_j} -> {blend_attr}=1")
+    if cmds.objExists(ui) and cmds.attributeQuery("IK_FK", node=ui, exists=True):
+        cmds.setAttr(ui + ".IK_FK", 1)
+    print(f"[{_PACKAGE}] snap_ik_to_fk: {start_j} -> IK_FK=1")
 
 
 def setup_all_ik_fk():
@@ -2593,7 +2547,7 @@ def _build_body() -> None:
     cmds.setParent("..")
 
     cmds.separator(h=6, style="none")
-    cmds.text(l="IK/FK 切替: UI host (option ctl) の '<label>_blend' attr (0=FK, 1=IK)",
+    cmds.text(l="IK/FK 切替: UI host (option ctl) の 'IK_FK' attr (0=FK, 1=IK)",
               al="left", fn="smallObliqueLabelFont")
     cmds.text(l="装飾骨は暗灰色。IK モードで waist を回すと足が接地したまま追従。",
               al="left", fn="smallObliqueLabelFont")
