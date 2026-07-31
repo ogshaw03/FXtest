@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.7"
+__version__ = "0.9.8"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -762,11 +762,13 @@ def delete_generated():
     for pat in ("*_ikh", "*_toeIkh"):
         for ikh in cmds.ls(pat, type="ikHandle") or []:
             _safe_del(ikh, "ik handle")
-    # dual chain: <joint>_ik / <joint>_fk の joint
-    for suf in ("_ik", "_fk"):
+    # dual chain: <joint>_ik / <joint>_fk / <joint>_mth の joint
+    # (_mth = mGear IK/FK match target、AUDIT #2 で削除漏れが判明)
+    # 加えて reverse foot 用 helper (<ankle>_rfBallBone / _rfToeBone)
+    for suf in ("_ik", "_fk", "_mth", "_rfBallBone", "_rfToeBone"):
         for j in cmds.ls("*" + suf, type="joint") or []:
             if cmds.objExists(j):
-                _safe_del(j, "dual chain joint")
+                _safe_del(j, "generated joint")
     print(f"[{_PACKAGE}] Deleted generated nodes: {n}")
 
 
@@ -975,9 +977,11 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     cmds.parent(ik_npo, ROOT_GROUP)
     cmds.pointConstraint(ik_ctl, ik_handle, mo=False)
     _lock_hide_attrs(ik_ctl, ["sx", "sy", "sz"])
-    # leg は足元に敷く水平 box にする (bone 継承の斜め表示 63° を解消、FOOTCTL)
+    # 水平化 (bone 継承の斜め表示解消):
+    # - leg は地面 (ground_y) に敷く flat box
+    # - arm は wrist 高さの水平面 (AUDIT #4: hand IK ctl 未水平化を修正)
+    end_ws = cmds.xform(end, q=True, ws=True, t=True)
     if is_leg:
-        end_ws = cmds.xform(end, q=True, ws=True, t=True)
         gy = end_ws[1]
         try:
             _lm = _detect_foot_landmarks(end, _find_toe_joint(end))
@@ -987,6 +991,10 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
             pass
         _rewrite_flat_horizontal(ik_ctl, end_ws, ik_size, _make_flat_box_curve,
                                   x_ratio=1.6, z_ratio=2.2, ground_y=gy)
+    else:
+        # arm: wrist 高さの水平 flat box (地面には落とさない、掴みやすい)
+        _rewrite_flat_horizontal(ik_ctl, end_ws, ik_size, _make_flat_box_curve,
+                                  x_ratio=1.4, z_ratio=1.6, ground_y=end_ws[1])
 
     # --- 4. Pole vector ctl (diamond 形状で目立たせる) ---
     pv_ctl = _make_diamond_curve(label + "_PV_ctl", scale=pv_size)
@@ -1078,6 +1086,14 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                              ui_host + ".IK_FK", f=True)
     except Exception:
         pass
+    # BEHAV-A: IK_FK / ikVis / fkVis は driven (locked) なので Channel Box
+    # から setAttr するとエラー。keyable/channelBox 両方 False にして
+    # ユーザは `_blend` のみを触る運用に統一。
+    for driven in ("IK_FK", "ikVis", "fkVis"):
+        try:
+            cmds.setAttr(ui_host + "." + driven, k=False, channelBox=False)
+        except Exception:
+            pass
     # コンポーネント配下 ctl リスト用 message array (mGear が
     # `<label>_id0_ctl_cnx` を叩いて全メンバーを取得する)
     ctl_cnx_attr = label + "_id0_ctl_cnx"
@@ -1178,24 +1194,24 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     cmds.poleVectorConstraint(pv_ctl, ik_handle)
 
     # --- 8.5. Twist 自動補正 (RP solver plane flip 対策) ---
-    # 5° 刻みで細かく総当り、3 joint 合算 drift 最小の twist を採用
-    _twist_candidates = list(range(-180, 181, 5))
+    # AUDIT #11: v0.9.0 の freeze_joint_rotations で bind pose が identity 化
+    # された後、全 chain で twist=0° が最適解に収束する (実測)。73 候補 × 4
+    # chain の総当りは 10-15% の実行時間を消費するだけで無駄なので、初期解
+    # が既に十分小さければスキップ。念のため fallback として drift > 5° の
+    # 場合のみ限定的に探索 (v0.9.0 前の pose データ想定)。
     best_twist = 0.0
     best_drift = _total_drift()
-    n_cands = len(_twist_candidates)
-    for _i, twist_try in enumerate(_twist_candidates):
-        try:
-            cmds.setAttr(ik_handle + ".twist", float(twist_try))
-            d = _total_drift()
-            if d < best_drift:
-                best_drift = d
-                best_twist = float(twist_try)
-        except Exception:
-            pass
-        # setup_ik_fk の担当区間内で twist 探索は末尾を占める、20%毎に更新
-        if _i % max(1, n_cands // 5) == 0:
-            _pw_sub(60.0 + 40.0 * _i / n_cands,
-                    f"Solve twist ({label}) {_i}/{n_cands}")
+    _pw_sub(80.0, f"Solve twist ({label})")
+    if best_drift > 5.0:
+        for twist_try in range(-180, 181, 15):  # 25 候補に絞る
+            try:
+                cmds.setAttr(ik_handle + ".twist", float(twist_try))
+                d = _total_drift()
+                if d < best_drift:
+                    best_drift = d
+                    best_twist = float(twist_try)
+            except Exception:
+                pass
     try:
         cmds.setAttr(ik_handle + ".twist", best_twist)
     except Exception:
@@ -1251,7 +1267,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
             for b in (ik_chain[1], ik_chain[2]):
                 rest_t = cmds.getAttr(b + ".translate")[0]
                 md = cmds.createNode("multiplyDivide", n=b + "_stretch_mul")
-                cmds.setAttr(md + ".input1", *rest_t)
+                cmds.setAttr(md + ".input1", *rest_t, type="double3")
                 cmds.connectAttr(ik_gate + ".output", md + ".input2X")
                 cmds.connectAttr(ik_gate + ".output", md + ".input2Y")
                 cmds.connectAttr(ik_gate + ".output", md + ".input2Z")
@@ -1261,7 +1277,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                 if cmds.objExists(h):
                     rest_h = cmds.getAttr(h + ".translate")[0]
                     md_h = cmds.createNode("multiplyDivide", n=h + "_stretch_mul")
-                    cmds.setAttr(md_h + ".input1", *rest_h)
+                    cmds.setAttr(md_h + ".input1", *rest_h, type="double3")
                     cmds.connectAttr(ik_gate + ".output", md_h + ".input2X")
                     cmds.connectAttr(ik_gate + ".output", md_h + ".input2Y")
                     cmds.connectAttr(ik_gate + ".output", md_h + ".input2Z")
@@ -1273,8 +1289,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         cmds.warning(f"[attach_ctrls] stretch setup failed for {label}: {exc}")
 
     # --- 8. Visibility (UI host の ikVis/fkVis で明示制御) ---
-    try: cmds.setAttr(ik_ctl + ".v", lock=False)
-    except Exception: pass
+    # (AUDIT #14: setAttr(ik_ctl.v, lock=False) は dead code だったので削除)
     try:
         cmds.connectAttr(ui_host + ".ikVis", ik_npo + ".v")
         cmds.connectAttr(ui_host + ".ikVis", pv_npo + ".v")
@@ -1285,8 +1300,9 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     except Exception as exc:
         cmds.warning(f"[attach_ctrls] visibility connect failed: {exc}")
 
+    # AUDIT #13: 古い `switch=<ik_ctl>.IK_FK` print を UI host 参照に更新
     print(f"[{_PACKAGE}] IK/FK rig: {label}  IK={ik_ctl}  PV={pv_ctl}  "
-          f"FK={[c for _, c in fk_ctls]}  switch={ik_ctl}.IK_FK")
+          f"FK={[c for _, c in fk_ctls]}  switch={ui_host}.{blend_attr}")
 
     return {
         "label":     label,
@@ -1750,19 +1766,26 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
                                     sol="ikSCsolver", n=label + "_rfToeIkh")[0]
             cmds.parent(toe_ikh, toe_piv)
             if cmds.objExists(toe_joint):
-                for con in (cmds.listConnections(toe_joint + ".translateX",
-                            s=True, d=False, type="constraint") or []):
-                    try: cmds.delete(con)
-                    except Exception: pass
+                # BEHAV-C: 既存 parentConstraint (toe_L_ctl → toe_L、FK 駆動)
+                # を **削除しない**。以前は type="constraint" で巻き込み削除
+                # していたため FK が完全無効化されていた。ここでは追加で
+                # orientConstraint(rf_toe → toe) を張り、weight を IK_FK に
+                # 連動させて IK モードで rf_toe が rotate 支配、FK モードで
+                # toe_ctl の parentConstraint が支配する構造にする。
+                _leg_lbl = "leg_L" if side == "L" else "leg_R" if side == "R" else "leg_C"
+                _ui_host_name = _leg_lbl + "_UI_ctl"
                 try:
-                    # skipTranslate: hero toe の translate は ankle 直下維持
-                    # (parentConstraint で位置を持ってくると rf_toe が地面
-                    # 沿いで動くので hero toe が -3.6 unit 沈む問題を回避)
-                    cmds.parentConstraint(rf_toe, toe_joint, mo=True,
-                                          skipTranslate=["x", "y", "z"],
-                                          n=toe_joint + "_rfToe_pc")
+                    oc = cmds.orientConstraint(rf_toe, toe_joint, mo=True,
+                                               n=toe_joint + "_rfToe_oc")[0]
+                    wal = cmds.orientConstraint(oc, q=True, wal=True)
+                    if wal and cmds.objExists(_ui_host_name) \
+                            and cmds.attributeQuery("IK_FK", node=_ui_host_name,
+                                                     exists=True):
+                        # rf_toe の weight = IK_FK (IK モード時に支配)
+                        cmds.connectAttr(_ui_host_name + ".IK_FK",
+                                         oc + "." + wal[0], f=True)
                 except Exception as e:
-                    cmds.warning(f"[attach_ctrls] rfToe pc: {e}")
+                    cmds.warning(f"[attach_ctrls] rfToe oc: {e}")
         except Exception as exc:
             cmds.warning(f"[attach_ctrls] rfToe ikHandle failed: {exc}")
             toe_ikh = None
@@ -1902,10 +1925,12 @@ def snap_fk_to_ik(chain_label):
         orig_wm = cmds.xform(orig, q=True, ws=True, m=True)
         cmds.xform(fk_ctl, ws=True, m=orig_wm)
     # UI host は start joint に basicallyy 対応。start_j + "_UI_ctl" で探す
+    # v0.9.8: _blend (master) を叩く。IK_FK は driven で locked (BEHAV-B)。
     ui = start_j + "_UI_ctl"
-    if cmds.objExists(ui) and cmds.attributeQuery("IK_FK", node=ui, exists=True):
-        cmds.setAttr(ui + ".IK_FK", 0)
-    print(f"[{_PACKAGE}] snap_fk_to_ik: {start_j} -> IK_FK=0")
+    blend_attr = start_j + "_blend"
+    if cmds.objExists(ui) and cmds.attributeQuery(blend_attr, node=ui, exists=True):
+        cmds.setAttr(ui + "." + blend_attr, 0)
+    print(f"[{_PACKAGE}] snap_fk_to_ik: {start_j} -> {blend_attr}=0")
 
 
 def snap_ik_to_fk(chain_label):
@@ -1924,9 +1949,10 @@ def snap_ik_to_fk(chain_label):
         wp = cmds.xform(mid_j, q=True, ws=True, t=True)
         cmds.xform(pv_ctl, ws=True, t=wp)
     ui = start_j + "_UI_ctl"
-    if cmds.objExists(ui) and cmds.attributeQuery("IK_FK", node=ui, exists=True):
-        cmds.setAttr(ui + ".IK_FK", 1)
-    print(f"[{_PACKAGE}] snap_ik_to_fk: {start_j} -> IK_FK=1")
+    blend_attr = start_j + "_blend"
+    if cmds.objExists(ui) and cmds.attributeQuery(blend_attr, node=ui, exists=True):
+        cmds.setAttr(ui + "." + blend_attr, 1)
+    print(f"[{_PACKAGE}] snap_ik_to_fk: {start_j} -> {blend_attr}=1")
 
 
 def setup_all_ik_fk():
@@ -2072,15 +2098,15 @@ def _pw_start(title="Attach Ctrls", status="Setting up...", max_v=100):
     if cmds is None: return
     try:
         # 二重積み対策: 残留 progressWindow を全部 drain。
-        # 前回異常終了 (例外で finally 未実行、または多重 spawn) で複数 window
-        # が積まれていると Maya の main menu 全体が反応停止する副作用がある。
+        # progressWindow が無い時は cmds.progressWindow(q=True) が例外を投げる
+        # (None を返さない) ので try/except で判定する (AUDIT #6)。
         for _ in range(8):
             try:
-                if cmds.progressWindow(q=True, isCancelled=True) is None:
-                    break
+                cmds.progressWindow(q=True, isCancelled=True)
+                # 例外出ない = window 存在
                 cmds.progressWindow(endProgress=True)
             except Exception:
-                break
+                break  # window 無し = drain 完了
         cmds.progressWindow(title=title, status=status, progress=0,
                              min=0, max=max_v, isInterruptable=False)
         _PW_ACTIVE = True
@@ -2354,10 +2380,24 @@ def _build_body() -> None:
     cmds.setParent("..")
 
     cmds.separator(h=6, style="none")
-    cmds.text(l="IK/FK 切替: IK ctl の 'IK_FK' attr (0=FK, 1=IK)",
+    cmds.text(l="IK/FK 切替: UI host (option ctl) の '<label>_blend' attr (0=FK, 1=IK)",
               al="left", fn="smallObliqueLabelFont")
     cmds.text(l="装飾骨は暗灰色。IK モードで waist を回すと足が接地したまま追従。",
               al="left", fn="smallObliqueLabelFont")
+
+    # snap / reset ボタン (AUDIT #3, #10)
+    cmds.separator(h=8, style="in")
+    cmds.text(l="=== Snap / Reset (chain の任意 ctl を選択して実行) ===",
+              al="left", fn="boldLabelFont")
+    cmds.rowLayout(nc=3, adj=1, cw3=(130, 130, 130),
+                   ct3=("both","both","both"), co3=(2,2,2))
+    cmds.button(l="FK → IK snap", h=26, c=_ui_snap_fk_to_ik,
+                bgc=(0.35, 0.55, 0.75))
+    cmds.button(l="IK → FK snap", h=26, c=_ui_snap_ik_to_fk,
+                bgc=(0.55, 0.35, 0.75))
+    cmds.button(l="Reset all IK ctls", h=26, c=_ui_reset_ik,
+                bgc=(0.60, 0.30, 0.30))
+    cmds.setParent("..")
 
 
 def _ui_full_auto(*_):
@@ -2388,6 +2428,53 @@ def _ui_del_junk(*_):
 
 def _ui_ikfk(*_):
     setup_all_ik_fk()
+
+
+def _ui_snap_fk_to_ik(*_):
+    """selection の joint / ctl から chain を推定して snap (AUDIT #3)。"""
+    sel = cmds.ls(sl=True) or []
+    if not sel:
+        cmds.warning("Select any joint/ctl of the target chain first")
+        return
+    label = sel[0].split(":")[-1].replace("_ctl", "").replace("_IK", "") \
+                       .replace("_PV", "").replace("_UI", "").replace("_fk", "")
+    for guess in (label, label + "_L", label + "_R"):
+        try:
+            snap_fk_to_ik(guess); return
+        except Exception:
+            continue
+    cmds.warning(f"snap_fk_to_ik: could not resolve chain from {sel[0]}")
+
+
+def _ui_snap_ik_to_fk(*_):
+    sel = cmds.ls(sl=True) or []
+    if not sel:
+        cmds.warning("Select any joint/ctl of the target chain first")
+        return
+    label = sel[0].split(":")[-1].replace("_ctl", "").replace("_IK", "") \
+                       .replace("_PV", "").replace("_UI", "").replace("_fk", "")
+    for guess in (label, label + "_L", label + "_R"):
+        try:
+            snap_ik_to_fk(guess); return
+        except Exception:
+            continue
+    cmds.warning(f"snap_ik_to_fk: could not resolve chain from {sel[0]}")
+
+
+def _ui_reset_ik(*_):
+    """全 IK ctl の translate/rotate を bind pose (npo と同位置) にリセット。
+    ユーザが誤って translate=100 等にした際の復帰手段 (AUDIT #10)。"""
+    n = 0
+    for ctl in cmds.ls("*_IK_ctl", type="transform") or []:
+        try:
+            npo = ctl.replace("_IK_ctl", "_IK_npo")
+            if cmds.objExists(npo):
+                m = cmds.xform(npo, q=True, ws=True, m=True)
+                cmds.xform(ctl, ws=True, m=m)
+                n += 1
+        except Exception:
+            pass
+    print(f"[{_PACKAGE}] Reset IK ctls to bind: {n}")
 
 
 def _ui_attach(*_):
