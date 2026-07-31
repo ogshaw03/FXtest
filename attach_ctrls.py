@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.8"
+__version__ = "0.9.9"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -769,6 +769,25 @@ def delete_generated():
         for j in cmds.ls("*" + suf, type="joint") or []:
             if cmds.objExists(j):
                 _safe_del(j, "generated joint")
+    # attach_ctrls 起源 ctl (isCtl marker + Pass 2 で親 joint 下に移動されて
+    # ROOT_GROUP 削除で残った *_ctl / *_npo) を全部掃討する (AUDIT2 NEW: 2回目
+    # setup で 90+ warning "already exists; skipping" の原因)。
+    for ctl in cmds.ls("*_ctl", type="transform") or []:
+        if not cmds.objExists(ctl):
+            continue
+        try:
+            has_marker = cmds.attributeQuery("isCtl", node=ctl, exists=True)
+        except Exception:
+            has_marker = False
+        if has_marker:
+            _safe_del(ctl, "orphan ctl")
+    # 対応する npo も掃討
+    for npo in cmds.ls("*_npo", type="transform") or []:
+        if cmds.objExists(npo):
+            _safe_del(npo, "orphan npo")
+    # rig_controllers_grp / attach_ctrls 起源の objectSet も片付け
+    if cmds.objExists("rig_controllers_grp"):
+        _safe_del("rig_controllers_grp", "controllers set")
     print(f"[{_PACKAGE}] Deleted generated nodes: {n}")
 
 
@@ -1272,19 +1291,41 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                 cmds.connectAttr(ik_gate + ".output", md + ".input2Y")
                 cmds.connectAttr(ik_gate + ".output", md + ".input2Z")
                 cmds.connectAttr(md + ".output", b + ".translate", f=True)
-            # hero chain (mid, end) の translate も同 ik_gate で駆動
-            for h in (mid, end):
-                if cmds.objExists(h):
+            # v0.9.9-3 (BEHAV2 P0-E) 再アプローチ: hero chain 内の全 joint
+            # (start→end の bind hierarchy 経路、twist bone 含む) の translate
+            # に ik_gate scale を適用。arm 側は arm_L → arm_twist_1..3 →
+            # elbow_L → hand_twist_1..3 → wrist_L で twist 6 本挟まる。
+            # 全部 scale することで合計 reach が 1:1 対応。
+            def _hero_chain_bones(_start, _end):
+                """_start (含まず) から _end (含む) までの bind hierarchy 経路。"""
+                _out = []
+                _cur = _end
+                for _ in range(30):  # 安全上限
+                    if not _cur or _cur == _start:
+                        break
+                    _out.insert(0, _cur)
+                    _pars = cmds.listRelatives(_cur, p=True, type="joint") or []
+                    _cur = _pars[0] if _pars else None
+                return _out
+            for h in _hero_chain_bones(start, end):
+                if not cmds.objExists(h):
+                    continue
+                try:
                     rest_h = cmds.getAttr(h + ".translate")[0]
-                    md_h = cmds.createNode("multiplyDivide", n=h + "_stretch_mul")
-                    cmds.setAttr(md_h + ".input1", *rest_h, type="double3")
-                    cmds.connectAttr(ik_gate + ".output", md_h + ".input2X")
-                    cmds.connectAttr(ik_gate + ".output", md_h + ".input2Y")
-                    cmds.connectAttr(ik_gate + ".output", md_h + ".input2Z")
-                    try:
-                        cmds.connectAttr(md_h + ".output", h + ".translate", f=True)
-                    except Exception:
-                        pass
+                except Exception:
+                    continue
+                # ゼロ translate の joint は scale しても意味なし (bind pose 0)
+                if abs(rest_h[0])+abs(rest_h[1])+abs(rest_h[2]) < 1e-6:
+                    continue
+                md_h = cmds.createNode("multiplyDivide", n=h + "_stretch_mul")
+                cmds.setAttr(md_h + ".input1", *rest_h, type="double3")
+                cmds.connectAttr(ik_gate + ".output", md_h + ".input2X")
+                cmds.connectAttr(ik_gate + ".output", md_h + ".input2Y")
+                cmds.connectAttr(ik_gate + ".output", md_h + ".input2Z")
+                try:
+                    cmds.connectAttr(md_h + ".output", h + ".translate", f=True)
+                except Exception:
+                    pass
     except Exception as exc:
         cmds.warning(f"[attach_ctrls] stretch setup failed for {label}: {exc}")
 
@@ -1766,26 +1807,49 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
                                     sol="ikSCsolver", n=label + "_rfToeIkh")[0]
             cmds.parent(toe_ikh, toe_piv)
             if cmds.objExists(toe_joint):
-                # BEHAV-C: 既存 parentConstraint (toe_L_ctl → toe_L、FK 駆動)
-                # を **削除しない**。以前は type="constraint" で巻き込み削除
-                # していたため FK が完全無効化されていた。ここでは追加で
-                # orientConstraint(rf_toe → toe) を張り、weight を IK_FK に
-                # 連動させて IK モードで rf_toe が rotate 支配、FK モードで
-                # toe_ctl の parentConstraint が支配する構造にする。
+                # v0.9.9-2 (AUDIT2 P0-C 回帰): 単純 orientConstraint 追加は
+                # `Object is already connected` で失敗、あるいは既存の rotate
+                # 接続を上書きして FK ctl 無効化していた。正しい構造:
+                # 既存 parentConstraint (toe_L_ctl → toe_L) を **一旦 delete**
+                # し、2-source parentConstraint(toe_L_ctl, rf_toe → toe_L,
+                # mo=True) で作り直す。weight を IK_FK で切替:
+                #   FK モード (IK_FK=0) → toe_L_ctl weight=1、rf_toe=0
+                #   IK モード (IK_FK=1) → toe_L_ctl weight=0、rf_toe=1
                 _leg_lbl = "leg_L" if side == "L" else "leg_R" if side == "R" else "leg_C"
                 _ui_host_name = _leg_lbl + "_UI_ctl"
                 try:
-                    oc = cmds.orientConstraint(rf_toe, toe_joint, mo=True,
-                                               n=toe_joint + "_rfToe_oc")[0]
-                    wal = cmds.orientConstraint(oc, q=True, wal=True)
-                    if wal and cmds.objExists(_ui_host_name) \
-                            and cmds.attributeQuery("IK_FK", node=_ui_host_name,
+                    # 既存 parentConstraint (toe_L_ctl → toe_L) を探して削除。
+                    # attach_controllers Pass 3 が `<jnt>_parentConstraint` で作る。
+                    existing = cmds.listConnections(toe_joint + ".rotateX",
+                                                    s=True, d=False,
+                                                    type="parentConstraint") or []
+                    fk_source_ctl = None
+                    for con in existing:
+                        # source ctl を記録してから削除
+                        tgs = cmds.parentConstraint(con, q=True, tl=True) or []
+                        if tgs:
+                            fk_source_ctl = tgs[0]
+                        try: cmds.delete(con)
+                        except Exception: pass
+                    if fk_source_ctl and cmds.objExists(fk_source_ctl):
+                        pc = cmds.parentConstraint(fk_source_ctl, rf_toe,
+                                                    toe_joint, mo=True,
+                                                    n=toe_joint + "_ikfk_pc")[0]
+                        wal = cmds.parentConstraint(pc, q=True, wal=True) or []
+                        if len(wal) >= 2 and cmds.objExists(_ui_host_name) and \
+                                cmds.attributeQuery("IK_FK", node=_ui_host_name,
                                                      exists=True):
-                        # rf_toe の weight = IK_FK (IK モード時に支配)
-                        cmds.connectAttr(_ui_host_name + ".IK_FK",
-                                         oc + "." + wal[0], f=True)
+                            # rev: IK_FK=0 → FK weight=1, IK_FK=1 → IK weight=1
+                            rev_n = cmds.createNode("reverse",
+                                                     n=toe_joint + "_ikfk_pc_rev")
+                            cmds.connectAttr(_ui_host_name + ".IK_FK",
+                                              rev_n + ".inputX")
+                            cmds.connectAttr(rev_n + ".outputX",
+                                              pc + "." + wal[0], f=True)  # FK
+                            cmds.connectAttr(_ui_host_name + ".IK_FK",
+                                              pc + "." + wal[1], f=True)  # IK
                 except Exception as e:
-                    cmds.warning(f"[attach_ctrls] rfToe oc: {e}")
+                    cmds.warning(f"[attach_ctrls] toe ikfk_pc: {e}")
         except Exception as exc:
             cmds.warning(f"[attach_ctrls] rfToe ikHandle failed: {exc}")
             toe_ikh = None
