@@ -754,9 +754,14 @@ def delete_generated():
             print(f"[{_PACKAGE}] delete {node} failed ({why}): {exc}")
 
     # attach 起源の constraint/handle のみ (suffix で識別)
-    for pat in ("*_ikfk_oc", "*_fk_oc", "*_ik_orient_oc"):
+    for pat in ("*_ikfk_oc", "*_fk_oc", "*_ik_orient_oc", "*_ikctl_oc"):
         for con in cmds.ls(pat, type="orientConstraint") or []:
             _safe_del(con, "orient constraint")
+    # v0.9.13 Bug 1: hero joint 用 blend を parentConstraint に置換 (per-target
+    # offset で FK↔IK 切替時の bind 復帰を保証)。suffix `_ikfk_pc` を掃討対象へ。
+    for pat in ("*_ikfk_pc",):
+        for con in cmds.ls(pat, type="parentConstraint") or []:
+            _safe_del(con, "ikfk parent constraint")
     # attach 起源 parentConstraint (naming: <joint>_parentConstraint)
     for con in cmds.ls("*_parentConstraint*", type="parentConstraint") or []:
         # attach_ctrls は attach_controllers で `n=jnt + "_parentConstraint"` で
@@ -953,6 +958,18 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     orig_parent_list = cmds.listRelatives(start, p=True, type="joint") or []
     orig_parent = orig_parent_list[0] if orig_parent_list else None
 
+    # v0.9.13 Bug 1: 真の bind WS matrix / position を rig 構築前に捕捉。
+    # 後段 (twist scan) は「orig を bind に戻す twist 値」を探すが、以前は
+    # orient constraint 生成後に snapshot していたため単一 offset の誤差を
+    # そのまま bind として固定していた。真 bind を先取りすれば scan が
+    # ik chain の実 drift を最小化できる。
+    _true_bind_ws_mat = {
+        j: cmds.xform(j, q=True, ws=True, m=True) for j in (start, mid, end)
+    }
+    _true_bind_ws_pos = {
+        j: cmds.xform(j, q=True, ws=True, t=True) for j in (start, mid, end)
+    }
+
     # サイズ (mesh bbox 準拠の auto scale)
     diag = _scene_mesh_bbox_diag()
     ik_size = diag / 18.0    # IK ctl 大きめ (掴みやすさ)
@@ -1127,22 +1144,42 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     cmds.connectAttr(ui_host + ".IK_FK", rev + ".inputX")
 
     # --- 7. Blend original hero joints between IK chain and FK chain ---
-    # orientConstraint mo=True で local space 差異を初期化時に吸収。
-    # twist bones は元 hero joint の child なので、hero joint 回転すれば自然追従。
-    # IK solver は clean chain だけ動かし、twist bones を直接触らない。
+    # v0.9.13 Bug 1: 従来は 2-source `orientConstraint` mo=True で blend したが、
+    # Maya の orientConstraint は per-target offset を持たず top-level 単一
+    # `offsetX/Y/Z` のみ。初期化時 weight=1/1 で `offset = orig - avg(FK, IK)`
+    # となり、weight=1/0 (FK) や 0/1 (IK) に切替えても bind に完全復帰しない
+    # (arm mid_delta=0.386, leg=1.75)。
+    #
+    # 対策: `parentConstraint` (per-target `targetOffsetRotate` あり) を使い、
+    # translate は skip して rotation のみ blend する。mo=True で各 source ごと
+    # に独立 offset が計算されるので、weight=1 側の source 単独時は bind に
+    # 完全復帰する。挙動は事前に mayapy で検証済 (per-target offset 正解)。
+    #
+    # End joint (wrist/ankle) は IK RP solver が rotation を制御しないため、
+    # `orientConstraint(ik_ctl, wrist_ik, mo=True)` を先に張って ik_ctl の
+    # WS 回転を wrist_ik.rotate に注入する (single-source は正しく解決)。
+    # 以前の「wrist_ik 経由 local-space 不整合」は 2-source 単一 offset が
+    # 原因だったので、per-target offset の parentConstraint では再発しない。
+    end_ikj = ik_chain[2]
+    try:
+        cmds.orientConstraint(ik_ctl, end_ikj, mo=True,
+                              n=end_ikj + "_ikctl_oc")
+    except Exception:
+        pass
+
     for orig, ikj, fkj in zip([start, mid, end], ik_chain, fk_chain):
-        # end joint (wrist/ankle) は IK solver が rotate を制御しないので、
-        # ikj (wrist_ik) 経由でなく ik_ctl を直接 orient source に使う。
-        # これで wrist_ik 経由の local-space 不整合が消え、TWIST scout 報告の
-        # 手首捻れ (arm_R wrist 127°) が解消する。
-        ikj_source = ik_ctl if orig == end else ikj
-        cons = cmds.orientConstraint(fkj, ikj_source, orig, mo=True,
-                                     n=orig + "_ikfk_oc")[0]
-        wal = cmds.orientConstraint(cons, q=True, wal=True)  # [fkW, ikW]
-        cmds.connectAttr(rev + ".outputX",  cons + "." + wal[0])
-        cmds.connectAttr(ui_host + ".IK_FK", cons + "." + wal[1])
-    # 従来の orientConstraint(ik_ctl, wrist_ik, mo=True) は削除
-    # (wrist_ik を driven する必要が無くなった)
+        cons = cmds.parentConstraint(
+            fkj, ikj, orig, mo=True,
+            st=("x", "y", "z"),   # translate は skip: rotation blend のみ
+            n=orig + "_ikfk_pc")[0]
+        wal = cmds.parentConstraint(cons, q=True, wal=True)  # [fkW, ikW]
+        cmds.connectAttr(rev + ".outputX",  cons + "." + wal[0], f=True)
+        cmds.connectAttr(ui_host + ".IK_FK", cons + "." + wal[1], f=True)
+        # interpType=2 (shortest) で 180°付近の euler flip を回避
+        try:
+            cmds.setAttr(cons + ".interpType", 2)
+        except Exception:
+            pass
 
     # v0.9.12: mGear tag (`_tag_mgear_ctl` / ctl_role / uiHost / match_ref /
     # _mth joint dup) は撤去。自作 UI (snap ボタン / mirror_pose 関数) で対応。
@@ -1167,12 +1204,11 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         p = cmds.xform(j, q=True, ws=True, t=True) or [0,0,0]
         return _math.sqrt(sum((p[i]-ref_pos[i])**2 for i in range(3)))
 
-    bind_matrices = {
-        j: cmds.xform(j, q=True, ws=True, m=True) for j in (start, mid, end)
-    }
-    bind_positions = {
-        j: cmds.xform(j, q=True, ws=True, t=True) for j in (start, mid, end)
-    }
+    # v0.9.13 Bug 1: 関数冒頭で捕捉した真 bind (`_true_bind_ws_mat/pos`) を使用。
+    # 従来は orient constraint 後に snapshot していたため単一 offset の誤差が
+    # bind として固定され、twist scan が real drift を見えなくしていた。
+    bind_matrices = _true_bind_ws_mat
+    bind_positions = _true_bind_ws_pos
 
     def _total_drift():
         # 3-axis rotate drift + position drift の合成 (v0.9.12: twist と
