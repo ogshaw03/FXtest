@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.9"
+__version__ = "0.9.10"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -1281,8 +1281,19 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
             cmds.setAttr(ik_gate + ".input[0]", 1.0)
             cmds.connectAttr(bta + ".output", ik_gate + ".input[1]")
             cmds.connectAttr(ui_host + ".IK_FK", ik_gate + ".attributesBlender")
-            # IK chain bones の translate に ik_gate 経由で scale 掛ける
-            # (STRETCH2 scout B: bta 直接だと FK モードでも伸びる)
+            # v0.9.10 (STRETCH4 案A + AUDIT3): translate は per-axis 接続
+            # (`.translateX/Y/Z` 個別) にしないと既存 parentConstraint の
+            # per-component 接続が優先されて scale が無効化される。加えて
+            # hero_chain_bones を DFS 化して兄弟 twist (arm_twist_1..3 等)
+            # も回収、arm chain 全体で reach 1:1 達成。
+            def _conn_per_axis(md, target):
+                for _ax in ("X", "Y", "Z"):
+                    try:
+                        cmds.connectAttr(md + ".output" + _ax,
+                                          target + ".translate" + _ax, f=True)
+                    except Exception:
+                        pass
+            # IK chain bones (mid, end) の translate に ik_gate 経由で scale
             for b in (ik_chain[1], ik_chain[2]):
                 rest_t = cmds.getAttr(b + ".translate")[0]
                 md = cmds.createNode("multiplyDivide", n=b + "_stretch_mul")
@@ -1290,31 +1301,20 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                 cmds.connectAttr(ik_gate + ".output", md + ".input2X")
                 cmds.connectAttr(ik_gate + ".output", md + ".input2Y")
                 cmds.connectAttr(ik_gate + ".output", md + ".input2Z")
-                cmds.connectAttr(md + ".output", b + ".translate", f=True)
-            # v0.9.9-3 (BEHAV2 P0-E) 再アプローチ: hero chain 内の全 joint
-            # (start→end の bind hierarchy 経路、twist bone 含む) の translate
-            # に ik_gate scale を適用。arm 側は arm_L → arm_twist_1..3 →
-            # elbow_L → hand_twist_1..3 → wrist_L で twist 6 本挟まる。
-            # 全部 scale することで合計 reach が 1:1 対応。
-            def _hero_chain_bones(_start, _end):
-                """_start (含まず) から _end (含む) までの bind hierarchy 経路。"""
-                _out = []
-                _cur = _end
-                for _ in range(30):  # 安全上限
-                    if not _cur or _cur == _start:
-                        break
-                    _out.insert(0, _cur)
-                    _pars = cmds.listRelatives(_cur, p=True, type="joint") or []
-                    _cur = _pars[0] if _pars else None
-                return _out
-            for h in _hero_chain_bones(start, end):
+                _conn_per_axis(md, b)
+            # hero chain: start の全 descendant joint (end の descendant は除く
+            # = 指骨/末端は stretch 対象外) を回収して scale。DFS で兄弟
+            # twist (arm_twist_1..3, hand_twist_1..3 等) も含める。
+            all_desc = cmds.listRelatives(start, ad=True, type="joint") or []
+            end_desc = set(cmds.listRelatives(end, ad=True, type="joint") or [])
+            hero_bones = [j for j in all_desc if j not in end_desc]
+            for h in hero_bones:
                 if not cmds.objExists(h):
                     continue
                 try:
                     rest_h = cmds.getAttr(h + ".translate")[0]
                 except Exception:
                     continue
-                # ゼロ translate の joint は scale しても意味なし (bind pose 0)
                 if abs(rest_h[0])+abs(rest_h[1])+abs(rest_h[2]) < 1e-6:
                     continue
                 md_h = cmds.createNode("multiplyDivide", n=h + "_stretch_mul")
@@ -1322,10 +1322,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                 cmds.connectAttr(ik_gate + ".output", md_h + ".input2X")
                 cmds.connectAttr(ik_gate + ".output", md_h + ".input2Y")
                 cmds.connectAttr(ik_gate + ".output", md_h + ".input2Z")
-                try:
-                    cmds.connectAttr(md_h + ".output", h + ".translate", f=True)
-                except Exception:
-                    pass
+                _conn_per_axis(md_h, h)
     except Exception as exc:
         cmds.warning(f"[attach_ctrls] stretch setup failed for {label}: {exc}")
 
