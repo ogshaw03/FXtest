@@ -1059,10 +1059,21 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         base_offset = chain_len * (0.60 if is_leg_pv else 0.71)
     else:
         base_offset = pv_offset
-    # T-pose straight chain の fallback: 腕は後方 (-Z), 脚は前方 (+Z)
+    # T-pose straight chain の fallback: 腕は後方 (-Z), 脚は前方 (+Z)。
+    # v0.9.14 Bug 2: 脚は Nekotatune の bind knock-knee (knee X が hip-ankle
+    # 直線から内側 -1.64 offset) の bend 方向を PV plane に反映させる必要が
+    # ある。BUG2-DIAG 実測: PV を hip **内側** に置くと knee X が幾何理想
+    # (bind X 近傍) に着地、外側 に置くと大股に飛ぶ。よって leg_L は -X (体
+    # 内側)、leg_R は +X (体内側) 混合 + 前方 Z を fallback にする。Z 成分
+    # (0.3) は屈曲時に knee を前へ導く生理的な動作を維持するため。
     lo = label.lower()
     if "leg" in lo or "knee" in lo or "ankle" in lo:
-        fallback_pv = [0, 0, +1]
+        if side == "L" or lo.endswith("_l") or "_l_" in lo:
+            fallback_pv = [-0.5, 0, +0.85]  # 内側 X (弱) + 前方 Z (主体) 、内側 20 unit 相当
+        elif side == "R" or lo.endswith("_r") or "_r_" in lo:
+            fallback_pv = [+0.5, 0, +0.85]
+        else:
+            fallback_pv = [0, 0, +1]       # 中央 (C) は前方のみ
     else:
         fallback_pv = [0, 0, -1]
     pv_pos = _compute_pv_position(start_pos, mid_pos, end_pos,
