@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.10"
+__version__ = "0.9.11"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -547,6 +547,28 @@ def _mark_as_ctl(ctl):
             cmds.sets(name=set_name, empty=True)
         if not cmds.sets(ctl, isMember=set_name):
             cmds.sets(ctl, add=set_name)
+    except Exception:
+        pass
+    # 4. v0.9.11 Mirror Pose 対応: `invTx..invSz` 9 bool attr。
+    # side が R の ctl は default で invTx=1, invRy=1, invRz=1 (YZ 平面で
+    # ミラーする mGear 慣習)。L/C は全 0。
+    try:
+        _short = ctl.split(":")[-1].split("|")[-1]
+        _side_r = _short.endswith("_R") or _short.endswith("_R_ctl") or \
+                   "_R_" in _short or _short.startswith("R_")
+        _defaults = {
+            "invTx": 1 if _side_r else 0,
+            "invTy": 0, "invTz": 0,
+            "invRx": 0,
+            "invRy": 1 if _side_r else 0,
+            "invRz": 1 if _side_r else 0,
+            "invSx": 0, "invSy": 0, "invSz": 0,
+        }
+        for _a, _dv in _defaults.items():
+            if not cmds.attributeQuery(_a, node=ctl, exists=True):
+                cmds.addAttr(ctl, ln=_a, at="bool", dv=bool(_dv), k=False)
+            try: cmds.setAttr(ctl + "." + _a, channelBox=False)
+            except Exception: pass
     except Exception:
         pass
 
@@ -1089,6 +1111,14 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         if not cmds.attributeQuery(attr_name, node=ui_host, exists=True):
             cmds.addAttr(ui_host, ln=attr_name, at="float",
                          min=0.0, max=1.0, dv=dv, k=True)
+    # v0.9.11 Stretch UI: 伸び上限 (maxstretch, default 1.5x) と
+    # volume 保存 (体積保持で伸ばした bone を横方向に細くする)
+    if not cmds.attributeQuery("maxstretch", node=ui_host, exists=True):
+        cmds.addAttr(ui_host, ln="maxstretch", at="float",
+                     min=1.0, max=5.0, dv=1.5, k=True)
+    if not cmds.attributeQuery("volume", node=ui_host, exists=True):
+        cmds.addAttr(ui_host, ln="volume", at="float",
+                     min=0.0, max=1.0, dv=0.0, k=True)
     # mGear dagmenu が探す `<label>_blend` サフィックスを追加 (MENU scout)。
     # `_blend` を master、`IK_FK` は driven にする (mGear の IK/FK Switch は
     # setAttr `_blend` を叩くので、以前の逆方向接続だと "locked or connected"
@@ -1258,17 +1288,38 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
             db = cmds.createNode("distanceBetween", n=label + "_stretch_dist")
             cmds.connectAttr(arm_ik + ".worldMatrix[0]", db + ".inMatrix1")
             cmds.connectAttr(ik_ctl + ".worldMatrix[0]", db + ".inMatrix2")
-            # 距離 / rest_len
+            # v0.9.11: rest_len を world_ctl.sx で補正 (global scale 変えても
+            # stretch trigger threshold が rig scale と一致するように)
+            rest_scaled = cmds.createNode("multiplyDivide",
+                                           n=label + "_stretch_rest_scale")
+            cmds.setAttr(rest_scaled + ".input1X", rest_len)
+            if cmds.objExists("world_ctl"):
+                try:
+                    cmds.connectAttr("world_ctl.scaleX", rest_scaled + ".input2X")
+                except Exception:
+                    cmds.setAttr(rest_scaled + ".input2X", 1.0)
+            else:
+                cmds.setAttr(rest_scaled + ".input2X", 1.0)
+            # 距離 / rest_len (scaled)
             div = cmds.createNode("multiplyDivide", n=label + "_stretch_div")
             cmds.setAttr(div + ".operation", 2)  # divide
             cmds.connectAttr(db + ".distance", div + ".input1X")
-            cmds.setAttr(div + ".input2X", rest_len)
+            cmds.connectAttr(rest_scaled + ".outputX", div + ".input2X", f=True)
             # rest_len 超え時のみ scale 適用 (それ以下は 1.0 で bone 短縮を防ぐ)
             cnd = cmds.createNode("condition", n=label + "_stretch_cond")
             cmds.setAttr(cnd + ".operation", 2)  # greater
             cmds.connectAttr(db + ".distance", cnd + ".firstTerm")
-            cmds.setAttr(cnd + ".secondTerm", rest_len)
-            cmds.connectAttr(div + ".outputX", cnd + ".colorIfTrueR")
+            cmds.connectAttr(rest_scaled + ".outputX", cnd + ".secondTerm", f=True)
+            # v0.9.11: maxstretch で伸び上限 clamp (min = clamp scale, max = maxstretch)
+            # UI attr `maxstretch` (default 1.5) は setup_ik_fk の attr 追加時に定義
+            cl = cmds.createNode("clamp", n=label + "_stretch_clamp")
+            cmds.setAttr(cl + ".minR", 1.0)
+            if cmds.attributeQuery("maxstretch", node=ui_host, exists=True):
+                cmds.connectAttr(ui_host + ".maxstretch", cl + ".maxR")
+            else:
+                cmds.setAttr(cl + ".maxR", 999.0)
+            cmds.connectAttr(div + ".outputX", cl + ".inputR")
+            cmds.connectAttr(cl + ".outputR", cnd + ".colorIfTrueR", f=True)
             cmds.setAttr(cnd + ".colorIfFalseR", 1.0)
             # stretch attr で 1.0 (off) ↔ scale (on) blend
             bta = cmds.createNode("blendTwoAttr", n=label + "_stretch_blend")
@@ -1323,6 +1374,36 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
                 cmds.connectAttr(ik_gate + ".output", md_h + ".input2Y")
                 cmds.connectAttr(ik_gate + ".output", md_h + ".input2Z")
                 _conn_per_axis(md_h, h)
+
+            # v0.9.11 Volume preservation: hero bone の X/Z scale を stretch
+            # 逆数の平方根で駆動 (bone 縦に伸びたら横に細くする)。
+            # volume attr で強度 blend (0 = 効かない、1 = 完全に体積保存)。
+            # `pow(stretch, -0.5)` は power ノードで実現、volume で blend。
+            try:
+                vol_pow = cmds.createNode("multiplyDivide",
+                                            n=label + "_volume_pow")
+                cmds.setAttr(vol_pow + ".operation", 3)  # power
+                cmds.connectAttr(ik_gate + ".output", vol_pow + ".input1X")
+                cmds.setAttr(vol_pow + ".input2X", -0.5)  # 1/sqrt
+                # volume で 1.0 (no compress) ↔ pow (full compress) blend
+                vol_bta = cmds.createNode("blendTwoAttr",
+                                           n=label + "_volume_blend")
+                cmds.setAttr(vol_bta + ".input[0]", 1.0)
+                cmds.connectAttr(vol_pow + ".outputX", vol_bta + ".input[1]")
+                cmds.connectAttr(ui_host + ".volume",
+                                  vol_bta + ".attributesBlender")
+                # hero bones (mid, end のみ、twist は skinning 補間で自然追従)
+                for h in (mid, end):
+                    if not cmds.objExists(h):
+                        continue
+                    for _ax in ("X", "Z"):
+                        try:
+                            cmds.connectAttr(vol_bta + ".output",
+                                              h + ".scale" + _ax, f=True)
+                        except Exception:
+                            pass
+            except Exception as exc:
+                cmds.warning(f"[attach_ctrls] volume setup failed: {exc}")
     except Exception as exc:
         cmds.warning(f"[attach_ctrls] stretch setup failed for {label}: {exc}")
 
@@ -1994,6 +2075,68 @@ def snap_fk_to_ik(chain_label):
     print(f"[{_PACKAGE}] snap_fk_to_ik: {start_j} -> {blend_attr}=0")
 
 
+def _opposite_side_name(ctl_name):
+    """`arm_L_ctl` → `arm_R_ctl` 等、side を反転した ctl 名を返す。無ければ None。"""
+    if cmds is None: return None
+    short = ctl_name.split(":")[-1].split("|")[-1]
+    # 命名バリエーション網羅 (_L / _R / L_ / R_ / _L_xxx / _R_xxx)
+    candidates = []
+    if "_L" in short: candidates.append(short.replace("_L", "_R", 1))
+    if "_R" in short: candidates.append(short.replace("_R", "_L", 1))
+    if short.startswith("L_"): candidates.append("R_" + short[2:])
+    if short.startswith("R_"): candidates.append("L_" + short[2:])
+    for cand in candidates:
+        if cand != short and cmds.objExists(cand):
+            return cand
+    return None
+
+
+def mirror_pose(ctls=None):
+    """選択 ctl の TRS を反対側 ctl にコピーし、`invTx..invSz` で反転する。
+    mGear の Mirror Pose 相当。v0.9.11 追加。
+
+    Args:
+        ctls: 対象 ctl リスト。None なら現在の selection。
+    Returns:
+        (mirrored_count, skipped_count)
+    """
+    if cmds is None: return (0, 0)
+    if ctls is None:
+        ctls = cmds.ls(sl=True, type="transform") or []
+    n_ok = 0; n_skip = 0
+    for src in ctls:
+        dst = _opposite_side_name(src)
+        if not dst:
+            n_skip += 1; continue
+        for a, inv_attr in [("translateX", "invTx"), ("translateY", "invTy"),
+                             ("translateZ", "invTz"),
+                             ("rotateX", "invRx"), ("rotateY", "invRy"),
+                             ("rotateZ", "invRz"),
+                             ("scaleX", "invSx"), ("scaleY", "invSy"),
+                             ("scaleZ", "invSz")]:
+            try:
+                v = cmds.getAttr(src + "." + a)
+                # dst の inv attr で反転判定 (mGear 慣習: dst 側の attr を参照)
+                inv = False
+                if cmds.attributeQuery(inv_attr, node=dst, exists=True):
+                    inv = bool(cmds.getAttr(dst + "." + inv_attr))
+                if inv:
+                    if a.startswith("scale"):
+                        # scale は 1 中心の反転 (通常は不要だが対応)
+                        v = 2.0 - v if abs(v) < 5 else v
+                    else:
+                        v = -v
+                try:
+                    cmds.setAttr(dst + "." + a, v)
+                except Exception:
+                    pass  # locked attr 等
+            except Exception:
+                pass
+        n_ok += 1
+    print(f"[{_PACKAGE}] mirror_pose: {n_ok} mirrored, {n_skip} skipped")
+    return (n_ok, n_skip)
+
+
 def snap_ik_to_fk(chain_label):
     """IK ctl (+ pole vector) を現 FK 姿勢に snap。"""
     triple = _resolve_chain_joints(chain_label)
@@ -2311,7 +2454,16 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
             world_ctl = _make_octagon_curve(world_ctl_name, scale=diag * 0.28)
             _set_ctl_color(world_ctl, COLOR_WORLD)
             cmds.parent(world_ctl, ROOT_GROUP)
-            _lock_hide_attrs(world_ctl, ["sx","sy","sz","v"])
+            # v0.9.11: scale は unlock して global scale ctl として使う
+            _lock_hide_attrs(world_ctl, ["v"])
+            # rig 全体 scale を world_ctl の scale で駆動 (main_ctl は既に
+            # world_ctl の子だが、scaleConstraint で子孫全部が同期)
+            try:
+                for _ax in ("sx", "sy", "sz"):
+                    cmds.connectAttr(world_ctl + "." + _ax,
+                                      ROOT_GROUP + "." + _ax, f=True)
+            except Exception:
+                pass
         else:
             world_ctl = world_ctl_name
         # main ctl (体を包む) — 中サイズ box (mGear body_C0_ctl 相当、黄)
@@ -2460,6 +2612,12 @@ def _build_body() -> None:
                 bgc=(0.60, 0.30, 0.30))
     cmds.setParent("..")
 
+    # v0.9.11 UX: Mirror Pose ボタン
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
+    cmds.button(l="Mirror Selected (L ↔ R pose copy)", h=26,
+                c=_ui_mirror_pose, bgc=(0.35, 0.65, 0.35))
+    cmds.setParent("..")
+
 
 def _ui_full_auto(*_):
     scale = cmds.floatSliderGrp(_UI_SCALE, q=True, value=True)
@@ -2520,6 +2678,15 @@ def _ui_snap_ik_to_fk(*_):
         except Exception:
             continue
     cmds.warning(f"snap_ik_to_fk: could not resolve chain from {sel[0]}")
+
+
+def _ui_mirror_pose(*_):
+    sel = cmds.ls(sl=True, type="transform") or []
+    if not sel:
+        cmds.warning("Select L or R side ctls to mirror to opposite side")
+        return
+    n_ok, n_skip = mirror_pose(sel)
+    print(f"[{_PACKAGE}] Mirror: {n_ok} mirrored, {n_skip} skipped")
 
 
 def _ui_reset_ik(*_):
