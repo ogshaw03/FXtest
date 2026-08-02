@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.23"
+__version__ = "0.9.24"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2219,6 +2219,144 @@ def snap_ik_to_fk(chain_label):
     print(f"[{_PACKAGE}] snap_ik_to_fk: {start_j} -> IK_FK=1")
 
 
+def _create_twist_segments(parent, child, count=3, prefix=None, side=None):
+    """parent → child bone を count 分節する twist joint を parent の子として作成。
+
+    各 twist joint は parent joint の DIRECT CHILD として parent→child 直線上
+    に等間隔配置される (i/(count+1) の位置)。既存の parent-child 階層 (parent
+    が child の親) は保持され、twist joint は sibling として並ぶ。
+
+    naming: `<prefix>_i_<side>` (i=1..count)
+    prefix 省略時: parent の base name から `_twist` を派生
+    side 省略時: parent 名末尾の _L/_R/_C から判定
+
+    Returns: 作成した twist joint 名リスト。
+    """
+    if cmds is None:
+        return []
+    if not (cmds.objExists(parent) and cmds.objExists(child)):
+        return []
+    if side is None:
+        side = _detect_side(parent)
+    if prefix is None:
+        # arm_L → "arm_twist"、hand_L → "hand_twist"
+        base = _base_name(parent).lower()
+        prefix = base + "_twist"
+
+    p_pos = cmds.xform(parent, q=True, ws=True, t=True)
+    c_pos = cmds.xform(child, q=True, ws=True, t=True)
+
+    created = []
+    for i in range(1, count + 1):
+        frac = i / (count + 1)
+        pos = [p_pos[k] + (c_pos[k] - p_pos[k]) * frac for k in range(3)]
+        name = f"{prefix}_{i}_{side}" if side else f"{prefix}_{i}"
+        if cmds.objExists(name):
+            # 名前衝突: 既存を再利用
+            created.append(name)
+            continue
+        try:
+            cmds.select(parent, r=True)
+            j = cmds.joint(n=name, p=pos)
+            # 親 (parent) の jointOrient を継承しつつ、rotate=0 にリセット
+            for a in ("jointOrientX", "jointOrientY", "jointOrientZ"):
+                try:
+                    v = cmds.getAttr(parent + "." + a)
+                    cmds.setAttr(j + "." + a, v)
+                except Exception:
+                    pass
+            cmds.setAttr(j + ".rotate", 0, 0, 0, type="double3")
+            # visual: parent と同じ radius、描画なし (viewport ノイズ回避)
+            try:
+                cmds.setAttr(j + ".radius", cmds.getAttr(parent + ".radius"))
+            except Exception:
+                pass
+            try:
+                cmds.setAttr(j + ".drawStyle", 2)  # None
+            except Exception:
+                pass
+            created.append(j)
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] create twist joint {name} failed: {exc}")
+    return created
+
+
+def setup_twist_wiring():
+    """L/R arm/forearm の twist joint auto-drive を配線 (無ければ追加)。
+
+    処理:
+      1. 既知 chain (L/R arm=arm→elbow、L/R forearm=elbow→wrist) を検出
+      2. 該当する既存 twist series を検出 (naming: arm_twist_1/2/3_L 等)
+      3. 既存 master (arm_twist_L / hand_twist_L) があれば master 駆動
+         (無ければ child joint = elbow/wrist の rotateX を driver に採用)
+      4. 存在しない chain には count=3 で新規 twist joint 作成
+      5. multiplyDivide で `driver.rotateX * (idx/(count+1))` を接続
+
+    汎用性: MMD FBX (twist 既存) と plain model (twist 未存在) 両対応。
+    plain model の場合、skinCluster への weight 転送は行わない (mesh 破壊
+    リスクのため)。ユーザが後で copySkinWeights 等で行う想定。
+
+    既存 rotate 接続がある segment は skip (attach_controllers の
+    parentConstraint など、他 driver との衝突回避)。
+    """
+    if cmds is None:
+        return 0
+
+    # (chain_label, parent_joint, child_joint, twist_base_name)
+    # NOTE: hand_twist は elbow_L の子として elbow→wrist 間を分節するのが MMD 慣習
+    targets = [
+        ("arm_L",   "arm_L",   "elbow_L", "arm_twist"),
+        ("arm_R",   "arm_R",   "elbow_R", "arm_twist"),
+        ("hand_L",  "elbow_L", "wrist_L", "hand_twist"),
+        ("hand_R",  "elbow_R", "wrist_R", "hand_twist"),
+    ]
+
+    n_wired = 0
+    n_created = 0
+    for label, parent, child, base in targets:
+        if not (cmds.objExists(parent) and cmds.objExists(child)):
+            continue
+        side = _detect_side(parent)
+        # 既存 twist series を検出
+        segs = []
+        for i in (1, 2, 3):
+            seg = f"{base}_{i}_{side}"
+            if cmds.objExists(seg):
+                segs.append(seg)
+        # 存在しない場合、新規作成 (count=3)
+        if not segs:
+            segs = _create_twist_segments(parent, child, count=3,
+                                           prefix=base, side=side)
+            n_created += len(segs)
+            print(f"[{_PACKAGE}] twist: created {len(segs)} joint(s) "
+                  f"for {label} ({parent}→{child})")
+
+        # driver 決定: master (arm_twist_L 等) 優先、無ければ child (child の
+        # 局所 rotateX = 捻り軸) を採用
+        master = f"{base}_{side}"
+        driver = master if cmds.objExists(master) else child
+
+        max_i = len(segs)
+        for idx, seg in enumerate(segs, start=1):
+            frac = idx / (max_i + 1)  # 3 seg → 0.25/0.50/0.75
+            try:
+                dst = seg + ".rotateX"
+                cur = cmds.listConnections(dst, s=True, d=False, p=True) or []
+                if cur:
+                    continue  # 既存 driver あり → skip
+                md = cmds.createNode("multiplyDivide", n=seg + "_twist_mul")
+                cmds.setAttr(md + ".input2X", frac)
+                cmds.connectAttr(driver + ".rotateX", md + ".input1X")
+                cmds.connectAttr(md + ".outputX", dst, f=True)
+                n_wired += 1
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] twist wire {driver}→{seg} failed: {exc}")
+
+    print(f"[{_PACKAGE}] setup_twist_wiring: {n_wired} segment(s) wired, "
+          f"{n_created} joint(s) newly created")
+    return n_wired
+
+
 def setup_all_ik_fk():
     """検出できた L/R arm/leg 全てに IK/FK rig を構築。leg には reverse foot も。"""
     chains = find_ik_chains()
@@ -2944,9 +3082,15 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
             exclude.update(chain)
 
         all_joints = cmds.ls(type="joint") or []
+        # v0.9.24: twist joint は FK cube ctl の対象外 (auto-drive で
+        # multiplyDivide 接続するため、parentConstraint と衝突しないよう
+        # attach_controllers から除外)。
+        def _is_twist_bone(name):
+            return "twist" in name.split("|")[-1].split(":")[-1].lower()
         other = [j for j in all_joints
                  if j not in exclude
-                 and not j.endswith("_end")]
+                 and not j.endswith("_end")
+                 and not _is_twist_bone(j)]
         attach_result = attach_controllers(joints=other, scale=scale,
                                             do_constrain=True,
                                             auto_scale=True,
@@ -2964,9 +3108,16 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
                 except Exception:
                     pass
 
-        # Step 7: IK/FK setup (IK ctl NPO は独立世界置き = 足接地 目的) (55-100%)
-        _pw_span(55, 100); _pw_sub(0, "Setup IK/FK chains...")
+        # Step 7: IK/FK setup (IK ctl NPO は独立世界置き = 足接地 目的) (55-97%)
+        _pw_span(55, 97); _pw_sub(0, "Setup IK/FK chains...")
         ik_results = setup_all_ik_fk()
+
+        # Step 8: twist joint auto-drive 配線 (97-100%)
+        _pw_span(97, 100); _pw_sub(0, "Wire twist joints...")
+        try:
+            setup_twist_wiring()
+        except Exception as _tw_exc:
+            cmds.warning(f"[attach_ctrls] twist wiring failed (continue): {_tw_exc}")
 
         print(f"[{_PACKAGE}] === full_auto_setup complete ===")
         print(f"  FK ctls attached: {len(attach_result)}")
