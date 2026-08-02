@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.26"
+__version__ = "0.9.28"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2290,84 +2290,88 @@ def _create_twist_segments(parent, child, count=3, prefix=None, side=None):
 
 
 def setup_twist_wiring():
-    """L/R arm/forearm の twist joint auto-drive を配線 (無ければ追加)。
+    """L/R arm/forearm の twist master bone を wrist から自動駆動する。
 
-    処理:
-      1. 既知 chain (L/R arm=arm→elbow、L/R forearm=elbow→wrist) を検出
-      2. 該当する既存 twist series を検出 (naming: arm_twist_1/2/3_L 等)
-      3. 既存 master (arm_twist_L / hand_twist_L) があれば master 駆動
-         (無ければ child joint = elbow/wrist の rotateX を driver に採用)
-      4. 存在しない chain には count=3 で新規 twist joint 作成
-      5. multiplyDivide で `driver.rotateX * (idx/(count+1))` を接続
+    v0.9.28 (ユーザ報告での訂正): Nekotatune 等の MMD モデルでは
+    `arm_twist_1/2/3_L` `hand_twist_1/2/3_L` は **装飾骨** (sleeve/armor 等
+    の overlay) で命名だけ "_twist_" が付いている。実際の twist bone は
+    master `arm_twist_L` `hand_twist_L` の 1 本のみ。よって:
 
-    汎用性: MMD FBX (twist 既存) と plain model (twist 未存在) 両対応。
-    plain model の場合、skinCluster への weight 転送は行わない (mesh 破壊
-    リスクのため)。ユーザが後で copySkinWeights 等で行う想定。
+      * 数字付き `arm_twist_1/2/3_L` は wiring 対象外 (装飾を勝手に回転
+        させると視覚的におかしくなる、v0.9.27 リボン反転の真因)
+      * `arm_twist_L` (上腕捻り master) を wrist.rotateX × 0.5 で駆動
+      * `hand_twist_L` (前腕捻り master) を wrist.rotateX × 1.0 で駆動
+        (前腕は wrist と一体で捻れる想定)
 
-    既存 rotate 接続がある segment は skip (attach_controllers の
-    parentConstraint など、他 driver との衝突回避)。
+    plain model (master 骨が無い) 対応: master が存在しない場合は
+    `_create_twist_segments` で 1 本作成し、同じく wrist から駆動する。
+
+    既存 rotate 接続がある master は skip (他 driver との衝突回避)。
     """
     if cmds is None:
         return 0
 
-    # (chain_label, parent_joint, child_joint, twist_base_name)
-    # NOTE: hand_twist は elbow_L の子として elbow→wrist 間を分節するのが MMD 慣習
+    # (chain_label, parent_joint, child_joint, master_base_name, fraction)
     targets = [
-        ("arm_L",   "arm_L",   "elbow_L", "arm_twist"),
-        ("arm_R",   "arm_R",   "elbow_R", "arm_twist"),
-        ("hand_L",  "elbow_L", "wrist_L", "hand_twist"),
-        ("hand_R",  "elbow_R", "wrist_R", "hand_twist"),
+        ("arm_L",   "arm_L",   "elbow_L", "arm_twist",  0.5),  # 上腕: 半分
+        ("arm_R",   "arm_R",   "elbow_R", "arm_twist",  0.5),
+        ("hand_L",  "elbow_L", "wrist_L", "hand_twist", 1.0),  # 前腕: 全量
+        ("hand_R",  "elbow_R", "wrist_R", "hand_twist", 1.0),
     ]
 
     n_wired = 0
     n_created = 0
-    for label, parent, child, base in targets:
+    for label, parent, child, base, frac in targets:
         if not (cmds.objExists(parent) and cmds.objExists(child)):
             continue
         side = _detect_side(parent)
-        # 既存 twist series を検出
-        segs = []
-        for i in (1, 2, 3):
-            seg = f"{base}_{i}_{side}"
-            if cmds.objExists(seg):
-                segs.append(seg)
-        # 存在しない場合、新規作成 (count=3)
-        if not segs:
-            segs = _create_twist_segments(parent, child, count=3,
-                                           prefix=base, side=side)
-            n_created += len(segs)
-            print(f"[{_PACKAGE}] twist: created {len(segs)} joint(s) "
-                  f"for {label} ({parent}→{child})")
+        # master (arm_twist_L / hand_twist_L) を探す
+        master = f"{base}_{side}"
+        if not cmds.objExists(master):
+            # 無ければ 1 本作成 (parent と child の中間)
+            new = _create_twist_segments(parent, child, count=1,
+                                          prefix=base, side=side)
+            if new:
+                # count=1 だと `<prefix>_1_<side>` になるので rename
+                created_name = new[0]
+                target_name = f"{base}_{side}"
+                try:
+                    if cmds.objExists(created_name) and \
+                            created_name != target_name and \
+                            not cmds.objExists(target_name):
+                        master = cmds.rename(created_name, target_name)
+                    else:
+                        master = created_name
+                except Exception:
+                    master = created_name
+                n_created += 1
+                print(f"[{_PACKAGE}] twist: created master {master} for {label}")
+            else:
+                continue
 
-        # v0.9.26: driver は常に child joint (wrist for hand_twist chain,
-        # elbow for arm_twist chain) の rotateX を採用。以前は master
-        # (arm_twist_L / hand_twist_L) 優先だったが、master は MMD 慣習で
-        # ユーザが手動制御する bone で自動駆動されていない → user が wrist
-        # を捻っても master=0 のまま segments も動かず forearm mesh が潰れる
-        # 症状 (ユーザ報告)。child の rotateX (bone aim 軸 = 捻り軸) を
-        # driver にすれば wrist 回転が自動で forearm twist bones に分配
-        # 伝播して mesh がスムーズに変形する。master 自体は skinCluster に
-        # weight を持っていれば独立回転して追加補正できる (ユーザ手動)。
-        driver = child
+        # arm_twist は forearm の twist ではなく、child は elbow なので upper
+        # arm 自身の twist を得るには wrist を driver にする方が自然。
+        # hand_twist の driver も wrist (親関係で elbow→wrist)。
+        # 統一して wrist_<side>.rotateX を driver とする。
+        wrist = f"wrist_{side}"
+        driver = wrist if cmds.objExists(wrist) else child
 
-        max_i = len(segs)
-        for idx, seg in enumerate(segs, start=1):
-            frac = idx / (max_i + 1)  # 3 seg → 0.25/0.50/0.75
-            try:
-                dst = seg + ".rotateX"
-                cur = cmds.listConnections(dst, s=True, d=False, p=True) or []
-                if cur:
-                    continue  # 既存 driver あり → skip
-                md = cmds.createNode("multiplyDivide", n=seg + "_twist_mul")
-                cmds.setAttr(md + ".input2X", frac)
-                cmds.connectAttr(driver + ".rotateX", md + ".input1X")
-                cmds.connectAttr(md + ".outputX", dst, f=True)
-                n_wired += 1
-            except Exception as exc:
-                cmds.warning(f"[{_PACKAGE}] twist wire {driver}→{seg} failed: {exc}")
+        try:
+            dst = master + ".rotateX"
+            cur = cmds.listConnections(dst, s=True, d=False, p=True) or []
+            if cur:
+                continue  # 既存 driver あり → skip
+            md = cmds.createNode("multiplyDivide", n=master + "_twist_mul")
+            cmds.setAttr(md + ".input2X", frac)
+            cmds.connectAttr(driver + ".rotateX", md + ".input1X")
+            cmds.connectAttr(md + ".outputX", dst, f=True)
+            n_wired += 1
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] twist wire {driver}→{master} failed: {exc}")
 
-    print(f"[{_PACKAGE}] setup_twist_wiring: {n_wired} segment(s) wired, "
-          f"{n_created} joint(s) newly created")
+    print(f"[{_PACKAGE}] setup_twist_wiring: {n_wired} master(s) wired, "
+          f"{n_created} joint(s) newly created "
+          f"(numbered segments are treated as decoration and left untouched)")
     return n_wired
 
 
