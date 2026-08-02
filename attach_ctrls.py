@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.22"
+__version__ = "0.9.23"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2096,11 +2096,21 @@ def snap_fk_to_ik(chain_label):
         fk_ctl = orig + "_fk_ctl"
         if not (cmds.objExists(fk_ctl) and cmds.objExists(orig)):
             continue
-        # orig の現 world matrix を fk_ctl に転写。
-        # fk_ctl は fk_npo の子なので、fk_ctl.matrix = orig_wm * inv(fk_npo_wm)
-        # cmds.xform ws=True m=... はこれを自動計算してくれる。
-        orig_wm = cmds.xform(orig, q=True, ws=True, m=True)
-        cmds.xform(fk_ctl, ws=True, m=orig_wm)
+        # v0.9.23 snap 誤差修正: `xform ws=True m=` は translate 軸がロック
+        # されている fk_ctl に対して translation 部分が失われ、end joint
+        # (wrist_L 等) で 0.7 unit ズレが発生していた。orig と fk_chain は
+        # 同じ parent 階層構造なので local rotate 値を直接コピーする。
+        # orientConstraint(fk_ctl -> fk_chain, mo=False) で WS rotation が
+        # 同期し、parentConstraint 経由で orig に完全一致する。
+        try:
+            orig_rot = cmds.getAttr(orig + ".rotate")[0]
+            cmds.setAttr(fk_ctl + ".rotate",
+                          orig_rot[0], orig_rot[1], orig_rot[2],
+                          type="double3")
+        except Exception:
+            # フォールバック: 旧経路
+            orig_wm = cmds.xform(orig, q=True, ws=True, m=True)
+            cmds.xform(fk_ctl, ws=True, m=orig_wm)
     # UI host は start joint に basicallyy 対応。start_j + "_UI_ctl" で探す
     # v0.9.12: IK_FK 直接 (master、旧 `_blend` エイリアス廃止)
     ui = start_j + "_UI_ctl"
@@ -2181,8 +2191,25 @@ def snap_ik_to_fk(chain_label):
     ik_ctl = start_j + "_IK_ctl"
     pv_ctl = start_j + "_PV_ctl"
     if cmds.objExists(ik_ctl) and cmds.objExists(end_j):
-        wm = cmds.xform(end_j, q=True, ws=True, m=True)
-        cmds.xform(ik_ctl, ws=True, m=wm)
+        # v0.9.23 snap 誤差修正: leg では IK ctl の rotation が pivot chain
+        # (heel/tip/ball) 経由で foot_ikh 位置を動かして knee がわずかにズレる
+        # (0.13 unit)。IK ctl は translate だけ end WS 位置に合わせ、rotation
+        # は end WS rotation に合わせる場合と分けて処理する。arm は wrist
+        # 向きを ik_ctl から取るため matrix 全体を転写、leg は translate のみ
+        # 転写して pivot が bind orient を維持できるようにする。
+        is_leg = "leg" in chain_label.lower()
+        if is_leg:
+            ep = cmds.xform(end_j, q=True, ws=True, t=True)
+            cmds.xform(ik_ctl, ws=True, t=ep)
+            # rotation は 0 に (pivot chain が bind orient で foot_ikh の
+            # WS が IK ctl WS と一致するように)。
+            try:
+                cmds.setAttr(ik_ctl + ".rotate", 0, 0, 0, type="double3")
+            except Exception:
+                pass
+        else:
+            wm = cmds.xform(end_j, q=True, ws=True, m=True)
+            cmds.xform(ik_ctl, ws=True, m=wm)
     if cmds.objExists(pv_ctl) and cmds.objExists(mid_j):
         wp = cmds.xform(mid_j, q=True, ws=True, t=True)
         cmds.xform(pv_ctl, ws=True, t=wp)
