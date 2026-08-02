@@ -2489,6 +2489,225 @@ def symmetrize_bones_L_to_R():
     return n_transferred, len(l_roots)
 
 
+def merge_legD_into_leg():
+    """MMD の legD 系 bone (legD/kneeD/ankleD + shadow_/dummy_ 変種) を
+    削除し、skinCluster の weight を対応する main leg bone に移送する。
+
+    MMD FBX には脚 chain と並列に "D" (Direct/Displacement) chain が
+    存在し、skinCluster に含まれる場合がある。attach_ctrls の rig は
+    main leg bone (leg_L/knee_L/ankle_L) を対象とするため、D chain は
+    リギング上不要かつ IK 挙動と干渉する原因になる。
+
+    処理:
+      1. D bone → main bone の mapping を組む (D suffix を除去した名前)
+      2. skinCluster ごとに、D bone の weight を main bone に加算転送
+      3. D bone を skinCluster influence から除外
+      4. D bone (と _end) を delete
+
+    Returns:
+        (n_transferred, n_deleted): 転送した D bone 数と削除した joint 数。
+    """
+    if cmds is None:
+        raise RuntimeError("Must run inside Maya.")
+
+    # 対象 D bone 名 (base name)
+    d_base_names = ("legD", "kneeD", "ankleD")
+    # 変種 prefix
+    prefixes = ("", "shadow_", "dummy_")
+
+    def _main_of_d(d_name):
+        """dummy_legD_L → leg_L 等、対応する main bone 名を返す。"""
+        short = d_name.split("|")[-1].split(":")[-1]
+        for pref in prefixes:
+            for base in d_base_names:
+                d_full = pref + base
+                # base_L / base_R
+                for side in ("_L", "_R"):
+                    if short == d_full + side:
+                        # main は base から D を除いた版
+                        return base[:-1] + side  # legD → leg, kneeD → knee
+        return None
+
+    # 現在 scene 内の全 joint から D 骨を検出
+    all_joints = cmds.ls(type="joint") or []
+    d_joints = []
+    for j in all_joints:
+        main = _main_of_d(j)
+        if main and cmds.objExists(main):
+            d_joints.append((j, main))
+
+    if not d_joints:
+        print(f"[{_PACKAGE}] merge_legD_into_leg: D 系 bone 未検出 → skip")
+        return 0, 0
+
+    print(f"[{_PACKAGE}] merge_legD_into_leg: {len(d_joints)} D-bone 検出")
+
+    # skinCluster 単位で weight 転送
+    skcs = cmds.ls(type="skinCluster") or []
+    n_transferred = 0
+    for skc in skcs:
+        infs = cmds.skinCluster(skc, q=True, inf=True) or []
+        inf_short = [i.split("|")[-1].split(":")[-1] for i in infs]
+        # このスキンに含まれる D bone だけ処理
+        d_in_skin = [(d, m) for (d, m) in d_joints
+                     if d.split("|")[-1].split(":")[-1] in inf_short]
+        if not d_in_skin:
+            continue
+        geo_list = cmds.skinCluster(skc, q=True, g=True) or []
+        if not geo_list:
+            continue
+        geo = geo_list[0]
+        # 頂点数
+        vtx_count = cmds.polyEvaluate(geo, v=True)
+        if not isinstance(vtx_count, int):
+            continue
+
+        # main bone を influence に必ず含める (未含なら add)
+        for d, m in d_in_skin:
+            if m not in infs:
+                try:
+                    cmds.skinCluster(skc, e=True, ai=m,
+                                     lockWeights=False, weight=0)
+                    infs.append(m)
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] add influence {m} failed: {exc}")
+
+        # 頂点 loop で weight 移送
+        for vi in range(vtx_count):
+            vtx = f"{geo}.vtx[{vi}]"
+            for d, m in d_in_skin:
+                try:
+                    d_w = cmds.skinPercent(skc, vtx, transform=d, q=True) or 0
+                except Exception:
+                    d_w = 0
+                if d_w > 1e-6:
+                    try:
+                        m_w = cmds.skinPercent(skc, vtx,
+                                                transform=m, q=True) or 0
+                        cmds.skinPercent(skc, vtx,
+                                          transformValue=[(m, m_w + d_w),
+                                                          (d, 0)])
+                    except Exception:
+                        pass
+            if vi and (vi % max(1, vtx_count // 20) == 0):
+                _pw_sub(100.0 * vi / vtx_count,
+                         f"Merge legD weights {vi}/{vtx_count}")
+
+        # D bone を influence から除外
+        for d, m in d_in_skin:
+            try:
+                cmds.skinCluster(skc, e=True, ri=d)
+                n_transferred += 1
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] remove influence {d} failed: {exc}")
+
+    # D bone (と descendants) を削除
+    n_deleted = 0
+    for d, _ in d_joints:
+        if not cmds.objExists(d):
+            continue
+        try:
+            # descendants も含めて削除 (D_end 等)
+            cmds.delete(d)
+            n_deleted += 1
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] delete {d} failed: {exc}")
+
+    print(f"[{_PACKAGE}] merge_legD_into_leg: {n_transferred} 影響移送、"
+          f"{n_deleted} joint 削除")
+    return n_transferred, n_deleted
+
+
+def neutralize_leg_bind_bend():
+    """脚 knee を hip-ankle 直線に完全射影して bind pose の knock-knee
+    (X 内側 + Z 前方 offset) を除去する。
+
+    問題: MMD 由来 FBX は knee joint が hip-ankle 直線から (-X inward,
+    +Z forward) にオフセットして bind されている (Nekotatune 実測 dist=2.04)。
+    RP solver は bind の bend 方向を preferred hint として拾い、腰下げ時の
+    chain 圧縮で knee が world X 方向へ大きく変位する (Bug 2 の根源)。
+
+    対策: knee_L / knee_R の WS position を hip-ankle 線上に射影して bind
+    をストレート (dist=0) にする。ankle は knee の子なので world 位置を
+    保存 → 復元。skinCluster は `moveJointsMode` で bindPreMatrix を自動
+    更新し mesh を保持。射影後 freeze で新 bind を jointOrient に集約。
+
+    こうすると RP solver は preferred bend を持たなくなり、PV 方向 (現状
+    +Z forward) のみが bend を決定 → chain 圧縮で knee は素直に前方に
+    曲がる。
+    """
+    if cmds is None:
+        raise RuntimeError("Must run inside Maya.")
+    import math
+
+    def _project_on_line(hip, mid, ank):
+        se = [ank[i] - hip[i] for i in range(3)]
+        len2 = sum(a * a for a in se)
+        if len2 < 1e-9:
+            return list(mid)
+        t = sum((mid[i] - hip[i]) * se[i] for i in range(3)) / len2
+        return [hip[i] + t * se[i] for i in range(3)]
+
+    def _ws(n):
+        return cmds.xform(n, q=True, ws=True, t=True)
+
+    # 脚 chain 検出 (hero name: leg_L/knee_L/ankle_L)
+    pairs = []
+    for side in ("L", "R"):
+        hip = f"leg_{side}"
+        mid = f"knee_{side}"
+        ank = f"ankle_{side}"
+        if all(cmds.objExists(n) for n in (hip, mid, ank)):
+            pairs.append((hip, mid, ank))
+    if not pairs:
+        print(f"[{_PACKAGE}] neutralize_leg_bind_bend: leg/knee/ankle "
+              "chain 未検出 → skip")
+        return 0
+
+    # 補正前の offset 記録
+    for hip, mid, ank in pairs:
+        hp, mp, ap = _ws(hip), _ws(mid), _ws(ank)
+        proj = _project_on_line(hp, mp, ap)
+        offset = math.sqrt(sum((mp[i] - proj[i]) ** 2 for i in range(3)))
+        print(f"[{_PACKAGE}] {mid} bind offset from hip-ankle line: "
+              f"{offset:.3f} unit")
+
+    # skinCluster moveJointsMode 有効化 (bindPreMatrix 自動更新)
+    skc_list = cmds.ls(type="skinCluster") or []
+    for sc in skc_list:
+        try:
+            cmds.skinCluster(sc, e=True, moveJointsMode=1)
+        except Exception:
+            pass
+
+    frozen_joints = []
+    for hip, mid, ank in pairs:
+        ankle_save = _ws(ank)
+        proj = _project_on_line(_ws(hip), _ws(mid), ankle_save)
+        cmds.xform(mid, ws=True, t=proj)
+        # ankle は mid の子なので追従してしまう → world 位置を強制復元
+        cmds.xform(ank, ws=True, t=ankle_save)
+        frozen_joints.extend([hip, mid, ank])
+
+    # 新 bind を jointOrient に集約 (rotate=0 化)
+    freeze_joint_rotations(frozen_joints)
+
+    for sc in skc_list:
+        try:
+            cmds.skinCluster(sc, e=True, moveJointsMode=0)
+        except Exception:
+            pass
+
+    # 補正後確認
+    for hip, mid, ank in pairs:
+        hp, mp, ap = _ws(hip), _ws(mid), _ws(ank)
+        proj = _project_on_line(hp, mp, ap)
+        offset = math.sqrt(sum((mp[i] - proj[i]) ** 2 for i in range(3)))
+        print(f"[{_PACKAGE}] {mid} 補正後 offset: {offset:.4f} unit")
+
+    return len(pairs)
+
+
 def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     """FBX 直後の状態から完全 rig setup を 1 コマンドで実行。
     1. namespace 除去
@@ -2523,16 +2742,34 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
         _pw_span(5, 12); _pw_sub(0, "Freeze joint rotations...")
         freeze_joint_rotations()
 
-        # Step 2.6: L → R 骨対称化 (12-15%)
+        # Step 2.6: L → R 骨対称化 (12-14%)
         # MMD FBX は L/R で local axis が非対称なことがあり、両肩の同一
         # rotateX で片腕上がって片腕下がる、といった rig 不能状態になる。
         # mirrorJoint (mirrorBehavior=True) で L chain を正しく mirror し
         # R chain の jointOrient/translate に転写して対称化する。
-        _pw_span(12, 15); _pw_sub(0, "Symmetrize L->R bones...")
+        _pw_span(12, 14); _pw_sub(0, "Symmetrize L->R bones...")
         try:
             symmetrize_bones_L_to_R()
         except Exception as _sym_exc:
             cmds.warning(f"[attach_ctrls] symmetrize_bones failed (continue): {_sym_exc}")
+
+        # Step 2.7: legD 系削除 + skin weight 移送 (14-15%)
+        # MMD の "D" (Direct/Displacement) 系 leg bone は attach_ctrls の
+        # rig にとって不要で、IK 挙動と干渉する。main leg bone に weight を
+        # 移送してから削除する。
+        _pw_span(14, 15); _pw_sub(0, "Merge legD -> leg...")
+        try:
+            merge_legD_into_leg()
+        except Exception as _md_exc:
+            cmds.warning(f"[attach_ctrls] merge_legD_into_leg failed (continue): {_md_exc}")
+
+        # Step 2.8: (無効化) knee を hip-ankle 直線に射影
+        # 副作用 (chain が rigid になり IK が bend しない) が判明したため
+        # 無効化。legD 削除だけで Bug 2 が解決するか先に検証する。
+        # try:
+        #     neutralize_leg_bind_bend()
+        # except Exception as _bend_exc:
+        #     cmds.warning(f"[attach_ctrls] neutralize failed (continue): {_bend_exc}")
 
         # Step 3: cleanup (15-25%)
         _pw_span(15, 25); _pw_sub(0, "Delete unnecessary nodes...")
