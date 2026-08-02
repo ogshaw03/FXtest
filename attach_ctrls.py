@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.24"
+__version__ = "0.9.25"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2258,6 +2258,14 @@ def _create_twist_segments(parent, child, count=3, prefix=None, side=None):
         try:
             cmds.select(parent, r=True)
             j = cmds.joint(n=name, p=pos)
+            # v0.9.25: cmds.joint(p=pos) は parent 選択下で pos を LOCAL
+            # として扱う挙動があり、parent に jointOrient がある場合 twist
+            # bone が期待位置から 10+ unit ズレる (PLAIN-MODEL scout 発見)。
+            # WS で強制配置してズレを消す。
+            try:
+                cmds.xform(j, ws=True, t=pos)
+            except Exception:
+                pass
             # 親 (parent) の jointOrient を継承しつつ、rotate=0 にリセット
             for a in ("jointOrientX", "jointOrientY", "jointOrientZ"):
                 try:
