@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.19"
+__version__ = "0.9.20"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -994,6 +994,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         try: cmds.setAttr(j + ".drawStyle", 2)
         except Exception: pass
 
+    # (probe removed)
     # --- 2. IK handle on CLEAN chain ---
     # v0.9.0 の freeze_joint_rotations で rotate=0 になっているので RP solver
     # は bind pose を曖昧と判定せず chain を perturb しない (spa fix 不要)。
@@ -1036,6 +1037,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         _rewrite_flat_horizontal(ik_ctl, end_ws, ik_size, _make_flat_box_curve,
                                   x_ratio=1.4, z_ratio=1.6, ground_y=end_ws[1])
 
+    # (probe removed)
     # --- 4. Pole vector ctl (diamond 形状で目立たせる) ---
     pv_ctl = _make_diamond_curve(label + "_PV_ctl", scale=pv_size)
     # PV は通常 side 色より少し変えて識別性を上げる (light green vs light blue/rose)
@@ -1143,6 +1145,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     rev = cmds.createNode("reverse", n=label + "_ikfk_rev")
     cmds.connectAttr(ui_host + ".IK_FK", rev + ".inputX")
 
+    # (probe removed)
     # --- 7. Blend original hero joints between IK chain and FK chain ---
     # v0.9.13 Bug 1: 従来は 2-source `orientConstraint` mo=True で blend したが、
     # Maya の orientConstraint は per-target offset を持たず top-level 単一
@@ -1184,6 +1187,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     # v0.9.12: mGear tag (`_tag_mgear_ctl` / ctl_role / uiHost / match_ref /
     # _mth joint dup) は撤去。自作 UI (snap ボタン / mirror_pose 関数) で対応。
 
+    # (probe removed)
     # --- 8. Pole vector constraint (orient blend 構築の後で張る) ---
     # 判定は world X 軸 (bone 軸) の acos で行う。start+mid+end 3 joint の合算 drift
     # を最小化する twist を選ぶ (FOOTROT scout 発見: start だけだと elbow/wrist の
@@ -1221,6 +1225,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     # (v0.9.12 Bug 1: poleVectorConstraint は step 4 で orient constraint
     #  より前に既に張られている。二重張りしない)
 
+    # (probe removed)
     # --- 8.5. Twist 自動補正 (RP solver plane flip 対策) ---
     # AUDIT #11: v0.9.0 の freeze_joint_rotations で bind pose が identity 化
     # された後、全 chain で twist=0° が最適解に収束する (実測)。73 候補 × 4
@@ -1264,6 +1269,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
           f"(total drift {final_total:.1f}°, per-joint: "
           f"{ {k.split('|')[-1]: round(v,1) for k,v in final_per_j.items()} })")
 
+    # (probe removed)
     # --- 8.7. Stretch (ui_host.stretch attr で ON/OFF blend) ---
     # 標準 IK stretch: chain root ↔ IK ctl の距離が rest_len を超えたら
     # 各 bone の translate をスケール。stretch attr で ON/OFF blend。
@@ -1352,8 +1358,24 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
             all_desc = cmds.listRelatives(start, ad=True, type="joint") or []
             end_desc = set(cmds.listRelatives(end, ad=True, type="joint") or [])
             hero_bones = [j for j in all_desc if j not in end_desc]
+            # v0.9.20 リバースフット回帰対策: MMD の D (Direct) 系 bone は
+            # waistcancel_L 経由の hidden constraint を持ち、translate を直接
+            # 接続で置き換えると constraint が壊れて chain が world 座標系で
+            # jump する (ankle_L Y=8.85 → 65.01 現象)。dummy_/shadow_/D 系
+            # bone は stretch 対象から除外する。skinning は twist bones で
+            # 十分カバーされる想定。
+            def _is_d_family(name):
+                s = name.split("|")[-1].split(":")[-1].lower()
+                if s.startswith("dummy_") or s.startswith("shadow_"):
+                    return True
+                for tok in ("legd", "kneed", "ankled", "toed", "footd"):
+                    if tok in s:
+                        return True
+                return False
             for h in hero_bones:
                 if not cmds.objExists(h):
+                    continue
+                if _is_d_family(h):
                     continue
                 try:
                     rest_h = cmds.getAttr(h + ".translate")[0]
@@ -1400,6 +1422,7 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     except Exception as exc:
         cmds.warning(f"[attach_ctrls] stretch setup failed for {label}: {exc}")
 
+    # (probe removed)
     # --- 8. Visibility (UI host の ikVis/fkVis で明示制御) ---
     # (AUDIT #14: setAttr(ik_ctl.v, lock=False) は dead code だったので削除)
     try:
@@ -1607,8 +1630,21 @@ def _detect_foot_landmarks(ankle_joint, toe_joint):
     #    (a) ankle 以下の大まかフィルタ (装飾 vertex 除去のため必要)
     below = [v for v in candidates if v[1] < ankle_pos[1]]
     if not below:
-        below = candidates
+        # v0.9.20 リバースフット robustness: candidates に ankle 以下の vertex
+        # が 1 個も無い場合、スキニング破綻 (e.g. 上半身 vertex が ankle_L に
+        # 誤って高い weight を持っている) → 検出失敗として fallback に委ねる。
+        print(f"[{_PACKAGE}] foot landmarks: no verts below ankle ({ankle_pos[1]:.2f}), "
+              f"skinning anomaly; fall back to geometric approximation")
+        return None
     ground_y = min(v[1] for v in below)
+    # ground_y は ankle より十分下 (少なくとも bone 長の 20% 以上) であるべき。
+    # 上に来ている場合はサニティ違反 → fallback に委ねる。
+    toe_dist = ((ankle_pos[0]-toe_pos[0])**2 + (ankle_pos[1]-toe_pos[1])**2
+                + (ankle_pos[2]-toe_pos[2])**2) ** 0.5
+    if ankle_pos[1] - ground_y < toe_dist * 0.2:
+        print(f"[{_PACKAGE}] foot landmarks: ground_y={ground_y:.2f} too close to ankle "
+              f"Y={ankle_pos[1]:.2f} (diff < 20% of {toe_dist:.2f}) → fallback")
+        return None
 
     #    (b) 床帯厳格フィルタ: ground から ankle Y までの下 25% 帯のみを heel/tip 判定に使う。
     #        これで装飾骨 (後方バルジ Y=3.6) が heel と誤判定される問題を回避。
