@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.20"
+__version__ = "0.9.21"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -926,6 +926,13 @@ def _dup_hero_joint(orig, suffix, new_parent=None):
     # rotate を再度 0 に (jointOrient にセットしたので)
     try: cmds.setAttr(n + ".rotate", 0, 0, 0, type="double3")
     except Exception: pass
+    # v0.9.21: preferredAngle も copy (RP solver bend hint 保持)
+    for a in ("preferredAngleX", "preferredAngleY", "preferredAngleZ"):
+        try:
+            v = cmds.getAttr(orig + "." + a)
+            cmds.setAttr(n + "." + a, v)
+        except Exception:
+            pass
     # visual radius を hero と同じに (0.016 想定)
     try:
         cmds.setAttr(n + ".radius", cmds.getAttr(orig + ".radius"))
@@ -2752,6 +2759,19 @@ def neutralize_leg_bind_bend():
         except Exception:
             pass
 
+    # v0.9.21: knee が直線 bind になった状態で RP solver に bend 方向ヒント
+    # を与える。preferredAngleZ に小さな値 (5°) を設定して「膝は Z 軸周りに
+    # 前方向に曲がる」ことを solver に伝える。値が小さいので visible pose
+    # 変化はほぼゼロだが、waist drop / IK ctl 移動時に solver が正しく
+    # 前方 bend を選ぶ。
+    for hip, mid, ank in pairs:
+        try:
+            cmds.setAttr(mid + ".preferredAngleX", 0)
+            cmds.setAttr(mid + ".preferredAngleY", 0)
+            cmds.setAttr(mid + ".preferredAngleZ", 5.0)
+        except Exception:
+            pass
+
     # 補正後確認
     for hip, mid, ank in pairs:
         hp, mp, ap = _ws(hip), _ws(mid), _ws(ank)
@@ -2821,13 +2841,17 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
         # except Exception as _md_exc:
         #     cmds.warning(f"[attach_ctrls] merge_legD_into_leg failed (continue): {_md_exc}")
 
-        # Step 2.8: (無効化) knee を hip-ankle 直線に射影
-        # 副作用 (chain が rigid になり IK が bend しない) が判明したため
-        # 無効化。legD 削除だけで Bug 2 が解決するか先に検証する。
-        # try:
-        #     neutralize_leg_bind_bend()
-        # except Exception as _bend_exc:
-        #     cmds.warning(f"[attach_ctrls] neutralize failed (continue): {_bend_exc}")
+        # Step 2.8: knee を hip-ankle 直線に射影 (Bug 2 根本対策)
+        # v0.9.17 で有効化した際 chain が rigid になる副作用があったが、
+        # 真因は setup_ik_fk の stretch loop が D-family bone の translate
+        # を override して waistcancel_L の hidden constraint を壊し ankle
+        # を 56 unit jump させていたこと (v0.9.20 で D-family 除外して解消)。
+        # v0.9.21 で再有効化して neutralize が IK bend を natural にする
+        # か検証する。
+        try:
+            neutralize_leg_bind_bend()
+        except Exception as _bend_exc:
+            cmds.warning(f"[attach_ctrls] neutralize failed (continue): {_bend_exc}")
 
         # Step 3: cleanup (15-25%)
         _pw_span(15, 25); _pw_sub(0, "Delete unnecessary nodes...")
