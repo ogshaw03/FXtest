@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.28"
+__version__ = "0.9.29"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2289,89 +2289,215 @@ def _create_twist_segments(parent, child, count=3, prefix=None, side=None):
     return created
 
 
-def setup_twist_wiring():
-    """L/R arm/forearm の twist master bone を wrist から自動駆動する。
+def _transfer_parent_weight_to_twist(parent, twist_bones, mesh_shape,
+                                       skc, driver_axis=(1.0, 0.0, 0.0)):
+    """parent bone の skin weight を twist_bones に bone 軸沿いで proportional 転送。
 
-    v0.9.28 (ユーザ報告での訂正): Nekotatune 等の MMD モデルでは
-    `arm_twist_1/2/3_L` `hand_twist_1/2/3_L` は **装飾骨** (sleeve/armor 等
-    の overlay) で命名だけ "_twist_" が付いている。実際の twist bone は
-    master `arm_twist_L` `hand_twist_L` の 1 本のみ。よって:
+    各 vertex について:
+      1. parent への weight を取得
+      2. weight > 閾値 なら、vertex を parent-child (bone) 軸に射影して t 値取得
+      3. t を twist_bones の位置範囲 [0..1] にマップ、隣接 2 bone 間で線形補間
+      4. parent の weight を interpolated fractions で twist_bones に加算、
+         parent の weight は 0 に
 
-      * 数字付き `arm_twist_1/2/3_L` は wiring 対象外 (装飾を勝手に回転
-        させると視覚的におかしくなる、v0.9.27 リボン反転の真因)
-      * `arm_twist_L` (上腕捻り master) を wrist.rotateX × 0.5 で駆動
-      * `hand_twist_L` (前腕捻り master) を wrist.rotateX × 1.0 で駆動
-        (前腕は wrist と一体で捻れる想定)
+    parent の weight が全 vertex で ≒ 0 (skin されていない) なら何もしない
+    (Nekotatune のように既存 twist 系が weight を持つケース)。
 
-    plain model (master 骨が無い) 対応: master が存在しない場合は
-    `_create_twist_segments` で 1 本作成し、同じく wrist から駆動する。
+    Returns: 転送した vertex 数。0 なら parent skinning 無しでスキップ。
+    """
+    if cmds is None or not twist_bones:
+        return 0
+    infs = cmds.skinCluster(skc, q=True, inf=True) or []
+    if parent not in infs:
+        return 0
+    # twist_bones を influence に追加 (未含のみ)
+    for tb in twist_bones:
+        if tb not in infs:
+            try:
+                cmds.skinCluster(skc, e=True, ai=tb,
+                                  lockWeights=False, weight=0)
+            except Exception:
+                pass
 
-    既存 rotate 接続がある master は skip (他 driver との衝突回避)。
+    n_verts = cmds.polyEvaluate(mesh_shape, v=True)
+    if not isinstance(n_verts, int):
+        return 0
+
+    p_pos = cmds.xform(parent, q=True, ws=True, t=True)
+    # twist bones を parent → child 軸沿いで sort、t 値 (fraction) を計算
+    tb_info = []
+    for tb in twist_bones:
+        tb_pos = cmds.xform(tb, q=True, ws=True, t=True)
+        vec = [tb_pos[i] - p_pos[i] for i in range(3)]
+        # child 方向の長さで正規化するため、driver_axis のスケールで t 取る
+        # 実際は twist_bone 位置は既に parent→child 直線上なので、単純に
+        # parent からの距離で fraction を計算 (max=1)
+        d = sum(v * v for v in vec) ** 0.5
+        tb_info.append((tb, tb_pos, d))
+    # d 順にソート (parent から近い順)
+    tb_info.sort(key=lambda x: x[2])
+    max_d = tb_info[-1][2] if tb_info else 1.0
+    if max_d < 1e-4:
+        return 0
+
+    n_transferred = 0
+    for vi in range(n_verts):
+        vtx = f"{mesh_shape}.vtx[{vi}]"
+        try:
+            pw = cmds.skinPercent(skc, vtx, transform=parent, q=True) or 0
+        except Exception:
+            continue
+        if pw < 1e-4:
+            continue
+        # vertex 位置
+        try:
+            vp = cmds.pointPosition(vtx, w=True)
+        except Exception:
+            continue
+        vec = [vp[i] - p_pos[i] for i in range(3)]
+        d_v = sum(v * v for v in vec) ** 0.5
+        t = min(1.0, max(0.0, d_v / max_d))
+        # 隣接 2 twist bone 間で線形補間
+        # tb_info の d 位置は 0..max_d、tb i の fraction = i_d / max_d
+        # 適切な区間 [i, i+1] を探す
+        fracs = [(tbi[2] / max_d) for tbi in tb_info]
+        weights_split = {}
+        placed = False
+        for i in range(len(fracs) - 1):
+            if fracs[i] <= t <= fracs[i + 1]:
+                span = fracs[i + 1] - fracs[i]
+                if span < 1e-6:
+                    weights_split[tb_info[i][0]] = 1.0
+                else:
+                    a = (t - fracs[i]) / span
+                    weights_split[tb_info[i][0]] = 1.0 - a
+                    weights_split[tb_info[i + 1][0]] = a
+                placed = True
+                break
+        if not placed:
+            # 範囲外 (parent 側 or child 端側): 最近傍 1 本に集中
+            if t < fracs[0]:
+                weights_split[tb_info[0][0]] = 1.0
+            else:
+                weights_split[tb_info[-1][0]] = 1.0
+
+        # skinPercent で weight 更新: parent → 0、各 tb に pw * frac を追加
+        try:
+            tv = [(parent, 0.0)]
+            for tb, frac in weights_split.items():
+                # 既存の tb weight に加算するため事前取得
+                cur = cmds.skinPercent(skc, vtx, transform=tb, q=True) or 0
+                tv.append((tb, cur + pw * frac))
+            cmds.skinPercent(skc, vtx, transformValue=tv)
+            n_transferred += 1
+        except Exception:
+            pass
+
+    return n_transferred
+
+
+def setup_twist_wiring(transfer_weights=False):
+    """L/R arm/forearm にツール独自の twist chain を追加して wrist 捻り自動分配。
+
+    v0.9.29 完全独立化: モデル固有の "_twist_" 命名 bone (arm_twist_L,
+    hand_twist_1/2/3_L, dummy_/shadow_ 等) は装飾か実 twist か判定不能な
+    ので **一切触らず**、ツール専用命名 `<parent>_tt_<N>_<side>` の chain
+    を新規作成する。
+
+    処理:
+      1. arm 系 (arm_L→elbow_L) / hand 系 (elbow_L→wrist_L) 各 chain で
+         `<parent>_tt_1/2/3_<side>` を parent 子として直線配置
+      2. `wrist_<side>.rotateX × (idx/(N+1))` で wire (0.25/0.50/0.75 分配)
+      3. transfer_weights=True の場合: parent (arm_L / elbow_L) に既存
+         skin weight があれば、bone 軸沿いで proportional に tool bones へ
+         転送。**per-vertex 処理で 86000+ verts なら数分掛かる**ため default
+         は False (wire だけ張る)。plain model で mesh 変形を活かしたい
+         場合のみ True で呼ぶ。
+
+    tool bones が weight を持たない場合 (transfer skip) は mesh 変形に
+    寄与しないが、wire は張られるため manually skin することで有効化可能。
     """
     if cmds is None:
         return 0
 
-    # (chain_label, parent_joint, child_joint, master_base_name, fraction)
+    # (chain_label, parent_joint, child_joint)
     targets = [
-        ("arm_L",   "arm_L",   "elbow_L", "arm_twist",  0.5),  # 上腕: 半分
-        ("arm_R",   "arm_R",   "elbow_R", "arm_twist",  0.5),
-        ("hand_L",  "elbow_L", "wrist_L", "hand_twist", 1.0),  # 前腕: 全量
-        ("hand_R",  "elbow_R", "wrist_R", "hand_twist", 1.0),
+        ("arm_L",   "arm_L",   "elbow_L"),
+        ("arm_R",   "arm_R",   "elbow_R"),
+        ("hand_L",  "elbow_L", "wrist_L"),
+        ("hand_R",  "elbow_R", "wrist_R"),
     ]
 
     n_wired = 0
     n_created = 0
-    for label, parent, child, base, frac in targets:
+    n_transferred_total = 0
+    count = 3  # 分節数
+
+    # skinCluster / mesh 対応取得
+    skc_list = cmds.ls(type="skinCluster") or []
+    sc_mesh = {}
+    for sc in skc_list:
+        geo = cmds.skinCluster(sc, q=True, g=True) or []
+        if geo:
+            sc_mesh[sc] = geo[0]
+
+    for label, parent, child in targets:
         if not (cmds.objExists(parent) and cmds.objExists(child)):
             continue
         side = _detect_side(parent)
-        # master (arm_twist_L / hand_twist_L) を探す
-        master = f"{base}_{side}"
-        if not cmds.objExists(master):
-            # 無ければ 1 本作成 (parent と child の中間)
-            new = _create_twist_segments(parent, child, count=1,
-                                          prefix=base, side=side)
-            if new:
-                # count=1 だと `<prefix>_1_<side>` になるので rename
-                created_name = new[0]
-                target_name = f"{base}_{side}"
-                try:
-                    if cmds.objExists(created_name) and \
-                            created_name != target_name and \
-                            not cmds.objExists(target_name):
-                        master = cmds.rename(created_name, target_name)
-                    else:
-                        master = created_name
-                except Exception:
-                    master = created_name
-                n_created += 1
-                print(f"[{_PACKAGE}] twist: created master {master} for {label}")
-            else:
-                continue
-
-        # arm_twist は forearm の twist ではなく、child は elbow なので upper
-        # arm 自身の twist を得るには wrist を driver にする方が自然。
-        # hand_twist の driver も wrist (親関係で elbow→wrist)。
-        # 統一して wrist_<side>.rotateX を driver とする。
         wrist = f"wrist_{side}"
         driver = wrist if cmds.objExists(wrist) else child
 
-        try:
-            dst = master + ".rotateX"
-            cur = cmds.listConnections(dst, s=True, d=False, p=True) or []
-            if cur:
-                continue  # 既存 driver あり → skip
-            md = cmds.createNode("multiplyDivide", n=master + "_twist_mul")
-            cmds.setAttr(md + ".input2X", frac)
-            cmds.connectAttr(driver + ".rotateX", md + ".input1X")
-            cmds.connectAttr(md + ".outputX", dst, f=True)
-            n_wired += 1
-        except Exception as exc:
-            cmds.warning(f"[{_PACKAGE}] twist wire {driver}→{master} failed: {exc}")
+        # tool 専用 chain 作成 (prefix "_tt" で既存 "_twist_" と衝突回避)
+        prefix = f"{parent}_tt"
+        segs = []
+        already_exist_count = 0
+        for i in range(1, count + 1):
+            name = f"{prefix}_{i}_{side}"
+            if cmds.objExists(name):
+                segs.append(name)
+                already_exist_count += 1
+        if len(segs) < count:
+            # 不足分を作成
+            new = _create_twist_segments(parent, child, count=count,
+                                          prefix=prefix, side=side)
+            segs = new
+            n_created += len(new) - already_exist_count
 
-    print(f"[{_PACKAGE}] setup_twist_wiring: {n_wired} master(s) wired, "
-          f"{n_created} joint(s) newly created "
-          f"(numbered segments are treated as decoration and left untouched)")
+        # wire
+        for idx, seg in enumerate(segs, start=1):
+            frac = idx / (count + 1)
+            try:
+                dst = seg + ".rotateX"
+                cur = cmds.listConnections(dst, s=True, d=False, p=True) or []
+                if cur:
+                    continue
+                md = cmds.createNode("multiplyDivide", n=seg + "_tt_mul")
+                cmds.setAttr(md + ".input2X", frac)
+                cmds.connectAttr(driver + ".rotateX", md + ".input1X")
+                cmds.connectAttr(md + ".outputX", dst, f=True)
+                n_wired += 1
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] tt wire {driver}→{seg} failed: {exc}")
+
+        # weight 転送: opt-in で default OFF (per-vertex 遅い)
+        if transfer_weights:
+            for sc, mesh in sc_mesh.items():
+                infs = cmds.skinCluster(sc, q=True, inf=True) or []
+                if parent not in infs:
+                    continue
+                try:
+                    nt = _transfer_parent_weight_to_twist(parent, segs, mesh, sc)
+                    if nt > 0:
+                        n_transferred_total += nt
+                        print(f"[{_PACKAGE}] tt weight: {label} → transferred "
+                              f"{nt} verts from {parent} to tool twist bones")
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] tt weight transfer {parent} failed: {exc}")
+
+    print(f"[{_PACKAGE}] setup_twist_wiring: {n_wired} tool twist wired, "
+          f"{n_created} newly created, {n_transferred_total} vertex weights "
+          f"transferred (existing model _twist_ bones untouched)")
     return n_wired
 
 
