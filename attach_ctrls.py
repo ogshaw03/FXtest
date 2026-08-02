@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.25"
+__version__ = "0.9.26"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2339,10 +2339,16 @@ def setup_twist_wiring():
             print(f"[{_PACKAGE}] twist: created {len(segs)} joint(s) "
                   f"for {label} ({parent}→{child})")
 
-        # driver 決定: master (arm_twist_L 等) 優先、無ければ child (child の
-        # 局所 rotateX = 捻り軸) を採用
-        master = f"{base}_{side}"
-        driver = master if cmds.objExists(master) else child
+        # v0.9.26: driver は常に child joint (wrist for hand_twist chain,
+        # elbow for arm_twist chain) の rotateX を採用。以前は master
+        # (arm_twist_L / hand_twist_L) 優先だったが、master は MMD 慣習で
+        # ユーザが手動制御する bone で自動駆動されていない → user が wrist
+        # を捻っても master=0 のまま segments も動かず forearm mesh が潰れる
+        # 症状 (ユーザ報告)。child の rotateX (bone aim 軸 = 捻り軸) を
+        # driver にすれば wrist 回転が自動で forearm twist bones に分配
+        # 伝播して mesh がスムーズに変形する。master 自体は skinCluster に
+        # weight を持っていれば独立回転して追加補正できる (ユーザ手動)。
+        driver = child
 
         max_i = len(segs)
         for idx, seg in enumerate(segs, start=1):
