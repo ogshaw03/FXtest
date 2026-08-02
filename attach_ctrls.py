@@ -1059,21 +1059,10 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         base_offset = chain_len * (0.60 if is_leg_pv else 0.71)
     else:
         base_offset = pv_offset
-    # T-pose straight chain の fallback: 腕は後方 (-Z), 脚は前方 (+Z)。
-    # v0.9.14 Bug 2: 脚は Nekotatune の bind knock-knee (knee X が hip-ankle
-    # 直線から内側 -1.64 offset) の bend 方向を PV plane に反映させる必要が
-    # ある。BUG2-DIAG 実測: PV を hip **内側** に置くと knee X が幾何理想
-    # (bind X 近傍) に着地、外側 に置くと大股に飛ぶ。よって leg_L は -X (体
-    # 内側)、leg_R は +X (体内側) 混合 + 前方 Z を fallback にする。Z 成分
-    # (0.3) は屈曲時に knee を前へ導く生理的な動作を維持するため。
+    # T-pose straight chain の fallback: 腕は後方 (-Z), 脚は前方 (+Z)
     lo = label.lower()
     if "leg" in lo or "knee" in lo or "ankle" in lo:
-        if side == "L" or lo.endswith("_l") or "_l_" in lo:
-            fallback_pv = [-0.5, 0, +0.85]  # 内側 X (弱) + 前方 Z (主体) 、内側 20 unit 相当
-        elif side == "R" or lo.endswith("_r") or "_r_" in lo:
-            fallback_pv = [+0.5, 0, +0.85]
-        else:
-            fallback_pv = [0, 0, +1]       # 中央 (C) は前方のみ
+        fallback_pv = [0, 0, +1]
     else:
         fallback_pv = [0, 0, -1]
     pv_pos = _compute_pv_position(start_pos, mid_pos, end_pos,
@@ -2392,6 +2381,114 @@ def freeze_joint_rotations(joints=None):
     return n_ok
 
 
+def symmetrize_bones_L_to_R():
+    """L 側 chain の bone を mirrorJoint (mirrorBehavior=True) で正しく
+    ミラーし、R 側 chain の jointOrient / translate に転写する。
+
+    問題: MMD 由来 FBX の骨は L と R で local axis の向きが一致していない
+    ことがあり、両肩を同時に `rotateX=30` しても片腕が上がって片腕が下がる、
+    ような "非ミラー" 挙動になる (jointOrient が幾何的に対称でない)。
+    freeze_joint_rotations は rotate → jointOrient に集約するだけで、
+    jointOrient 自体の非対称は解消しない。
+
+    対処: L root chain を duplicate → `cmds.mirrorJoint(mirrorYZ=True,
+    mirrorBehavior=True)` で正しく mirror されたコピーを作り、DFS 順序
+    (子は名前ソート) で R chain に jointOrient/translate をコピー。
+    これで同一 rotate 入力が左右で対称モーションを生む状態になる。
+
+    実測 (Nekotatune): before は arm.rotateX=30 で L wrist dY=+15.6 に
+    対し R wrist dY=-10.4 (逆)、after は L=+15.6 / R=+15.6 (共に上昇、
+    X は対称) と完全に正常化。
+
+    Returns:
+        (n_transferred, n_l_roots): 転写した joint 数と処理した L root 数。
+    """
+    if cmds is None:
+        raise RuntimeError("Must run inside Maya.")
+
+    def _dfs(root):
+        out = [root]
+        kids = cmds.listRelatives(root, c=True, type="joint", f=False) or []
+        for k in sorted(kids):
+            out.extend(_dfs(k))
+        return out
+
+    # L 側最上位 root (親が L でない L joint) を全収集
+    l_roots = []
+    for j in cmds.ls(type="joint") or []:
+        if _detect_side(j) != "L":
+            continue
+        parent = cmds.listRelatives(j, p=True, type="joint") or []
+        if not parent or _detect_side(parent[0]) != "L":
+            l_roots.append(j)
+
+    n_transferred = 0
+    n_missing_r = 0
+    for l_root in l_roots:
+        r_root = _opposite_side_name(l_root)
+        if not r_root or not cmds.objExists(r_root):
+            n_missing_r += 1
+            continue
+
+        # L root を duplicate → mirrorJoint で mirror behavior 付き複製
+        try:
+            dup = cmds.duplicate(l_root, rr=True, rc=True)[0]
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] symmetrize duplicate({l_root}) failed: {exc}")
+            continue
+        try:
+            mirrored = cmds.mirrorJoint(dup, mirrorYZ=True,
+                                        mirrorBehavior=True,
+                                        searchReplace=("_L", "_MTMP"))
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] mirrorJoint({dup}) failed: {exc}")
+            if cmds.objExists(dup):
+                cmds.delete(dup)
+            continue
+
+        # mirrored[0] = mirror root (mirrorJoint 仕様: 引数 joint の mirror が先頭)
+        mir_root = mirrored[0] if mirrored else None
+        if not mir_root or not cmds.objExists(mir_root):
+            if cmds.objExists(dup):
+                cmds.delete(dup)
+            continue
+
+        # DFS 同期 (子は名前ソート、L/mir/R とも同じ命名規則なので順序一致)
+        mir_list = _dfs(mir_root)
+        r_list = _dfs(r_root)
+        if len(mir_list) != len(r_list):
+            cmds.warning(f"[{_PACKAGE}] symmetrize({l_root}): mir({len(mir_list)}) "
+                         f"vs R({len(r_list)}) 数不一致 → skip")
+            if cmds.objExists(mir_root):
+                cmds.delete(mir_root)
+            if cmds.objExists(dup):
+                cmds.delete(dup)
+            continue
+
+        for m, r in zip(mir_list, r_list):
+            try:
+                jo = cmds.getAttr(m + ".jointOrient")[0]
+                t = cmds.getAttr(m + ".translate")[0]
+                cmds.setAttr(r + ".jointOrient",
+                             jo[0], jo[1], jo[2], type="double3")
+                cmds.setAttr(r + ".translate",
+                             t[0], t[1], t[2], type="double3")
+                cmds.setAttr(r + ".rotate", 0, 0, 0, type="double3")
+                n_transferred += 1
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] transfer {m} → {r} failed: {exc}")
+
+        # cleanup: mirror hierarchy + duplicate をどちらも削除
+        if cmds.objExists(mir_root):
+            cmds.delete(mir_root)
+        if cmds.objExists(dup):
+            cmds.delete(dup)
+
+    print(f"[{_PACKAGE}] symmetrize_bones_L_to_R: {n_transferred} joint(s) "
+          f"転写、L roots={len(l_roots)} (R 無し={n_missing_r})")
+    return n_transferred, len(l_roots)
+
+
 def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
     """FBX 直後の状態から完全 rig setup を 1 コマンドで実行。
     1. namespace 除去
@@ -2422,9 +2519,20 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
             fbx_renamer.remove_all_namespaces()
             fbx_renamer.rename_all_joints()
 
-        # Step 2.5: freeze rotate to jointOrient (5-15%)
-        _pw_span(5, 15); _pw_sub(0, "Freeze joint rotations...")
+        # Step 2.5: freeze rotate to jointOrient (5-12%)
+        _pw_span(5, 12); _pw_sub(0, "Freeze joint rotations...")
         freeze_joint_rotations()
+
+        # Step 2.6: L → R 骨対称化 (12-15%)
+        # MMD FBX は L/R で local axis が非対称なことがあり、両肩の同一
+        # rotateX で片腕上がって片腕下がる、といった rig 不能状態になる。
+        # mirrorJoint (mirrorBehavior=True) で L chain を正しく mirror し
+        # R chain の jointOrient/translate に転写して対称化する。
+        _pw_span(12, 15); _pw_sub(0, "Symmetrize L->R bones...")
+        try:
+            symmetrize_bones_L_to_R()
+        except Exception as _sym_exc:
+            cmds.warning(f"[attach_ctrls] symmetrize_bones failed (continue): {_sym_exc}")
 
         # Step 3: cleanup (15-25%)
         _pw_span(15, 25); _pw_sub(0, "Delete unnecessary nodes...")
