@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.18"
+__version__ = "0.9.19"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2422,67 +2422,85 @@ def symmetrize_bones_L_to_R():
         if not parent or _detect_side(parent[0]) != "L":
             l_roots.append(j)
 
+    # v0.9.19 mesh 破綻対策: R 骨の translate/jointOrient を変更する前に
+    # 全 skinCluster に moveJointsMode=1 を立てて bindPreMatrix を自動更新
+    # させる。これで骨の world 位置変化を mesh が追従しなくなる。
+    skc_list = cmds.ls(type="skinCluster") or []
+    for sc in skc_list:
+        try:
+            cmds.skinCluster(sc, e=True, moveJointsMode=1)
+        except Exception:
+            pass
+
     n_transferred = 0
     n_missing_r = 0
-    for l_root in l_roots:
-        r_root = _opposite_side_name(l_root)
-        if not r_root or not cmds.objExists(r_root):
-            n_missing_r += 1
-            continue
+    try:
+        for l_root in l_roots:
+            r_root = _opposite_side_name(l_root)
+            if not r_root or not cmds.objExists(r_root):
+                n_missing_r += 1
+                continue
 
-        # L root を duplicate → mirrorJoint で mirror behavior 付き複製
-        try:
-            dup = cmds.duplicate(l_root, rr=True, rc=True)[0]
-        except Exception as exc:
-            cmds.warning(f"[{_PACKAGE}] symmetrize duplicate({l_root}) failed: {exc}")
-            continue
-        try:
-            mirrored = cmds.mirrorJoint(dup, mirrorYZ=True,
-                                        mirrorBehavior=True,
-                                        searchReplace=("_L", "_MTMP"))
-        except Exception as exc:
-            cmds.warning(f"[{_PACKAGE}] mirrorJoint({dup}) failed: {exc}")
-            if cmds.objExists(dup):
-                cmds.delete(dup)
-            continue
+            # L root を duplicate → mirrorJoint で mirror behavior 付き複製
+            try:
+                dup = cmds.duplicate(l_root, rr=True, rc=True)[0]
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] symmetrize duplicate({l_root}) failed: {exc}")
+                continue
+            try:
+                mirrored = cmds.mirrorJoint(dup, mirrorYZ=True,
+                                            mirrorBehavior=True,
+                                            searchReplace=("_L", "_MTMP"))
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] mirrorJoint({dup}) failed: {exc}")
+                if cmds.objExists(dup):
+                    cmds.delete(dup)
+                continue
 
-        # mirrored[0] = mirror root (mirrorJoint 仕様: 引数 joint の mirror が先頭)
-        mir_root = mirrored[0] if mirrored else None
-        if not mir_root or not cmds.objExists(mir_root):
-            if cmds.objExists(dup):
-                cmds.delete(dup)
-            continue
+            # mirrored[0] = mirror root (mirrorJoint 仕様: 引数 joint の mirror が先頭)
+            mir_root = mirrored[0] if mirrored else None
+            if not mir_root or not cmds.objExists(mir_root):
+                if cmds.objExists(dup):
+                    cmds.delete(dup)
+                continue
 
-        # DFS 同期 (子は名前ソート、L/mir/R とも同じ命名規則なので順序一致)
-        mir_list = _dfs(mir_root)
-        r_list = _dfs(r_root)
-        if len(mir_list) != len(r_list):
-            cmds.warning(f"[{_PACKAGE}] symmetrize({l_root}): mir({len(mir_list)}) "
-                         f"vs R({len(r_list)}) 数不一致 → skip")
+            # DFS 同期 (子は名前ソート、L/mir/R とも同じ命名規則なので順序一致)
+            mir_list = _dfs(mir_root)
+            r_list = _dfs(r_root)
+            if len(mir_list) != len(r_list):
+                cmds.warning(f"[{_PACKAGE}] symmetrize({l_root}): mir({len(mir_list)}) "
+                             f"vs R({len(r_list)}) 数不一致 → skip")
+                if cmds.objExists(mir_root):
+                    cmds.delete(mir_root)
+                if cmds.objExists(dup):
+                    cmds.delete(dup)
+                continue
+
+            for m, r in zip(mir_list, r_list):
+                try:
+                    jo = cmds.getAttr(m + ".jointOrient")[0]
+                    t = cmds.getAttr(m + ".translate")[0]
+                    cmds.setAttr(r + ".jointOrient",
+                                 jo[0], jo[1], jo[2], type="double3")
+                    cmds.setAttr(r + ".translate",
+                                 t[0], t[1], t[2], type="double3")
+                    cmds.setAttr(r + ".rotate", 0, 0, 0, type="double3")
+                    n_transferred += 1
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] transfer {m} → {r} failed: {exc}")
+
+            # cleanup: mirror hierarchy + duplicate をどちらも削除
             if cmds.objExists(mir_root):
                 cmds.delete(mir_root)
             if cmds.objExists(dup):
                 cmds.delete(dup)
-            continue
-
-        for m, r in zip(mir_list, r_list):
+    finally:
+        # skinCluster の moveJointsMode を確実に戻す (例外時も)
+        for sc in skc_list:
             try:
-                jo = cmds.getAttr(m + ".jointOrient")[0]
-                t = cmds.getAttr(m + ".translate")[0]
-                cmds.setAttr(r + ".jointOrient",
-                             jo[0], jo[1], jo[2], type="double3")
-                cmds.setAttr(r + ".translate",
-                             t[0], t[1], t[2], type="double3")
-                cmds.setAttr(r + ".rotate", 0, 0, 0, type="double3")
-                n_transferred += 1
-            except Exception as exc:
-                cmds.warning(f"[{_PACKAGE}] transfer {m} → {r} failed: {exc}")
-
-        # cleanup: mirror hierarchy + duplicate をどちらも削除
-        if cmds.objExists(mir_root):
-            cmds.delete(mir_root)
-        if cmds.objExists(dup):
-            cmds.delete(dup)
+                cmds.skinCluster(sc, e=True, moveJointsMode=0)
+            except Exception:
+                pass
 
     print(f"[{_PACKAGE}] symmetrize_bones_L_to_R: {n_transferred} joint(s) "
           f"転写、L roots={len(l_roots)} (R 無し={n_missing_r})")
