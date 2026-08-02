@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.17"
+__version__ = "0.9.18"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2753,15 +2753,19 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
         except Exception as _sym_exc:
             cmds.warning(f"[attach_ctrls] symmetrize_bones failed (continue): {_sym_exc}")
 
-        # Step 2.7: legD 系削除 + skin weight 移送 (14-15%)
-        # MMD の "D" (Direct/Displacement) 系 leg bone は attach_ctrls の
-        # rig にとって不要で、IK 挙動と干渉する。main leg bone に weight を
-        # 移送してから削除する。
-        _pw_span(14, 15); _pw_sub(0, "Merge legD -> leg...")
-        try:
-            merge_legD_into_leg()
-        except Exception as _md_exc:
-            cmds.warning(f"[attach_ctrls] merge_legD_into_leg failed (continue): {_md_exc}")
+        # Step 2.7: (無効化) legD 系削除 + skin weight 移送
+        # v0.9.17 で有効化したが mesh 破綻が判明したため無効化。
+        # MMD の D (Direct/Displacement) bone は「mesh 用衛星骨」として
+        # waistcancel_L 経由の独自 constraint chain を持ち、animation で
+        # 起こる leg_L の変形から mesh を隔離する役割がある。単純に leg_L
+        # へ weight 移送すると IK 駆動の leg_L 変形が直接 mesh を歪めて
+        # 破綻する。関数は残置。有効化するには D bone の constraint 構造
+        # を保持したまま (または全 D chain を除去して MMD 設計外の rig を
+        # 覚悟して) 使う必要がある。
+        # try:
+        #     merge_legD_into_leg()
+        # except Exception as _md_exc:
+        #     cmds.warning(f"[attach_ctrls] merge_legD_into_leg failed (continue): {_md_exc}")
 
         # Step 2.8: (無効化) knee を hip-ankle 直線に射影
         # 副作用 (chain が rigid になり IK が bend しない) が判明したため
