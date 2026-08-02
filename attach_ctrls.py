@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.12"
+__version__ = "0.9.17"
 
 
 WINDOW = "attach_ctrlsWin"
