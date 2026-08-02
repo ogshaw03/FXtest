@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.21"
+__version__ = "0.9.22"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2759,11 +2759,15 @@ def neutralize_leg_bind_bend():
         except Exception:
             pass
 
-    # v0.9.21: knee が直線 bind になった状態で RP solver に bend 方向ヒント
-    # を与える。preferredAngleZ に小さな値 (5°) を設定して「膝は Z 軸周りに
-    # 前方向に曲がる」ことを solver に伝える。値が小さいので visible pose
-    # 変化はほぼゼロだが、waist drop / IK ctl 移動時に solver が正しく
-    # 前方 bend を選ぶ。
+    # v0.9.22 で試行した cmds.joint(oj="xyz") による chain 再オリエントは
+    # knee.jointOrient=(0,0,0) の clean 化に成功したが、primary X 軸が bone
+    # 方向 (aim) になったため FK ctl の rotateX が bend ではなく twist に
+    # なり functional_FK_leg テストが FAIL した。既存 FK convention と
+    # 噛み合わないため revert。preferredAngle だけで Bug 2 X drift は
+    # 十分小さいので現状で良しとする。将来 FK ctl 側の rotate axis
+    # convention を見直す場合に再検討。
+
+    # v0.9.21: knee に preferredAngleZ=5° を仕込む (RP solver bend 方向ヒント)。
     for hip, mid, ank in pairs:
         try:
             cmds.setAttr(mid + ".preferredAngleX", 0)
