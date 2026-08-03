@@ -3,7 +3,8 @@ __pycache__/
 *.pyo
 *.tmp_install
 
-# test artifacts (verification harness output)
+# test artifacts (verification harness output) — 全て再生成可能
+# v0.9.31 で diag/ フォルダに再編成、result JSON は tracked にしない。
 _test_result.json
 _test_run.py
 _test_full_setup_result.json
@@ -11,6 +12,27 @@ _bind_pose_drift.json
 _revfoot_result.json
 _waistfix_diag.py
 _waistfix_result.json
+
+# 全 diag script が書き出す result JSON (root と diag/ 両対応)
+_*_result.json
+diag/*_result.json
+diag/_*_result.json
+
+# 一時 PoC / audit / probe script (root 直下、_ prefix 付き)
+_audit*.py
+_behav*.py
+_bug2_*.py
+_diff*.py
+_dynpv*.py
+_kneebind*.py
+_plain*.py
+_regress*.py
+_spring*.py
+_sym*.py
+_tt_*.py
+_snap_precision*.py
+_mapping_test.py
+_test_write.*
 
 # Maya scene files (working artifacts)
 *.ma

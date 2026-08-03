@@ -15,7 +15,7 @@ import maya.mel as mel
 
 REPO = r"E:/OG_Tools/FXtest"
 FBX  = r"E:/OG_Tools/FXtest/Nekotatune_Path_mode_on.fbx"
-OUT  = r"E:/OG_Tools/FXtest/_test_full_setup_result.json"
+OUT  = r"E:/OG_Tools/FXtest/diag/_test_full_setup_result.json"
 
 sys.path.insert(0, REPO)
 

@@ -9,14 +9,14 @@ Repo: https://github.com/ogshaw03/FXtest
 ## クイック起動
 
 ```bash
-"C:/Program Files/Autodesk/Maya2023/bin/mayapy.exe" E:/OG_Tools/FXtest/_test_full_setup.py
+"C:/Program Files/Autodesk/Maya2023/bin/mayapy.exe" E:/OG_Tools/FXtest/diag/test_full_setup.py
 ```
 → `OVERALL VERDICT: PASS` (24/24) を確認。BEHAV5 補足:
 
 ```bash
-"C:/Program Files/Autodesk/Maya2023/bin/mayapy.exe" E:/OG_Tools/FXtest/_behav5_diag.py
+"C:/Program Files/Autodesk/Maya2023/bin/mayapy.exe" E:/OG_Tools/FXtest/diag/behav5_diag.py
 ```
-→ `E:/OG_Tools/FXtest/_behav5_result.json` の `verdict: OK`。
+→ `E:/OG_Tools/FXtest/diag/_behav5_result.json` の `verdict: OK`。
 
 ---
 
@@ -131,7 +131,7 @@ tool.inheritsTransform = 0  (parent 継承切断)
 
 | 優先 | 項目 | 詳細 |
 |---|---|---|
-| 高 | **診断ファイル整理** (pending task #2) | `_audit*/_behav*/_diff*/_sym*/_mirror*/_kneebind*/_spring_poc*/_tt_*` 等が untracked 状態。`.gitignore` に追加 or `.diag/` フォルダに移動 |
+| ~~高~~ | ~~診断ファイル整理~~ | **v0.9.31 で完了**。`diag/` に keeper 集約、throwaway 削除、result JSON を gitignore |
 | 中 | tt_2 (中央 tool bone) の weight 偏り | `_transfer_parent_weight_to_twist` の `max_d` が最後 bone 位置 (0.75) 基準 → 中央区間 [0.333, 0.667] しか tt_2 に配分されない。修正案: `max_d = child 位置 (1.0)` (attach_ctrls.py:2339 付近) |
 | 中 | Bug 2 全 depth 完全解決 (現在 ±0.3 unit 残) | **v0.9.31 で simple midpoint PV (hip↔ik_ctl 0.5/0.5 pointConstraint) を検証済**。dy=-35 で 0.63→0.08 に激減する一方 dy=-20 で 0.26→0.43 と ±0.3 spec を逸脱するため未採用。全 depth 解決には compression 依存 blend (condition + multiplyDivide) + キャラ別 tuning が必須。attach_ctrls.py:1084 のコメントに設計メモ残置 |
 | 中 | leg chain jointOrient cleanup | ユーザ提案の `cmds.joint(oj="xyz")` は FK ctl rotateX が twist 化して破綻 (v0.9.22 revert)。FK ctl 側 rotate axis convention 見直しが先 |
@@ -157,12 +157,15 @@ tool.inheritsTransform = 0  (parent 継承切断)
 
 ## 主要 test / diag スクリプト
 
+v0.9.31 以降 `diag/` フォルダに集約 (root 直下 `_*.py` は gitignore で除外)。
+
 | ファイル | 用途 |
 |---|---|
-| `_test_full_setup.py` | 24 統合テスト。full_auto_setup 実行、全機能 PASS/FAIL 判定 |
-| `_behav5_diag.py` | Bug 1/2 + snap + mirror + revfoot 挙動測定、`_behav5_result.json` 書出 |
-| scratchpad `_twist_*.py` | v0.9.24-30 twist 関連の PoC/検証 |
-| scratchpad `_snap_*.py` | v0.9.23 snap 精度検証 |
+| `diag/test_full_setup.py` | 24 統合テスト。full_auto_setup 実行、全機能 PASS/FAIL 判定 |
+| `diag/behav5_diag.py` | Bug 1/2 + snap + mirror + revfoot 挙動測定、`diag/_behav5_result.json` 書出 |
+| `diag/bug2_deep_diag.py` | Bug 2 waist ty=-5..-35 の knee X drift 精密測定 (v0.9.31 追加) |
+| `diag/mapping_test.py` | Chain Mapping API 検証 (auto-detect / roundtrip / UDE-rename override) |
+| `diag/snap_precision_diag.py` | snap arm/leg IK↔FK 精度検証 (v0.9.23) |
 
 ---
 
