@@ -1640,10 +1640,22 @@ def resolve_chains_for_ikfk(mapping=None):
       1. 明示 mapping 引数 (UI 経由の指定)
       2. scene attr (get_mapping)
       3. auto_detect_mapping (fallback)
-    fixed セクションのみ返す (可変 chain は IK/FK 対象外)。"""
+    fixed セクションのみ返す (可変 chain は IK/FK 対象外)。
+
+    mapping は 2 形式受付 (setup_all_ik_fk と対称):
+      (a) {"fixed": {label: [j,j,j]}, "chains": {...}}  完全形
+      (b) {label: [j,j,j]}                              fixed のみのフラット形
+    """
     if mapping is None:
         mapping = get_mapping()
-    fixed = mapping.get("fixed") or {}
+    # (a) / (b) 両対応
+    if isinstance(mapping, dict) and "fixed" in mapping \
+            and isinstance(mapping["fixed"], dict):
+        fixed = mapping["fixed"]
+    else:
+        # フラット形 or 空 dict → 全 key を fixed とみなす
+        fixed = {k: v for k, v in (mapping or {}).items()
+                 if k in FIXED_LABELS}
     # 空なら auto-detect fallback
     if not fixed:
         auto = auto_detect_mapping()
@@ -3411,9 +3423,16 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True,
 
         # Step 5: attach FK ctls, exclude IK/FK chain joints (30-55%)
         _pw_span(30, 55); _pw_sub(0, "Attach FK controllers...")
-        chains = find_ik_chains()
+        # v0.9.31 bugfix: mapping 経由で IK/FK 対象になる joint も除外に含める。
+        # 従来は find_ik_chains() の naming heuristic 結果だけを exclude にして
+        # いたが、UDE/HIJI/TE 等 非標準命名では heuristic が失敗して UDE_L に
+        # FK cube が付き、続く Step 7 で mapping 経由 IK/FK も張られて
+        # duplicate ctl + duplicate parentConstraint になっていた。
+        # resolve_chains_for_ikfk(mapping) で Step 7 と同じ chain 集合を得て
+        # exclude を統一する。
+        ikfk_chains = resolve_chains_for_ikfk(mapping)
         exclude = set()
-        for chain in chains.values():
+        for chain in ikfk_chains.values():
             exclude.update(chain)
 
         all_joints = cmds.ls(type="joint") or []
@@ -3688,13 +3707,16 @@ _FIXED_ROLE_JP = {
 _MAP_UI_FIXED_FIELDS = {}     # {(label, role_idx): textField_name}
 _MAP_UI_CHAINS_LAYOUT = None  # variable chain list の親 columnLayout
 _MAP_UI_CHAIN_ROWS = {}       # {chain_name: {"name_field":..., "joints_field":...}}
+_MAP_UI_ROW_COUNTER = 0       # v0.9.31 bugfix: 単調増加 ID (len(dict) だと
+                              # 削除→追加で衝突する)
 
 
 def _mapping_ui_reset_state():
     _MAP_UI_FIXED_FIELDS.clear()
     _MAP_UI_CHAIN_ROWS.clear()
-    global _MAP_UI_CHAINS_LAYOUT
+    global _MAP_UI_CHAINS_LAYOUT, _MAP_UI_ROW_COUNTER
     _MAP_UI_CHAINS_LAYOUT = None
+    _MAP_UI_ROW_COUNTER = 0
 
 
 def _mapping_pick_selection(field_name, single=True):
@@ -3768,7 +3790,10 @@ def _mapping_add_chain_row(name="", joints=None):
         return
     joints = joints or []
     cmds.setParent(_MAP_UI_CHAINS_LAYOUT)
-    row_key = f"chain_row_{len(_MAP_UI_CHAIN_ROWS)}"
+    # v0.9.31 bugfix: 単調増加カウンタで名前衝突を防ぐ
+    global _MAP_UI_ROW_COUNTER
+    row_key = f"chain_row_{_MAP_UI_ROW_COUNTER}"
+    _MAP_UI_ROW_COUNTER += 1
     row = cmds.rowLayout(row_key, nc=4, adj=2,
                           cw4=(80, 260, 90, 40),
                           ct4=("both", "both", "both", "both"),

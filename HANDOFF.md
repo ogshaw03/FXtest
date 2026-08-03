@@ -57,7 +57,7 @@ Repo: https://github.com/ogshaw03/FXtest
 
 ---
 
-## 現在の rig 挙動 (v0.9.30)
+## 現在の rig 挙動 (v0.9.31)
 
 **24 統合テスト全 PASS**、BEHAV5 verdict OK。
 
@@ -179,10 +179,10 @@ attach_ctrls.py の作業を再開します。
 E:/OG_Tools/FXtest/HANDOFF.md と memory の attach-ctrls-current-state を
 読んで現状を把握してください。
 
-最新 v0.9.30 (commit 42b2987、push 済) の状態で、以下の残課題があります:
-1. 診断ファイル整理 (pending)
-2. tool twist bone の weight 中央偏り修正
-3. Bug 2 全 depth 完全解決 (dynamic PV)
+最新 v0.9.31 (Chain Mapping UI + Step 5 バグ修正) の状態で、以下の残課題があります:
+1. tool twist bone の weight 中央偏り修正
+2. Bug 2 全 depth 完全解決 (dynamic PV、character-specific tuning 必要)
+3. Variable chain (spine/tail 等) の消費先実装 (spline IK 等)
 その他は HANDOFF.md 参照。
 
 今回は [具体的な作業内容] をお願いします。

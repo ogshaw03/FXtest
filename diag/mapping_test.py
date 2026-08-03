@@ -95,6 +95,26 @@ try:
     ok = cmds.objExists("UDE_L") and cmds.objExists("HIJI_L") and cmds.objExists("TE_L")
     report("ude_original_joints_preserved", ok)
 
+    # v0.9.31 CODE scout: Step 5 (FK cube attach) が mapping を尊重しない
+    # bug の regression test。UDE_L には IK/FK rig の parentConstraint が
+    # 張られるべきで、FK cube ctl 用の "UDE_L_ctl" は生成されてはいけない。
+    dup_ctls = [f"{j}_ctl" for j in ("UDE_L","HIJI_L","TE_L","UDE_R","HIJI_R","TE_R")
+                if cmds.objExists(f"{j}_ctl")]
+    ok = len(dup_ctls) == 0
+    report("ude_no_duplicate_fk_cube_ctl", ok,
+           f"unexpected FK cube ctls: {dup_ctls}")
+
+    # parentConstraint も 1 個だけであるべき (IK/FK blend の _ikfk_pc のみ)
+    dup_pc = []
+    for j in ("UDE_L","HIJI_L","TE_L"):
+        pcs = cmds.listConnections(j + ".rotateX", type="parentConstraint",
+                                    s=True, d=False) or []
+        pcs = list(set(pcs))
+        if len(pcs) > 1:
+            dup_pc.append((j, pcs))
+    ok = len(dup_pc) == 0
+    report("ude_no_duplicate_parent_constraint", ok, f"joints w/ dup pc: {dup_pc}")
+
 except Exception:
     print("[FAIL] fatal:", traceback.format_exc())
 
