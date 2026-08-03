@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.29"
+__version__ = "0.9.30"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2464,10 +2464,46 @@ def setup_twist_wiring(transfer_weights=False):
             segs = new
             n_created += len(new) - already_exist_count
 
-        # wire
+        # v0.9.30 twist only isolation:
+        # 1. inheritsTransform=0 で parent の rotation 継承を切断
+        # 2. wtAddMatrix で parent と child の worldMatrix を weighted blend
+        #    (weight (1-frac, frac)) → decomposeMatrix → tool.translate に接続。
+        #    parent が bend しても tool の位置は parent→child 直線上を追従
+        # 3. rotation は wrist.rotateX * fraction のみ (twist only)
+        # ペアレントコンストレイン不使用、node network で完結
         for idx, seg in enumerate(segs, start=1):
             frac = idx / (count + 1)
             try:
+                # inheritsTransform 切断 (parent の rotation/scale 継承を止める)
+                try:
+                    cmds.setAttr(seg + ".inheritsTransform", 0)
+                except Exception:
+                    pass
+
+                # 位置追従 node 群 (既存なら再利用)
+                wt_node = seg + "_tt_pos_wt"
+                dm_node = seg + "_tt_pos_dm"
+                if not cmds.objExists(wt_node):
+                    wt_node = cmds.createNode("wtAddMatrix", n=wt_node)
+                    cmds.connectAttr(parent + ".worldMatrix[0]",
+                                      wt_node + ".wtMatrix[0].matrixIn")
+                    cmds.connectAttr(child + ".worldMatrix[0]",
+                                      wt_node + ".wtMatrix[1].matrixIn")
+                    cmds.setAttr(wt_node + ".wtMatrix[0].weightIn", 1.0 - frac)
+                    cmds.setAttr(wt_node + ".wtMatrix[1].weightIn", frac)
+                if not cmds.objExists(dm_node):
+                    dm_node = cmds.createNode("decomposeMatrix", n=dm_node)
+                    cmds.connectAttr(wt_node + ".matrixSum",
+                                      dm_node + ".inputMatrix")
+                # translate を tool bone.translate に接続 (world-aligned position)
+                for ax in ("X", "Y", "Z"):
+                    try:
+                        cmds.connectAttr(dm_node + ".outputTranslate" + ax,
+                                          seg + ".translate" + ax, f=True)
+                    except Exception:
+                        pass
+
+                # rotation wire (wrist twist のみ)
                 dst = seg + ".rotateX"
                 cur = cmds.listConnections(dst, s=True, d=False, p=True) or []
                 if cur:
