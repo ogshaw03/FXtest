@@ -53,7 +53,7 @@ Repo: https://github.com/ogshaw03/FXtest
 | 0.9.28 | 5b3b952 | twist wiring 対象を master のみに (numbered は装飾骨として除外) |
 | 0.9.29 | f49eca0 | **ツール専用 twist chain 生成**: `<parent>_tt_<N>_<side>` (既存 `_twist_` 骨 untouched、汎用対応) |
 | 0.9.30 | 42b2987 | **tool twist bone を twist のみに応答**: inheritsTransform=0 + wtAddMatrix + decomposeMatrix で node network 位置追従 (ペアレントコンストレイン不使用) |
-| 0.9.31 | (pending) | **Chain Mapping UI** 追加。UDE/HIJI/TE 等 命名非標準キャラで user が手動で joint を割当てて確実に rig を組める。Bug 2 dyn PV 検討結果を design comment に残置 (functional 変更なし) |
+| 0.9.31 | b4aaa64 | **Chain Mapping UI** 追加。UDE/HIJI/TE 等 命名非標準キャラで user が手動で joint を割当てて確実に rig を組める。Bug 2 dyn PV 検討結果を design comment に残置 (functional 変更なし) |
 
 ---
 
