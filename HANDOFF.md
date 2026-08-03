@@ -1,6 +1,6 @@
 # FXtest attach_ctrls.py 引き継ぎ
 
-**最終更新**: 2026-08-03  **現行**: v0.9.30 (commit 42b2987、push 済)
+**最終更新**: 2026-08-04  **現行**: v0.9.31 (mapping UI 追加、Bug 2 完全解決は未達)
 
 Repo: https://github.com/ogshaw03/FXtest
 
@@ -53,6 +53,7 @@ Repo: https://github.com/ogshaw03/FXtest
 | 0.9.28 | 5b3b952 | twist wiring 対象を master のみに (numbered は装飾骨として除外) |
 | 0.9.29 | f49eca0 | **ツール専用 twist chain 生成**: `<parent>_tt_<N>_<side>` (既存 `_twist_` 骨 untouched、汎用対応) |
 | 0.9.30 | 42b2987 | **tool twist bone を twist のみに応答**: inheritsTransform=0 + wtAddMatrix + decomposeMatrix で node network 位置追従 (ペアレントコンストレイン不使用) |
+| 0.9.31 | (pending) | **Chain Mapping UI** 追加。UDE/HIJI/TE 等 命名非標準キャラで user が手動で joint を割当てて確実に rig を組める。Bug 2 dyn PV 検討結果を design comment に残置 (functional 変更なし) |
 
 ---
 
@@ -74,6 +75,33 @@ Repo: https://github.com/ogshaw03/FXtest
 | Global scale / stretch / volume / Mirror Pose | v0.9.11-12 実装維持 |
 
 ---
+
+## Chain Mapping API (v0.9.31)
+
+命名規則が特殊なキャラ (UDE/HIJI/TE、bip01_L_UpperArm 等) でも rig を組めるようにする手動 mapping 機構。
+
+**データ**: `attach_ctrls_grp.mappingJson` に JSON で保存
+```json
+{
+  "fixed":  {"arm_L": ["UDE_L","HIJI_L","TE_L"], "arm_R":[...], "leg_L":[...], "leg_R":[...]},
+  "chains": {"spine":["waist","upper_body","chest"], "tail":["tail_1","tail_2",...]}
+}
+```
+- `fixed`: 4 スロット固定 (arm/leg × L/R)、IK/FK rig 対象
+- `chains`: 可変長、選択順で登録。現状 API のみ (spline IK 等の消費先は今後)
+
+**API**:
+- `get_mapping()` / `set_mapping(dict)` — scene attr との IO
+- `auto_detect_mapping()` — 命名 heuristic で fixed をプリセット埋め
+- `resolve_chains_for_ikfk(mapping=None)` — mapping → auto-detect の順で解決
+- `full_auto_setup(..., mapping=None)` — 明示 override 可
+- `setup_all_ik_fk(mapping=None)` — 同上
+- `setup_ik_fk(start, mid, end, side, label=None)` — canonical `label` 引数追加。UDE_L を指定しても ctl は `arm_L_IK_ctl` etc で生成される
+
+**UI**: `show_mapping_ui()` (Main UI の "Chain Mapping…" ボタンから起動)
+- Fixed section: 12 個の textField + "Pick Sel" ボタン
+- Variable section: "+ Add chain" で行追加 → 選択順に "Set from Sel" で流し込み
+- "Save to scene" / "Save & Run Full Auto" / "Auto-detect names"
 
 ## twist joint 実装 (v0.9.29+30)
 
@@ -105,7 +133,7 @@ tool.inheritsTransform = 0  (parent 継承切断)
 |---|---|---|
 | 高 | **診断ファイル整理** (pending task #2) | `_audit*/_behav*/_diff*/_sym*/_mirror*/_kneebind*/_spring_poc*/_tt_*` 等が untracked 状態。`.gitignore` に追加 or `.diag/` フォルダに移動 |
 | 中 | tt_2 (中央 tool bone) の weight 偏り | `_transfer_parent_weight_to_twist` の `max_d` が最後 bone 位置 (0.75) 基準 → 中央区間 [0.333, 0.667] しか tt_2 に配分されない。修正案: `max_d = child 位置 (1.0)` (attach_ctrls.py:2339 付近) |
-| 中 | Bug 2 全 depth 完全解決 (現在 ±0.3 unit 残) | runtime dynamic PV (multiplyDivide + condition の node network、キャラ別 tuning) が要 |
+| 中 | Bug 2 全 depth 完全解決 (現在 ±0.3 unit 残) | **v0.9.31 で simple midpoint PV (hip↔ik_ctl 0.5/0.5 pointConstraint) を検証済**。dy=-35 で 0.63→0.08 に激減する一方 dy=-20 で 0.26→0.43 と ±0.3 spec を逸脱するため未採用。全 depth 解決には compression 依存 blend (condition + multiplyDivide) + キャラ別 tuning が必須。attach_ctrls.py:1084 のコメントに設計メモ残置 |
 | 中 | leg chain jointOrient cleanup | ユーザ提案の `cmds.joint(oj="xyz")` は FK ctl rotateX が twist 化して破綻 (v0.9.22 revert)。FK ctl 側 rotate axis convention 見直しが先 |
 | 低 | tool bone 命名重複 | `arm_L_tt_1_L` (prefix suffix 両方に _L)、動作影響なし視認性のみ |
 | 低 | arm_R Bug 1 残差非対称 | leg_L/R = e-05、arm_R = 1.4e-05 で 30× 差。symmetrize 由来、閾値内 |

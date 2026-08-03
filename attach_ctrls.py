@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.30"
+__version__ = "0.9.31"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -940,7 +940,7 @@ def _dup_hero_joint(orig, suffix, new_parent=None):
     return n
 
 
-def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
+def setup_ik_fk(start, mid, end, side="C", pv_offset=None, label=None):
     """3-joint chain (start, mid, end) に FK/IK blend rig を構築。
 
     方針: original chain の 3 hero joint を CLEAN な dual chain (IK 用/FK 用)
@@ -954,9 +954,14 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
         start, mid, end: 元 joint 名 (親→子順)
         side: "L"/"R"/"C" (ctl color 用)
         pv_offset: pole vector のワールド Z offset (None なら mesh diag / 8)
+        label: 生成する ctl/npo/ikh の canonical 名前 prefix (`arm_L` 等)。
+               None の場合 start joint 名を使う (v0.9.31 前の既定挙動)。
+               UDE_L 等 非標準命名の joint を arm_L canonical name の rig に
+               したい場合に mapping 経由で指定する。
     """
     color = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
-    label = start
+    if label is None:
+        label = start
 
     if not cmds.objExists(ROOT_GROUP):
         cmds.group(em=True, name=ROOT_GROUP)
@@ -1081,6 +1086,16 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None):
     # ROOT_GROUP (world 固定) だと腰が下がった時 PV は動かず膝が chain plane
     # 外へ大きく飛ぶ (leg で knee Z+17.5)。腕/脚とも hip/shoulder 系に追従
     # させれば bend 幾何が保持される。
+    #
+    # v0.9.31 Bug 2 dynamic PV 検討結果 (未採用):
+    #   `hip (leg_L) と ik_ctl の中点` に pointConstraint 追従する dyn_helper
+    #   下に pv_npo を parent する案を試作 (bug2_dynpv セッション)。
+    #   dy=-35 で knee X drift 0.63 → 0.08 unit と激減する一方、
+    #   dy=-20 (通常 squat 想定) で 0.26 → 0.43 unit と ±0.3 spec を逸脱。
+    #   浅い depth への副作用を打ち消すには compression 依存の blend
+    #   (condition/multiplyDivide) が必要で、character-specific tuning が
+    #   前提になる。汎用ツールとして安全側を採り v0.9.12 の hip-follow を
+    #   維持。将来 UI attr で auto-blend を露出する形で再検討する余地あり。
     pv_parent = orig_parent if (orig_parent and cmds.objExists(orig_parent)) else ROOT_GROUP
     cmds.parent(pv_npo, pv_parent)
     # v0.9.12 Bug 1: poleVectorConstraint を **orient constraint より前** に
@@ -1533,6 +1548,117 @@ def find_ik_chains():
         lg = _try_find(_LEG_CANDIDATES, side)
         if lg:
             out[f"{side}_leg"] = lg
+    return out
+
+
+# =========================================================================
+# Manual chain mapping (v0.9.31)
+# =========================================================================
+#
+# 目的: 命名規則が特殊 (UDE/HIJI/TE 等) なキャラでも user が手動で joint を
+# 割り当てて確実に rig を組めるようにする。auto-detect (find_ik_chains) は
+# 初期値プリセットとしてのみ使い、失敗しても user が UI で補正可能。
+#
+# データ構造 (attach_ctrls_grp.mappingJson に JSON で保存):
+#   {
+#     "fixed": {                          # 固定長 3 joint chain (IK/FK 対象)
+#       "arm_L": ["arm_L", "elbow_L", "wrist_L"],
+#       "arm_R": [...],
+#       "leg_L": [...],
+#       "leg_R": [...]
+#     },
+#     "chains": {                         # 可変長 chain (spine/tail/etc)
+#       "spine": ["waist", "upper_body", "chest"],
+#       "tail":  ["tail_1", "tail_2", "tail_3", "tail_4"]
+#     }
+#   }
+#
+# fixed は IK/FK rig 生成に使う。chains は選択順を記録するだけで、
+# 現状は setup 対象外だが将来 spline IK / dynamics / mirror 順序等で消費予定。
+
+MAPPING_ATTR = "mappingJson"
+FIXED_LABELS = ("arm_L", "arm_R", "leg_L", "leg_R")
+
+
+def _mapping_container():
+    """mapping JSON を保持する transform を返す (無ければ ROOT_GROUP)。
+    ROOT_GROUP が未生成の段階でも呼べるようにする。"""
+    if cmds.objExists(ROOT_GROUP):
+        return ROOT_GROUP
+    return None
+
+
+def get_mapping():
+    """scene から mapping dict を読む。無ければ空の template を返す。"""
+    import json as _json
+    holder = _mapping_container()
+    if holder and cmds.attributeQuery(MAPPING_ATTR, node=holder, exists=True):
+        raw = cmds.getAttr(f"{holder}.{MAPPING_ATTR}") or ""
+        if raw:
+            try:
+                data = _json.loads(raw)
+                # 正規化 (欠損 key を補う)
+                data.setdefault("fixed", {})
+                data.setdefault("chains", {})
+                return data
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] mappingJson parse failed: {exc}")
+    return {"fixed": {}, "chains": {}}
+
+
+def set_mapping(mapping):
+    """mapping dict を scene attr に JSON で保存。ROOT_GROUP が無ければ作成。"""
+    import json as _json
+    if not cmds.objExists(ROOT_GROUP):
+        cmds.group(em=True, name=ROOT_GROUP)
+    if not cmds.attributeQuery(MAPPING_ATTR, node=ROOT_GROUP, exists=True):
+        cmds.addAttr(ROOT_GROUP, ln=MAPPING_ATTR, dt="string")
+    payload = _json.dumps(mapping, ensure_ascii=False, indent=2)
+    cmds.setAttr(f"{ROOT_GROUP}.{MAPPING_ATTR}", payload, type="string")
+    print(f"[{_PACKAGE}] mapping saved to {ROOT_GROUP}.{MAPPING_ATTR}")
+
+
+def auto_detect_mapping():
+    """命名規則 heuristic で mapping を自動推定。
+    fixed は find_ik_chains の結果を label 統一 (arm_L etc) して詰める。
+    chains は現状ヒューリスティックを持たないので空。"""
+    detected = {"fixed": {}, "chains": {}}
+    raw = find_ik_chains()  # {"L_arm": [j,j,j], ...}
+    for key, joints in raw.items():
+        # "L_arm" → "arm_L"
+        side = key[0]
+        part = key[2:]  # "arm" or "leg"
+        label = f"{part}_{side}"
+        if label in FIXED_LABELS and len(joints) >= 3:
+            detected["fixed"][label] = list(joints[:3])
+    return detected
+
+
+def resolve_chains_for_ikfk(mapping=None):
+    """IK/FK setup が消費する形式 { label: [start,mid,end] } を返す。
+    優先順位:
+      1. 明示 mapping 引数 (UI 経由の指定)
+      2. scene attr (get_mapping)
+      3. auto_detect_mapping (fallback)
+    fixed セクションのみ返す (可変 chain は IK/FK 対象外)。"""
+    if mapping is None:
+        mapping = get_mapping()
+    fixed = mapping.get("fixed") or {}
+    # 空なら auto-detect fallback
+    if not fixed:
+        auto = auto_detect_mapping()
+        fixed = auto.get("fixed") or {}
+    # joint 存在チェック
+    out = {}
+    for label, joints in fixed.items():
+        if len(joints) < 3:
+            continue
+        if all(cmds.objExists(j) for j in joints[:3]):
+            out[label] = list(joints[:3])
+        else:
+            missing = [j for j in joints[:3] if not cmds.objExists(j)]
+            cmds.warning(f"[{_PACKAGE}] mapping '{label}' の joint 不在 "
+                         f"{missing} → skip")
     return out
 
 
@@ -2537,9 +2663,30 @@ def setup_twist_wiring(transfer_weights=False):
     return n_wired
 
 
-def setup_all_ik_fk():
-    """検出できた L/R arm/leg 全てに IK/FK rig を構築。leg には reverse foot も。"""
-    chains = find_ik_chains()
+def setup_all_ik_fk(mapping=None):
+    """検出できた L/R arm/leg 全てに IK/FK rig を構築。leg には reverse foot も。
+
+    Args:
+        mapping: dict {label: [start, mid, end]} を渡すと優先使用。
+                 None なら resolve_chains_for_ikfk() で scene mapping / auto
+                 detect の順に解決。UDE/HIJI/TE 等 非標準命名でも UI で
+                 mapping を設定しておけばこの経路で拾える。
+    """
+    if mapping is None or not mapping:
+        chains = resolve_chains_for_ikfk()
+    else:
+        # mapping は 2 形式受付:
+        #   (a) {"fixed": {label: [j,j,j]}, "chains": {...}} (完全形)
+        #   (b) {label: [j,j,j]} (fixed のみのフラット形、後方互換)
+        if "fixed" in mapping and isinstance(mapping["fixed"], dict):
+            fixed_src = mapping["fixed"]
+        else:
+            fixed_src = mapping
+        chains = {}
+        for label, joints in fixed_src.items():
+            if label in FIXED_LABELS and len(joints) >= 3 \
+                    and all(cmds.objExists(j) for j in joints[:3]):
+                chains[label] = list(joints[:3])
     total = len(chains)
     results = []
     # setup_all_ik_fk は full_auto_setup 側で [55, 100]% を占める前提。
@@ -2552,12 +2699,14 @@ def setup_all_ik_fk():
         chain_hi = outer_lo + (outer_hi - outer_lo) * (i + 1) / max(1, total)
         _pw_span(chain_lo, chain_hi)
         _pw_sub(0.0, f"Setup IK/FK: {label}")
-        side = "L" if label.startswith("L") else "R"
+        # label は "arm_L"/"arm_R"/"leg_L"/"leg_R" 形式 (FIXED_LABELS)
+        side = "L" if label.endswith("_L") else "R" if label.endswith("_R") else "C"
         try:
-            r = setup_ik_fk(chain[0], chain[1], chain[2], side=side)
+            r = setup_ik_fk(chain[0], chain[1], chain[2], side=side,
+                             label=label)
             results.append(r)
             # leg なら reverse foot も試みる
-            if "leg" in label:
+            if "leg" in label.lower():
                 _pw_sub(85.0, f"Reverse foot: {label}")
                 rf = setup_reverse_foot(chain[2], r["ik_ctl"], r["ik_handle"], side=side)
                 if rf:
@@ -3131,18 +3280,24 @@ def neutralize_leg_bind_bend():
     return len(pairs)
 
 
-def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
+def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True,
+                    mapping=None):
     """FBX 直後の状態から完全 rig setup を 1 コマンドで実行。
     1. namespace 除去
     2. joint 名 rename (fbx_renamer 経由)
     3. 不要ノード削除 (locator + 未skin _end/shadow/dummy)
     4. IK/FK chain を除いた全 joint に FK cube ctl 付与 (auto-scale)
-    5. L/R arm/leg で IK/FK blend rig 構築
+    5. L/R arm/leg で IK/FK blend rig 構築 (mapping 優先、無ければ auto-detect)
 
     Args:
         scale:           auto_scale multiplier (1.0 = bone 長さ準拠)
         skip_decoration: hair/ribbon/skirt/coat/ear/tail 系を除外
         delete_junk:     不要ノード削除を実行するか
+        mapping:         optional {label: [start,mid,end]} dict。命名規則が
+                         非標準 (UDE/HIJI/TE 等) のキャラで setup_all_ik_fk が
+                         auto-detect に失敗する場合に UI 経由で渡す。
+                         None なら scene の mappingJson attr を優先し、それも
+                         無ければ auto-detect fallback。
     """
     if cmds is None:
         raise RuntimeError("Must run inside Maya.")
@@ -3290,7 +3445,7 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True):
 
         # Step 7: IK/FK setup (IK ctl NPO は独立世界置き = 足接地 目的) (55-97%)
         _pw_span(55, 97); _pw_sub(0, "Setup IK/FK chains...")
-        ik_results = setup_all_ik_fk()
+        ik_results = setup_all_ik_fk(mapping=mapping)
 
         # Step 8: twist joint auto-drive 配線 (97-100%)
         _pw_span(97, 100); _pw_sub(0, "Wire twist joints...")
@@ -3352,6 +3507,13 @@ def _build_body() -> None:
                 bgc=(0.90, 0.55, 0.10))
     cmds.button(l="Delete ALL", h=40, c=_ui_delete,
                 bgc=(0.55, 0.20, 0.20))
+    cmds.setParent("..")
+
+    # v0.9.31: 命名が非標準なキャラ用の手動 mapping UI ボタン
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
+    cmds.button(l="Chain Mapping…  (UDE/HIJI 等 命名非標準キャラ用)",
+                h=28, c=show_mapping_ui,
+                bgc=(0.35, 0.45, 0.65))
     cmds.setParent("..")
 
     cmds.separator(h=10, style="in")
@@ -3505,6 +3667,251 @@ def _ui_attach(*_):
 
 def _ui_delete(*_):
     delete_generated()
+
+
+# =========================================================================
+# Chain Mapping UI (v0.9.31)
+# =========================================================================
+
+MAPPING_WINDOW = "attach_ctrls_mappingWin"
+
+# fixed chain の joint 役割ラベル (表示用)
+_FIXED_ROLES = ("start", "mid", "end")
+_FIXED_ROLE_JP = {
+    "arm_L": ("L Shoulder", "L Elbow", "L Wrist"),
+    "arm_R": ("R Shoulder", "R Elbow", "R Wrist"),
+    "leg_L": ("L Hip",      "L Knee",  "L Ankle"),
+    "leg_R": ("R Hip",      "R Knee",  "R Ankle"),
+}
+
+# UI 内で state を持ち回るための global (Maya cmds UI は callback で state 参照要)
+_MAP_UI_FIXED_FIELDS = {}     # {(label, role_idx): textField_name}
+_MAP_UI_CHAINS_LAYOUT = None  # variable chain list の親 columnLayout
+_MAP_UI_CHAIN_ROWS = {}       # {chain_name: {"name_field":..., "joints_field":...}}
+
+
+def _mapping_ui_reset_state():
+    _MAP_UI_FIXED_FIELDS.clear()
+    _MAP_UI_CHAIN_ROWS.clear()
+    global _MAP_UI_CHAINS_LAYOUT
+    _MAP_UI_CHAINS_LAYOUT = None
+
+
+def _mapping_pick_selection(field_name, single=True):
+    """選択中の joint 名を textField に流し込む。single=False は全 selection をカンマ結合。"""
+    sel = cmds.ls(sl=True, type="joint") or cmds.ls(sl=True, type="transform") or []
+    if not sel:
+        cmds.warning("Select joint(s) in the viewport / Outliner first")
+        return
+    names = [s.split(":")[-1] for s in sel]
+    if single:
+        cmds.textField(field_name, e=True, tx=names[0])
+    else:
+        cmds.textField(field_name, e=True, tx=", ".join(names))
+
+
+def _mapping_current_from_ui():
+    """現在の UI 状態を mapping dict にまとめる。"""
+    fixed = {}
+    for label in FIXED_LABELS:
+        joints = []
+        ok = True
+        for role_idx in range(3):
+            fld = _MAP_UI_FIXED_FIELDS.get((label, role_idx))
+            v = cmds.textField(fld, q=True, tx=True).strip() if fld else ""
+            if not v:
+                ok = False; break
+            joints.append(v)
+        if ok:
+            fixed[label] = joints
+    chains = {}
+    for name, refs in _MAP_UI_CHAIN_ROWS.items():
+        name_field = refs["name_field"]
+        joints_field = refs["joints_field"]
+        cur_name = cmds.textField(name_field, q=True, tx=True).strip() if name_field else ""
+        cur_joints = cmds.textField(joints_field, q=True, tx=True).strip() if joints_field else ""
+        if not cur_name or not cur_joints:
+            continue
+        jlist = [x.strip() for x in cur_joints.split(",") if x.strip()]
+        if len(jlist) >= 2:
+            chains[cur_name] = jlist
+    return {"fixed": fixed, "chains": chains}
+
+
+def _mapping_populate_ui(mapping):
+    """mapping dict を UI に流し込む。既存の chain row は全削除して詰め直し。"""
+    # fixed
+    fixed = mapping.get("fixed") or {}
+    for label in FIXED_LABELS:
+        joints = fixed.get(label) or []
+        for role_idx in range(3):
+            fld = _MAP_UI_FIXED_FIELDS.get((label, role_idx))
+            if fld:
+                v = joints[role_idx] if role_idx < len(joints) else ""
+                cmds.textField(fld, e=True, tx=v)
+    # variable chains: 既存 row を全削除
+    if _MAP_UI_CHAINS_LAYOUT and cmds.layout(_MAP_UI_CHAINS_LAYOUT, ex=True):
+        for row_refs in list(_MAP_UI_CHAIN_ROWS.values()):
+            try:
+                cmds.deleteUI(row_refs["row_layout"])
+            except Exception:
+                pass
+    _MAP_UI_CHAIN_ROWS.clear()
+    chains = mapping.get("chains") or {}
+    for name, joints in chains.items():
+        _mapping_add_chain_row(name=name, joints=joints)
+
+
+def _mapping_add_chain_row(name="", joints=None):
+    """可変 chain 用の 1 行 (name field + joints field + set/del button) を追加。"""
+    if _MAP_UI_CHAINS_LAYOUT is None or not cmds.layout(_MAP_UI_CHAINS_LAYOUT, ex=True):
+        return
+    joints = joints or []
+    cmds.setParent(_MAP_UI_CHAINS_LAYOUT)
+    row_key = f"chain_row_{len(_MAP_UI_CHAIN_ROWS)}"
+    row = cmds.rowLayout(row_key, nc=4, adj=2,
+                          cw4=(80, 260, 90, 40),
+                          ct4=("both", "both", "both", "both"),
+                          co4=(2, 2, 2, 2))
+    name_field = cmds.textField(tx=name, ann="chain 名 (spine, tail, hair 等)")
+    joints_field = cmds.textField(tx=", ".join(joints),
+                                   ann="joint 名をカンマ区切りで、根本→末端の順")
+    cmds.button(l="Set from Sel", h=22,
+                ann="選択された joint 群を選択順にこの chain に割当",
+                c=lambda *_: _mapping_pick_selection(joints_field, single=False))
+    cmds.button(l="✕", h=22, bgc=(0.5, 0.25, 0.25),
+                c=lambda *_: _mapping_delete_chain_row(row_key))
+    cmds.setParent("..")
+    _MAP_UI_CHAIN_ROWS[row_key] = {
+        "row_layout": row,
+        "name_field": name_field,
+        "joints_field": joints_field,
+    }
+
+
+def _mapping_delete_chain_row(row_key):
+    refs = _MAP_UI_CHAIN_ROWS.pop(row_key, None)
+    if not refs:
+        return
+    try:
+        cmds.deleteUI(refs["row_layout"])
+    except Exception:
+        pass
+
+
+def _ui_mapping_auto_detect(*_):
+    detected = auto_detect_mapping()
+    # variable chains は auto-detect 対象外だが、現在の UI 状態は保持したいので
+    # fixed のみ上書きして chains は現状維持
+    current = _mapping_current_from_ui()
+    detected["chains"] = current.get("chains", {})
+    _mapping_populate_ui(detected)
+    n_fixed = len(detected.get("fixed") or {})
+    print(f"[{_PACKAGE}] auto-detect: {n_fixed}/4 fixed chains detected")
+
+
+def _ui_mapping_save(*_):
+    mapping = _mapping_current_from_ui()
+    set_mapping(mapping)
+    n_fix = len(mapping.get("fixed") or {})
+    n_var = len(mapping.get("chains") or {})
+    print(f"[{_PACKAGE}] mapping saved: {n_fix} fixed / {n_var} variable")
+
+
+def _ui_mapping_save_and_run(*_):
+    mapping = _mapping_current_from_ui()
+    set_mapping(mapping)
+    if cmds.window(MAPPING_WINDOW, exists=True):
+        cmds.deleteUI(MAPPING_WINDOW)
+    # 通常の Full Auto Setup を走らせる (mapping は scene attr 経由で拾われる)
+    scale = 1.0
+    skip_dec = False
+    del_junk = True
+    if cmds.floatSliderGrp(_UI_SCALE, ex=True):
+        scale = cmds.floatSliderGrp(_UI_SCALE, q=True, value=True)
+    if cmds.checkBoxGrp(_UI_SKIP_DECOR, ex=True):
+        skip_dec = cmds.checkBoxGrp(_UI_SKIP_DECOR, q=True, value1=True)
+    if cmds.checkBoxGrp(_UI_DELETE_JUNK, ex=True):
+        del_junk = cmds.checkBoxGrp(_UI_DELETE_JUNK, q=True, value1=True)
+    full_auto_setup(scale=scale, skip_decoration=skip_dec,
+                    delete_junk=del_junk, mapping=mapping)
+
+
+def _ui_mapping_add_chain(*_):
+    _mapping_add_chain_row()
+
+
+def show_mapping_ui(*_):
+    """Chain mapping UI を開く。scene に既存 mapping があれば load、
+    無ければ auto-detect でプリセット表示。"""
+    if cmds is None:
+        raise RuntimeError("show_mapping_ui() must be called inside Maya.")
+    if cmds.window(MAPPING_WINDOW, exists=True):
+        cmds.deleteUI(MAPPING_WINDOW)
+    _mapping_ui_reset_state()
+
+    win = cmds.window(MAPPING_WINDOW,
+                      t=f"AttachCtrl Mapping  --  v{__version__}",
+                      w=520, h=560, mnb=True, mxb=False, s=True)
+    cmds.columnLayout(adj=True, rs=6, cat=("both", 10))
+
+    cmds.text(l="=== Fixed IK/FK chains (start / mid / end) ===",
+              al="left", fn="boldLabelFont")
+    cmds.text(l="命名が非標準 (UDE/HIJI/TE 等) でも scene の joint を直接指定できます。",
+              al="left", fn="smallObliqueLabelFont")
+
+    for label in FIXED_LABELS:
+        cmds.text(l=label, al="left")
+        for role_idx in range(3):
+            role_name = _FIXED_ROLE_JP[label][role_idx]
+            cmds.rowLayout(nc=3, adj=2,
+                           cw3=(90, 260, 100),
+                           ct3=("right", "both", "both"),
+                           co3=(4, 2, 2))
+            cmds.text(l=role_name + "  :")
+            fld = cmds.textField(tx="",
+                                  ann=f"{label} {_FIXED_ROLES[role_idx]} の joint 名")
+            _MAP_UI_FIXED_FIELDS[(label, role_idx)] = fld
+            cmds.button(l="Pick Sel", h=22,
+                        ann="viewport/Outliner で選択中の joint を割当",
+                        c=lambda _x=None, _f=fld: _mapping_pick_selection(_f, single=True))
+            cmds.setParent("..")
+        cmds.separator(h=4, style="none")
+
+    cmds.separator(h=8, style="in")
+    cmds.text(l="=== Variable chains (spine / tail / hair 等、可変長) ===",
+              al="left", fn="boldLabelFont")
+    cmds.text(l="Set from Sel: 選択された joint を根本→末端の順で登録。",
+              al="left", fn="smallObliqueLabelFont")
+
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 200))
+    cmds.button(l="+ Add chain", h=22, c=_ui_mapping_add_chain,
+                bgc=(0.30, 0.55, 0.30))
+    cmds.setParent("..")
+
+    global _MAP_UI_CHAINS_LAYOUT
+    _MAP_UI_CHAINS_LAYOUT = cmds.columnLayout(adj=True, rs=2)
+    cmds.setParent("..")
+
+    cmds.separator(h=10, style="in")
+    cmds.rowLayout(nc=3, adj=3, cw3=(140, 140, 200),
+                   ct3=("both", "both", "both"), co3=(4, 4, 4))
+    cmds.button(l="Auto-detect names", h=28, c=_ui_mapping_auto_detect)
+    cmds.button(l="Save to scene", h=28, c=_ui_mapping_save,
+                bgc=(0.35, 0.55, 0.75))
+    cmds.button(l="Save & Run Full Auto", h=28, c=_ui_mapping_save_and_run,
+                bgc=(0.90, 0.55, 0.10))
+    cmds.setParent("..")
+
+    # 初期表示: scene に mapping があれば load、無ければ auto-detect
+    existing = get_mapping()
+    if (existing.get("fixed") or existing.get("chains")):
+        _mapping_populate_ui(existing)
+    else:
+        _mapping_populate_ui(auto_detect_mapping())
+
+    cmds.showWindow(win)
+    return win
 
 
 def show() -> str:
