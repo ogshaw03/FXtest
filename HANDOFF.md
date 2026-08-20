@@ -1,6 +1,6 @@
 # FXtest attach_ctrls.py 引き継ぎ
 
-**最終更新**: 2026-08-04  **現行**: v0.9.31 (mapping UI 追加、Bug 2 完全解決は未達)
+**最終更新**: 2026-08-05  **現行**: v0.9.32 (mapping UI 人型 body-diagram 化)
 
 Repo: https://github.com/ogshaw03/FXtest
 
@@ -54,6 +54,8 @@ Repo: https://github.com/ogshaw03/FXtest
 | 0.9.29 | f49eca0 | **ツール専用 twist chain 生成**: `<parent>_tt_<N>_<side>` (既存 `_twist_` 骨 untouched、汎用対応) |
 | 0.9.30 | 42b2987 | **tool twist bone を twist のみに応答**: inheritsTransform=0 + wtAddMatrix + decomposeMatrix で node network 位置追従 (ペアレントコンストレイン不使用) |
 | 0.9.31 | b4aaa64 | **Chain Mapping UI** 追加。UDE/HIJI/TE 等 命名非標準キャラで user が手動で joint を割当てて確実に rig を組める。Bug 2 dyn PV 検討結果を design comment に残置 (functional 変更なし) |
+| 0.9.31 | 0ce8b15 | **Step 5 duplicate ctl bugfix + UI row_key 衝突対策** (5-scout 検証で発覚)。regression test 2 件追加 (8/8 PASS) |
+| 0.9.32 | (pending) | **Mapping UI を人型 body-diagram に刷新**。12 joint slot を人体位置に絶対配置、click で pick from selection、右click menu (pick/enter/select in scene/clear)、色分け (灰=未割当/緑=OK/赤=不在) |
 
 ---
 
@@ -99,7 +101,11 @@ Repo: https://github.com/ogshaw03/FXtest
 - `setup_ik_fk(start, mid, end, side, label=None)` — canonical `label` 引数追加。UDE_L を指定しても ctl は `arm_L_IK_ctl` etc で生成される
 
 **UI**: `show_mapping_ui()` (Main UI の "Chain Mapping…" ボタンから起動)
-- Fixed section: 12 個の textField + "Pick Sel" ボタン
+- Fixed section (v0.9.32 人型 body-diagram): 12 joint slot を人体位置に絶対配置
+  - 正面向きミラー配置 (character の L は viewer の右)
+  - 左click: 選択中 joint を pick / 右click: menu (Pick / Enter / Select in scene / Clear)
+  - 色: 灰=未割当、緑=割当済み OK、赤=割当てた joint が scene に不在
+  - 内部: `iconTextButton.annotation` に "joint: <name>" 形式で保存
 - Variable section: "+ Add chain" で行追加 → 選択順に "Set from Sel" で流し込み
 - "Save to scene" / "Save & Run Full Auto" / "Auto-detect names"
 

@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.31"
+__version__ = "0.9.32"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3689,7 +3689,7 @@ def _ui_delete(*_):
 
 
 # =========================================================================
-# Chain Mapping UI (v0.9.31)
+# Chain Mapping UI (v0.9.31 humanoid layout / v0.9.32 refactor)
 # =========================================================================
 
 MAPPING_WINDOW = "attach_ctrls_mappingWin"
@@ -3702,13 +3702,40 @@ _FIXED_ROLE_JP = {
     "leg_L": ("L Hip",      "L Knee",  "L Ankle"),
     "leg_R": ("R Hip",      "R Knee",  "R Ankle"),
 }
+# ボタン内 abbreviation (幅 ~72px に収める)
+_ROLE_ABBREV = {
+    "arm_L": ("L Sho", "L Elb", "L Wri"),
+    "arm_R": ("R Sho", "R Elb", "R Wri"),
+    "leg_L": ("L Hip", "L Kne", "L Ank"),
+    "leg_R": ("R Hip", "R Kne", "R Ank"),
+}
+
+# 人型 body diagram の joint 位置 (px offset from formLayout の左上)。
+# キャラを正面から見た配置なので character の L 側は viewer から見て右側
+# (x が大きい方) に置く (mirror view convention)。
+# 全体 canvas は 380 x 440。
+_HUMANOID_POSITIONS = {
+    ("arm_R", 0): ( 68,  70),   # R shoulder (character 右肩、viewer 左)
+    ("arm_R", 1): ( 32, 130),   # R elbow    (肩より外へ)
+    ("arm_R", 2): (  8, 195),   # R wrist    (更に外)
+    ("arm_L", 0): (238,  70),   # L shoulder (character 左肩、viewer 右)
+    ("arm_L", 1): (274, 130),
+    ("arm_L", 2): (298, 195),
+    ("leg_R", 0): (108, 245),   # R hip
+    ("leg_R", 1): (100, 320),
+    ("leg_R", 2): ( 94, 395),
+    ("leg_L", 0): (198, 245),   # L hip
+    ("leg_L", 1): (206, 320),
+    ("leg_L", 2): (212, 395),
+}
+_HUMANOID_FORM_W = 380
+_HUMANOID_FORM_H = 428
 
 # UI 内で state を持ち回るための global (Maya cmds UI は callback で state 参照要)
-_MAP_UI_FIXED_FIELDS = {}     # {(label, role_idx): textField_name}
+_MAP_UI_FIXED_FIELDS = {}     # {(label, role_idx): iconTextButton_name}
 _MAP_UI_CHAINS_LAYOUT = None  # variable chain list の親 columnLayout
 _MAP_UI_CHAIN_ROWS = {}       # {chain_name: {"name_field":..., "joints_field":...}}
-_MAP_UI_ROW_COUNTER = 0       # v0.9.31 bugfix: 単調増加 ID (len(dict) だと
-                              # 削除→追加で衝突する)
+_MAP_UI_ROW_COUNTER = 0       # 単調増加 ID (len(dict) だと 削除→追加で衝突する)
 
 
 def _mapping_ui_reset_state():
@@ -3719,13 +3746,96 @@ def _mapping_ui_reset_state():
     _MAP_UI_ROW_COUNTER = 0
 
 
+# ---- 人型 body-diagram slot 操作 ----
+
+def _slot_get_joint(btn):
+    """button の annotation に格納された joint 名を返す。空なら空文字。"""
+    try:
+        ann = cmds.button(btn, q=True, ann=True) or ""
+    except Exception:
+        return ""
+    # annotation 冒頭に "joint: " を付けているので split で取り出す
+    if ann.startswith("joint: "):
+        return ann[len("joint: "):].strip()
+    return ""
+
+
+def _slot_update_visual(btn, label, role_idx):
+    """slot の stored joint を読み、button の label/色/tooltip を再描画。"""
+    joint = _slot_get_joint(btn)
+    role_full = _FIXED_ROLE_JP[label][role_idx]
+    if joint:
+        # 存在チェックで色分け
+        exists = cmds.objExists(joint)
+        display = joint if len(joint) <= 9 else joint[:8] + "…"
+        cmds.button(btn, e=True, l=display,
+                     bgc=(0.30, 0.65, 0.30) if exists else (0.70, 0.35, 0.35),
+                     ann=f"joint: {joint}\n{role_full}\n"
+                          f"({'exists' if exists else 'NOT FOUND in scene'})\n"
+                          "左click: 選択中 joint を割当  /  右click: メニュー")
+    else:
+        cmds.button(btn, e=True, l="+ " + _ROLE_ABBREV[label][role_idx],
+                     bgc=(0.32, 0.32, 0.32),
+                     ann=f"joint: \n{role_full}  (未割当)\n"
+                          "左click: 選択中 joint を割当  /  右click: メニュー")
+
+
+def _slot_set_joint(btn, label, role_idx, joint):
+    """slot に joint 名を格納 → visual 更新。"""
+    joint = (joint or "").strip()
+    if joint:
+        cmds.button(btn, e=True, ann=f"joint: {joint}")
+    else:
+        cmds.button(btn, e=True, ann="")
+    _slot_update_visual(btn, label, role_idx)
+
+
+def _slot_pick_from_selection(btn, label, role_idx, *_):
+    sel = cmds.ls(sl=True, type="joint") or cmds.ls(sl=True, type="transform") or []
+    if not sel:
+        cmds.warning("Select a joint in the Outliner / viewport first")
+        return
+    # namespace 除去 + DAG full path 対応 ("|root|arm|wrist" → "wrist")
+    joint = sel[0].split("|")[-1].split(":")[-1]
+    _slot_set_joint(btn, label, role_idx, joint)
+
+
+def _slot_prompt_name(btn, label, role_idx, *_):
+    role_full = _FIXED_ROLE_JP[label][role_idx]
+    current = _slot_get_joint(btn)
+    result = cmds.promptDialog(
+        title=f"Enter joint name — {role_full}",
+        message=f"{label} / {_FIXED_ROLES[role_idx]} の joint 名:",
+        text=current,
+        button=["OK", "Cancel"], defaultButton="OK",
+        cancelButton="Cancel", dismissString="Cancel")
+    if result != "OK":
+        return
+    text = cmds.promptDialog(q=True, text=True) or ""
+    _slot_set_joint(btn, label, role_idx, text)
+
+
+def _slot_clear(btn, label, role_idx, *_):
+    _slot_set_joint(btn, label, role_idx, "")
+
+
+def _slot_select_in_scene(btn, *_):
+    """slot に格納された joint を Maya scene で選択する。"""
+    joint = _slot_get_joint(btn)
+    if joint and cmds.objExists(joint):
+        cmds.select(joint, r=True)
+    else:
+        cmds.warning(f"[{_PACKAGE}] joint '{joint}' が scene に存在しません")
+
+
+# 旧 API 互換 (variable chain 側の textField で使用)
 def _mapping_pick_selection(field_name, single=True):
     """選択中の joint 名を textField に流し込む。single=False は全 selection をカンマ結合。"""
     sel = cmds.ls(sl=True, type="joint") or cmds.ls(sl=True, type="transform") or []
     if not sel:
         cmds.warning("Select joint(s) in the viewport / Outliner first")
         return
-    names = [s.split(":")[-1] for s in sel]
+    names = [s.split("|")[-1].split(":")[-1] for s in sel]
     if single:
         cmds.textField(field_name, e=True, tx=names[0])
     else:
@@ -3739,8 +3849,8 @@ def _mapping_current_from_ui():
         joints = []
         ok = True
         for role_idx in range(3):
-            fld = _MAP_UI_FIXED_FIELDS.get((label, role_idx))
-            v = cmds.textField(fld, q=True, tx=True).strip() if fld else ""
+            btn = _MAP_UI_FIXED_FIELDS.get((label, role_idx))
+            v = _slot_get_joint(btn) if btn else ""
             if not v:
                 ok = False; break
             joints.append(v)
@@ -3762,15 +3872,15 @@ def _mapping_current_from_ui():
 
 def _mapping_populate_ui(mapping):
     """mapping dict を UI に流し込む。既存の chain row は全削除して詰め直し。"""
-    # fixed
+    # fixed → humanoid slot buttons
     fixed = mapping.get("fixed") or {}
     for label in FIXED_LABELS:
         joints = fixed.get(label) or []
         for role_idx in range(3):
-            fld = _MAP_UI_FIXED_FIELDS.get((label, role_idx))
-            if fld:
+            btn = _MAP_UI_FIXED_FIELDS.get((label, role_idx))
+            if btn:
                 v = joints[role_idx] if role_idx < len(joints) else ""
-                cmds.textField(fld, e=True, tx=v)
+                _slot_set_joint(btn, label, role_idx, v)
     # variable chains: 既存 row を全削除
     if _MAP_UI_CHAINS_LAYOUT and cmds.layout(_MAP_UI_CHAINS_LAYOUT, ex=True):
         for row_refs in list(_MAP_UI_CHAIN_ROWS.values()):
@@ -3877,31 +3987,70 @@ def show_mapping_ui(*_):
 
     win = cmds.window(MAPPING_WINDOW,
                       t=f"AttachCtrl Mapping  --  v{__version__}",
-                      w=520, h=560, mnb=True, mxb=False, s=True)
+                      w=420, h=760, mnb=True, mxb=False, s=True)
     cmds.columnLayout(adj=True, rs=6, cat=("both", 10))
 
-    cmds.text(l="=== Fixed IK/FK chains (start / mid / end) ===",
+    cmds.text(l="=== Fixed IK/FK chains — 人型 body diagram ===",
               al="left", fn="boldLabelFont")
-    cmds.text(l="命名が非標準 (UDE/HIJI/TE 等) でも scene の joint を直接指定できます。",
-              al="left", fn="smallObliqueLabelFont")
+    cmds.text(l="正面向きミラー配置 (character の L 側は viewer の右)。"
+                "各ドットを左click で選択中 joint を割当、右click でメニュー。",
+              al="left", fn="smallObliqueLabelFont", ww=True)
 
-    for label in FIXED_LABELS:
-        cmds.text(l=label, al="left")
-        for role_idx in range(3):
-            role_name = _FIXED_ROLE_JP[label][role_idx]
-            cmds.rowLayout(nc=3, adj=2,
-                           cw3=(90, 260, 100),
-                           ct3=("right", "both", "both"),
-                           co3=(4, 2, 2))
-            cmds.text(l=role_name + "  :")
-            fld = cmds.textField(tx="",
-                                  ann=f"{label} {_FIXED_ROLES[role_idx]} の joint 名")
-            _MAP_UI_FIXED_FIELDS[(label, role_idx)] = fld
-            cmds.button(l="Pick Sel", h=22,
-                        ann="viewport/Outliner で選択中の joint を割当",
-                        c=lambda _x=None, _f=fld: _mapping_pick_selection(_f, single=True))
-            cmds.setParent("..")
-        cmds.separator(h=4, style="none")
+    # --- 人型 body-diagram (formLayout 絶対配置) ---
+    form = cmds.formLayout(w=_HUMANOID_FORM_W, h=_HUMANOID_FORM_H)
+
+    # 静的パーツ (head + torso hint)。button では無く text で装飾のみ。
+    head = cmds.text(l="◯\nHEAD", al="center", h=36,
+                     fn="smallBoldLabelFont")
+    cmds.formLayout(form, e=True,
+                     af=[(head, "top", 8), (head, "left", 165)])
+    torso = cmds.text(l="│ TORSO │", al="center", h=20,
+                       fn="smallObliqueLabelFont")
+    cmds.formLayout(form, e=True,
+                     af=[(torso, "top", 155), (torso, "left", 140)])
+    pelvis = cmds.text(l="─ PELVIS ─", al="center", h=20,
+                        fn="smallObliqueLabelFont")
+    cmds.formLayout(form, e=True,
+                     af=[(pelvis, "top", 215), (pelvis, "left", 135)])
+    side_hint = cmds.text(l="R (character 右肩・右脚)         L (character 左肩・左脚)",
+                          al="center", h=16,
+                          fn="smallObliqueLabelFont")
+    cmds.formLayout(form, e=True,
+                     af=[(side_hint, "top", 46), (side_hint, "left", 12)])
+
+    # 12 個の joint slot button
+    for (label, role_idx), (x, y) in _HUMANOID_POSITIONS.items():
+        btn_name = f"map_slot_{label}_{role_idx}"
+        btn = cmds.button(btn_name, l="+ " + _ROLE_ABBREV[label][role_idx],
+                           w=72, h=24,
+                           bgc=(0.32, 0.32, 0.32),
+                           ann=f"{_FIXED_ROLE_JP[label][role_idx]} (未割当)")
+        # left-click: pick from selection。late-binding 対策で default args capture
+        cmds.button(btn, e=True,
+                     c=lambda _x=None, _b=btn, _l=label, _r=role_idx:
+                         _slot_pick_from_selection(_b, _l, _r))
+        # right-click menu
+        pu = cmds.popupMenu(p=btn, button=3)
+        cmds.menuItem(l="Pick from selection",
+                      c=lambda _x=None, _b=btn, _l=label, _r=role_idx:
+                          _slot_pick_from_selection(_b, _l, _r))
+        cmds.menuItem(l="Enter joint name…",
+                      c=lambda _x=None, _b=btn, _l=label, _r=role_idx:
+                          _slot_prompt_name(_b, _l, _r))
+        cmds.menuItem(l="Select in scene",
+                      c=lambda _x=None, _b=btn: _slot_select_in_scene(_b))
+        cmds.menuItem(divider=True)
+        cmds.menuItem(l="Clear",
+                      c=lambda _x=None, _b=btn, _l=label, _r=role_idx:
+                          _slot_clear(_b, _l, _r))
+        _MAP_UI_FIXED_FIELDS[(label, role_idx)] = btn
+        cmds.formLayout(form, e=True,
+                         af=[(btn, "left", x), (btn, "top", y)])
+
+    cmds.setParent("..")   # exit formLayout, back to outer columnLayout
+
+    cmds.text(l="灰 = 未割当  /  緑 = OK  /  赤 = joint 不在 (rename か再割当)",
+              al="center", fn="smallObliqueLabelFont")
 
     cmds.separator(h=8, style="in")
     cmds.text(l="=== Variable chains (spine / tail / hair 等、可変長) ===",
