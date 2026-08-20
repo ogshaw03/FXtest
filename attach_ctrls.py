@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.32"
+__version__ = "0.9.33"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -582,7 +582,7 @@ def _lock_hide_attrs(ctl, attrs):
 
 
 def attach_controllers(joints=None, scale=1.0, do_constrain=True,
-                        auto_scale=True, skip_decoration=False):
+                        auto_scale=True, skip_decoration=True):
     """選択された joint に mGear 風のコントローラを一括セットアップ。
 
     Args:
@@ -3292,7 +3292,7 @@ def neutralize_leg_bind_bend():
     return len(pairs)
 
 
-def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True,
+def full_auto_setup(scale=1.0, skip_decoration=True, delete_junk=True,
                     mapping=None):
     """FBX 直後の状態から完全 rig setup を 1 コマンドで実行。
     1. namespace 除去
@@ -3435,6 +3435,11 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True,
         for chain in ikfk_chains.values():
             exclude.update(chain)
 
+        # v0.9.32 診断: exclude 内容と件数を print (skip_decoration=False で
+        # arm ctl が生成されない bug 報告への切り分け材料)
+        print(f"[{_PACKAGE}] Step5 IK/FK 除外対象 ({len(exclude)}): "
+              f"{sorted(exclude)}")
+
         all_joints = cmds.ls(type="joint") or []
         # v0.9.24: twist joint は FK cube ctl の対象外 (auto-drive で
         # multiplyDivide 接続するため、parentConstraint と衝突しないよう
@@ -3445,10 +3450,21 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True,
                  if j not in exclude
                  and not j.endswith("_end")
                  and not _is_twist_bone(j)]
-        attach_result = attach_controllers(joints=other, scale=scale,
-                                            do_constrain=True,
-                                            auto_scale=True,
-                                            skip_decoration=skip_decoration)
+
+        # v0.9.32 defensive: attach_controllers 内部で 1 joint が例外を起こしても
+        # Step 7 の IK/FK setup は必ず走らせる。従来は Step 5 の予期せぬ例外で
+        # Step 7 まで到達せず「腕/脚 ctl が生成されない」bug 報告があった。
+        attach_result = {}
+        try:
+            attach_result = attach_controllers(joints=other, scale=scale,
+                                                do_constrain=True,
+                                                auto_scale=True,
+                                                skip_decoration=skip_decoration)
+        except Exception as _step5_exc:
+            import traceback as _tb
+            cmds.warning(f"[{_PACKAGE}] Step 5 attach_controllers 例外 → Step 7 は続行: "
+                          f"{_step5_exc}")
+            print(f"[{_PACKAGE}] Step 5 traceback:\n{_tb.format_exc()}")
 
         # Step 6: ルート系 ctl の親を main_ctl に寄せる
         # (attach_ctrls_grp 直下の孤立 npo を main_ctl の下に移動)
@@ -3465,6 +3481,23 @@ def full_auto_setup(scale=1.0, skip_decoration=False, delete_junk=True,
         # Step 7: IK/FK setup (IK ctl NPO は独立世界置き = 足接地 目的) (55-97%)
         _pw_span(55, 97); _pw_sub(0, "Setup IK/FK chains...")
         ik_results = setup_all_ik_fk(mapping=mapping)
+
+        # v0.9.32 診断: 期待した chain 数 vs 実際に生成できた IK ctl 数を突合
+        got_labels = {r.get("label") for r in ik_results}
+        expected_labels = set(ikfk_chains.keys())
+        missing_labels = expected_labels - got_labels
+        if missing_labels:
+            cmds.warning(f"[{_PACKAGE}] IK/FK 未生成 chain: {sorted(missing_labels)} "
+                          f"(期待 {sorted(expected_labels)}, 実際 {sorted(got_labels)})")
+        missing_ctls = []
+        for lbl in expected_labels:
+            for suf in ("_IK_ctl", "_PV_ctl", "_UI_ctl"):
+                nm = lbl + suf
+                if not cmds.objExists(nm):
+                    missing_ctls.append(nm)
+        if missing_ctls:
+            cmds.warning(f"[{_PACKAGE}] 生成失敗 ctl ({len(missing_ctls)}): "
+                          f"{missing_ctls}")
 
         # Step 8: twist joint auto-drive 配線 (97-100%)
         _pw_span(97, 100); _pw_sub(0, "Wire twist joints...")
@@ -3510,9 +3543,11 @@ def _build_body() -> None:
     )
     cmds.checkBoxGrp(
         _UI_SKIP_DECOR,
-        label="Skip:", label1="装飾骨 (hair/ribbon/skirt/coat/ear/tail 等)",
-        value1=False, cw2=(60, 280),
-        ann="装飾系の骨は ctl を付けない (視覚的にすっきり)",
+        label="Skip:", label1="揺れもの骨 (hair/ribbon/skirt/coat/ear/tail 等)",
+        value1=True, cw2=(60, 280),
+        ann="揺れもの (装飾系) は attach_ctrls では ctl を付けず、専用ツール "
+             "(jiggle_bones.show_ui) 側で dynamics/simulation を組む方針 "
+             "(v0.9.33 デフォルト True 化)",
     )
     cmds.checkBoxGrp(
         _UI_DELETE_JUNK,

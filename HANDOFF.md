@@ -1,6 +1,6 @@
 # FXtest attach_ctrls.py 引き継ぎ
 
-**最終更新**: 2026-08-05  **現行**: v0.9.32 (mapping UI 人型 body-diagram 化)
+**最終更新**: 2026-08-06  **現行**: v0.9.33 (skip_decoration=True 化 + jiggle_bones.py scaffold)
 
 Repo: https://github.com/ogshaw03/FXtest
 
@@ -55,7 +55,8 @@ Repo: https://github.com/ogshaw03/FXtest
 | 0.9.30 | 42b2987 | **tool twist bone を twist のみに応答**: inheritsTransform=0 + wtAddMatrix + decomposeMatrix で node network 位置追従 (ペアレントコンストレイン不使用) |
 | 0.9.31 | b4aaa64 | **Chain Mapping UI** 追加。UDE/HIJI/TE 等 命名非標準キャラで user が手動で joint を割当てて確実に rig を組める。Bug 2 dyn PV 検討結果を design comment に残置 (functional 変更なし) |
 | 0.9.31 | 0ce8b15 | **Step 5 duplicate ctl bugfix + UI row_key 衝突対策** (5-scout 検証で発覚)。regression test 2 件追加 (8/8 PASS) |
-| 0.9.32 | (pending) | **Mapping UI を人型 body-diagram に刷新**。12 joint slot を人体位置に絶対配置、click で pick from selection、右click menu (pick/enter/select in scene/clear)、色分け (灰=未割当/緑=OK/赤=不在) |
+| 0.9.32 | e5aa778 | **Mapping UI を人型 body-diagram に刷新**。12 joint slot を人体位置に絶対配置、click で pick from selection、右click menu (pick/enter/select in scene/clear)、色分け (灰=未割当/緑=OK/赤=不在) |
+| 0.9.33 | (pending) | **skip_decoration デフォルト True 化 + jiggle_bones.py scaffold**。attach_ctrls は主 rig 専業 (arm/leg/spine)、揺れもの (hair/skirt/ribbon/tail/coat/ear) は新設の jiggle_bones で dynamics/simulation を組む方針転換。full_auto_setup / attach_controllers / UI checkbox の default を True に、jiggle_bones は chain 検出 API + UI scaffold のみ実装 (simulation 方式は仕様確認後) |
 
 ---
 
