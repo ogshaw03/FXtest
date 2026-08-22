@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -1071,9 +1071,18 @@ def show_ui():
 def _build_category_section(category, chain_list, parent=None):
     """1 カテゴリ (hair / skirt 等) の param field + chain checkbox 群を作る。"""
     defaults = DEFAULT_PARAMS_BY_CATEGORY.get(category, {})
+    # v0.3.4: 既存 hairSystem があれば現在値を優先表示 (無ければ default)
+    hs_xform = f"jb_hairSystem_{category}"
+    live_values = None
+    if cmds.objExists(hs_xform):
+        try:
+            live_values = get_category_params(category)
+        except Exception:
+            live_values = None
     cat_jp = _CATEGORY_JP.get(category, category)
+    hs_marker = "  [構築済]" if live_values is not None else ""
     frame_kwargs = dict(
-        l=f"  {cat_jp}  ({category} / {len(chain_list)} 本)",
+        l=f"  {cat_jp}  ({category} / {len(chain_list)} 本){hs_marker}",
         cll=True, cl=False, mw=6, mh=4,
         bgc=(0.22, 0.24, 0.28),
     )
@@ -1083,8 +1092,10 @@ def _build_category_section(category, chain_list, parent=None):
     inner = cmds.columnLayout(adj=True, rs=3, p=frame)
 
     # シミュレーションパラメータ (per-category)
+    # 表示値の優先順位: 既存 hairSystem の live 値 > default 経験則
+    src = live_values if live_values is not None else defaults
     for attr in _PARAM_ATTRS:
-        v = defaults.get(attr, 0.0)
+        v = src.get(attr, defaults.get(attr, 0.0))
         label_jp = _PARAM_LABEL_JP.get(attr, attr) + " :"
         fld = cmds.floatFieldGrp(numberOfFields=1, label=label_jp,
                                    value1=v, cw2=(180, 80), p=inner)
