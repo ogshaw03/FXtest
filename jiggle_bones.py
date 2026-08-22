@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.4.7"
+__version__ = "0.5.0"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -350,10 +350,19 @@ def _next_multi_index(node, multi_attr):
     return (max(existing) + 1) if existing else 0
 
 
-def _get_or_create_hair_system(category):
-    """カテゴリごとに 1 個の hairSystem を返す。無ければ作って nucleus に接続。"""
+def _hair_system_name_for_chain(chain, category):
+    """v0.5.0: chain 1 本ごとに 1 hairSystem。名前は `jb_hs_<cat>_<chainId>`。"""
+    return f"jb_hs_{category}_{_chain_id(chain)}"
+
+
+def _get_or_create_hair_system(category, chain=None):
+    """v0.5.0: chain を渡すと per-chain hairSystem を返す (article-verbatim)。
+    chain=None (旧 API) の場合は per-category shared にフォールバック。"""
     _ensure_jb_group()
-    hs_xform = f"jb_hairSystem_{category}"
+    if chain is not None:
+        hs_xform = _hair_system_name_for_chain(chain, category)
+    else:
+        hs_xform = f"jb_hairSystem_{category}"
     hs_shape = hs_xform + "Shape"
     if cmds.objExists(hs_shape):
         return hs_xform, hs_shape
@@ -852,64 +861,49 @@ def create_jiggle_for_chain(chain, category=None):
         remove_jiggle_for_chain(chain)
 
     _ensure_jb_group()
-    hs_xform, hs_shape = _get_or_create_hair_system(category)
+    # v0.5.0: per-chain hairSystem (per-category shared 廃止)
+    hs_xform, hs_shape = _get_or_create_hair_system(category, chain=chain)
 
     # ---- 1. FK ctls (各 joint 位置に nested cube) ----
     fk_ctls, fk_npos = _create_fk_ctls_for_chain(chain)
     root_ctl = fk_ctls[0]
 
-    # ---- 2. FK duplicate chain (FK ctls が rotate 駆動) ----
+    # ---- 2. FK duplicate chain (FK ctls が rotate 駆動 → rest curve に伝達) ----
     fk_chain = _dup_chain(chain, _fk_joint_name)
     _parent_to_jb(fk_chain[0])
     for ctl, fkj in zip(fk_ctls, fk_chain):
-        # orientConstraint: ctl の world rotate → fk joint の rotate
-        cmds.orientConstraint(ctl, fkj, mo=False,
-                                n=fkj + "_oc")
-    # FK chain root は root ctl の WS transform に完全追従させる (translate も)
+        cmds.orientConstraint(ctl, fkj, mo=False, n=fkj + "_oc")
     cmds.pointConstraint(root_ctl, fk_chain[0], mo=False,
                           n=fk_chain[0] + "_pc")
 
-    # ---- 3. DYN duplicate chain (spline IK が rotate 駆動) ----
-    dyn_chain = _dup_chain(chain, _dyn_joint_name)
-    _parent_to_jb(dyn_chain[0])
-    # DYN chain root も root ctl に位置追従 (spline IK は rotate 駆動、
-    # 起点位置は curve root から取るが、root joint も揃えておく)
-    cmds.pointConstraint(root_ctl, dyn_chain[0], mo=False,
-                          n=dyn_chain[0] + "_pc")
-
-    # ---- 4. Rest curve: joint 位置に沿って作り、CV を FK chain に cluster 束縛 ----
+    # ---- 3. Rest curve: joint 位置で作成 → CV を FK chain に cluster 束縛 ----
+    #    Option B (hybrid): FK ctl を回すと rest curve が変形 →
+    #    sim の "attract target" が ctl 追従する
     rest_curve = _create_rest_curve_from_chain(chain)
     _bind_curve_cvs_to_joints(rest_curve, fk_chain)
 
-    # ---- 5. hairSystem follicle + dynamic curve + spline IK on DYN chain ----
+    # ---- 4. makeCurvesDynamic on rest curve → hairSystem + follicle + curve2 ----
     dyn_shape = _add_follicle_to_hair_system(rest_curve, hs_shape, chain)
-    ikh = _create_spline_ik(dyn_chain, dyn_shape)
 
-    # ---- 6. dynamics attr を root FK ctl に追加 (0..1、0=手付け FK / 1=full dyn) ----
+    # ---- 5. SplineIK を ORIGINAL chain 直接に張る (v0.5.0 core、article verbatim) ----
+    #    curve2.worldSpace[0] → ikHandle.inCurve
+    #    → collision force が減衰なく直接 ORIGINAL rotate を駆動
+    ikh = _create_spline_ik(chain, dyn_shape)
+
+    # ---- 6. dynBlend attr → hairSystem.startCurveAttract (逆値、Maya native blend) ----
+    #    dynBlend=1 → attract=0 (完全 sim) / dynBlend=0 → attract=1 (FK ほぼ固定)
     if not cmds.attributeQuery("dynBlend", node=root_ctl, exists=True):
         cmds.addAttr(root_ctl, ln="dynBlend", at="float",
                       min=0.0, max=1.0, dv=1.0, k=True)
-
-    # ---- 7. 元 joint に FK/DYN rotate blend の parentConstraint (translate skip) ----
     rev = cmds.createNode("reverse", n=_dynrev_name(chain))
     cmds.connectAttr(f"{root_ctl}.dynBlend", rev + ".inputX", f=True)
-    for orig, fkj, dynj in zip(chain, fk_chain, dyn_chain):
-        pc = cmds.parentConstraint(
-            fkj, dynj, orig, mo=True,
-            st=("x", "y", "z"),   # translate は元階層 or 別 constraint に任せる
-            n=_blend_pc_name(orig),
-        )[0]
-        wal = cmds.parentConstraint(pc, q=True, wal=True)  # [fkW, dynW]
-        try:
-            cmds.setAttr(pc + ".interpType", 2)  # shortest, euler flip 回避
-        except Exception:
-            pass
-        cmds.connectAttr(f"{root_ctl}.dynBlend", pc + "." + wal[1], f=True)
-        cmds.connectAttr(rev + ".outputX",       pc + "." + wal[0], f=True)
+    try:
+        cmds.connectAttr(rev + ".outputX",
+                          f"{hs_shape}.startCurveAttract", f=True)
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] startCurveAttract 接続失敗: {exc}")
 
-    # ---- 8. root joint に translate 用の parentConstraint (root_ctl → chain[0]) ----
-    # 親骨があれば chain[0].translate は元 hierarchy 任せで OK。無ければ
-    # root ctl の world 移動を chain[0] に反映する必要がある。
+    # ---- 7. root joint translate (world-parented chain のみ、SplineIK は rotate 制御) ----
     parent_j = cmds.listRelatives(chain[0], p=True, type="joint") or []
     if not parent_j:
         try:
@@ -918,13 +912,13 @@ def create_jiggle_for_chain(chain, category=None):
         except Exception as exc:
             cmds.warning(f"[jiggle_bones] root translate constraint failed: {exc}")
 
-    print(f"[jiggle_bones] setup {_chain_id(chain)} → category={category}, "
-          f"joints={len(chain)}, root ctl={root_ctl} (dynamics attr on this)")
+    print(f"[jiggle_bones] v0.5.0 setup {_chain_id(chain)} → "
+          f"category={category}, joints={len(chain)}, "
+          f"hairSystem={hs_xform}, root_ctl={root_ctl}")
     return {
         "chain":         chain,
         "category":      category,
         "fk_chain":      fk_chain,
-        "dyn_chain":     dyn_chain,
         "fk_ctls":       fk_ctls,
         "root_ctl":      root_ctl,
         "rest_curve":    rest_curve,
@@ -932,7 +926,7 @@ def create_jiggle_for_chain(chain, category=None):
         "follicle":      _follicle_name(chain),
         "ik_handle":     ikh,
         "hair_system":   hs_xform,
-        "dynamics_attr": f"{root_ctl}.dynBlend",  # UI や API に露出する blend attr
+        "dynamics_attr": f"{root_ctl}.dynBlend",
     }
 
 
@@ -989,13 +983,22 @@ def remove_jiggle_for_chain(chain):
             try: cmds.delete(clu)
             except Exception: pass
 
-    # 5. FK ctls + npo + FK chain + DYN chain
+    # 5. FK ctls + npo + FK chain + (旧 v0.4.x の DYN chain も掃除)
     for orig in chain:
         for nm in (_fk_ctl_name(orig), _fk_npo_name(orig),
                     _fk_joint_name(orig), _dyn_joint_name(orig)):
             if cmds.objExists(nm):
                 try: cmds.delete(nm)
                 except Exception: pass
+
+    # 6. v0.5.0: per-chain hairSystem を削除 (旧 per-category shared は共有なので残す)
+    chain_id = _chain_id(chain)
+    # 各カテゴリ名を試してマッチする per-chain hairSystem を探す
+    for cat in list(_JIGGLE_TOKENS.keys()) + ["hair"]:
+        hs_xform = f"jb_hs_{cat}_{chain_id}"
+        if cmds.objExists(hs_xform):
+            try: cmds.delete(hs_xform)
+            except Exception: pass
 
 
 def is_chain_active(chain):
@@ -1359,12 +1362,25 @@ def list_colliders():
 _PARAM_ATTRS = ("stiffness", "damp", "startCurveAttract", "mass")
 
 
+def _hair_systems_for_category(category):
+    """v0.5.0: 該当 category の全 hairSystem transform 名を返す。
+    per-chain (jb_hs_<cat>_<chain>) と 旧 per-category shared
+    (jb_hairSystem_<cat>) の両方を拾う。"""
+    out = []
+    for pat in (f"jb_hs_{category}_*", f"jb_hairSystem_{category}"):
+        for x in cmds.ls(pat, type="transform") or []:
+            if x not in out:
+                out.append(x)
+    return out
+
+
 def get_category_params(category):
-    """category hairSystem の現在 param を dict で返す。無ければ default。"""
-    hs_xform = f"jb_hairSystem_{category}"
-    if not cmds.objExists(hs_xform):
+    """category の 最初の hairSystem の現在 param を dict で返す。
+    無ければ default 経験則。v0.5.0: per-chain hairSystem 対応。"""
+    hs_list = _hair_systems_for_category(category)
+    if not hs_list:
         return dict(DEFAULT_PARAMS_BY_CATEGORY.get(category, {}))
-    shape = cmds.listRelatives(hs_xform, s=True)[0]
+    shape = cmds.listRelatives(hs_list[0], s=True)[0]
     out = {}
     for a in _PARAM_ATTRS:
         try:
@@ -1375,16 +1391,22 @@ def get_category_params(category):
 
 
 def set_category_params(category, **params):
-    """category hairSystem の param を更新 (無ければ何もしない)。"""
-    hs_xform = f"jb_hairSystem_{category}"
-    if not cmds.objExists(hs_xform):
-        return
-    shape = cmds.listRelatives(hs_xform, s=True)[0]
-    for a, v in params.items():
-        try:
-            cmds.setAttr(f"{shape}.{a}", v)
-        except Exception as exc:
-            cmds.warning(f"[jiggle_bones] set {a}={v} failed: {exc}")
+    """category の 全 hairSystem に param を反映 (v0.5.0: per-chain 全部 loop)。"""
+    hs_list = _hair_systems_for_category(category)
+    n = 0
+    for hs_xform in hs_list:
+        shapes = cmds.listRelatives(hs_xform, s=True, type="hairSystem") or []
+        if not shapes:
+            continue
+        shape = shapes[0]
+        for a, v in params.items():
+            try:
+                cmds.setAttr(f"{shape}.{a}", v)
+            except Exception as exc:
+                cmds.warning(f"[jiggle_bones] set {a}={v} on {shape} failed: {exc}")
+        n += 1
+    if n > 1:
+        print(f"[jiggle_bones] set_category_params: {n} hairSystem(s) updated")
 
 
 # =========================================================================

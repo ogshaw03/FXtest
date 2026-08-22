@@ -110,7 +110,8 @@ try:
     # ---- Remove jiggle → FK ctls / duplicates / constraint / dyn attr すべて掃除 ----
     jiggle_bones.remove_jiggle_for_chain(chain)
     still_exists = [n for n in (fk_ctls + [
-        result["fk_chain"][0], result["dyn_chain"][0],
+        result["fk_chain"][0],
+        # v0.5.0: dyn_chain 廃止 (SplineIK が ORIGINAL 直接)
         result["ik_handle"], result["rest_curve"],
     ]) if cmds.objExists(n)]
     report("remove_cleaned_all", len(still_exists) == 0,
