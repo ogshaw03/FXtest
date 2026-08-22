@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -638,7 +638,14 @@ def _ui_remove_all(*_):
 
 
 def show_ui():
-    """揺れもの dynamics UI (v0.2.0 hairSystem 本実装)。"""
+    """揺れもの dynamics UI (v0.2.1 header/body/footer レイアウト)。
+
+    formLayout で:
+      - header (title + 使い方) を上端固定
+      - footer (Setup All / Remove All / Refresh) を下端固定
+      - body (collider + カテゴリ) を残り領域に scrollLayout で配置
+    こうすると window resize しても footer の action ボタンが常に見える。
+    """
     if cmds is None:
         raise RuntimeError("show_ui() must be called inside Maya.")
     if cmds.window(WINDOW, exists=True):
@@ -646,33 +653,62 @@ def show_ui():
     _ui_reset_state()
 
     win = cmds.window(WINDOW, t=f"Jiggle Bones  v{__version__}",
-                      w=520, h=780, mnb=True, mxb=False, s=True)
-    main = cmds.scrollLayout(cr=True, w=520, h=780)
-    cmds.columnLayout(adj=True, rs=6, cat=("both", 10))
+                      w=540, h=680, mnb=True, mxb=True, s=True)
 
-    cmds.text(l="揺れもの hairSystem dynamics (nucleus 共有 + カテゴリ別 hairSystem)",
-              al="left", fn="boldLabelFont")
-    cmds.text(l="rest curve が親骨追従、live simulation (timeline scrub で確認)。"
-                 "collider は手動選択で add。",
-              al="left", fn="smallObliqueLabelFont", ww=True)
+    form = cmds.formLayout("jbForm", w=540, h=680)
 
-    # ---- Collider section ----
-    cmds.separator(h=8, style="in")
-    cmds.text(l="=== Collider mesh(es) ===", al="left", fn="boldLabelFont")
+    # ---- HEADER (title + 使い方 workflow) ----
+    header = cmds.columnLayout("jbHeader", adj=True, rs=3,
+                                cat=("both", 10), p=form)
+    cmds.text(l=f"Jiggle Bones  v{__version__}  —  hairSystem dynamics",
+              al="left", fn="boldLabelFont", p=header)
+    cmds.text(l="使い方: ①collider を選択して Add  ②各カテゴリで params 調整  "
+                "③chain 単位 [Setup] or 底部 [Setup All Enabled]  "
+                "④timeline scrub で確認",
+              al="left", fn="smallObliqueLabelFont", ww=True, p=header,
+              w=520)
+    cmds.separator(h=6, style="in", p=header)
+
+    # ---- FOOTER (常に見える action バー) ----
+    footer = cmds.columnLayout("jbFooter", adj=True, rs=3,
+                                cat=("both", 10), p=form)
+    cmds.separator(h=6, style="in", p=footer)
+    footer_row = cmds.rowLayout(nc=3, adj=1, p=footer,
+                                 cw3=(200, 130, 160),
+                                 ct3=("both", "both", "both"),
+                                 co3=(4, 4, 4))
+    cmds.button(l="⚡ Setup All Enabled", h=34, c=_ui_setup_all_enabled,
+                bgc=(0.90, 0.55, 0.10), p=footer_row)
+    cmds.button(l="Remove All", h=34, c=_ui_remove_all,
+                bgc=(0.55, 0.30, 0.30), p=footer_row)
+    cmds.button(l="Refresh Detection", h=34, c=lambda *_: show_ui(),
+                bgc=(0.35, 0.55, 0.75), p=footer_row)
+
+    # ---- BODY (scroll 領域: collider + カテゴリ) ----
+    body_scroll = cmds.scrollLayout("jbBody", cr=True, p=form,
+                                     horizontalScrollBarThickness=0)
+    body_col = cmds.columnLayout(adj=True, rs=6, cat=("both", 10),
+                                  p=body_scroll)
+
+    # collider セクション
+    cmds.text(l="① Collider mesh(es)", al="left",
+              fn="boldLabelFont", p=body_col)
+    cmds.text(l="body/leg 等の mesh を選んで Add。skirt vs 脚 の衝突判定に使う。",
+              al="left", fn="smallObliqueLabelFont", ww=True, p=body_col,
+              w=490)
     cmds.textScrollList(_UI_COLLIDER_LIST, numberOfRows=4, h=80,
-                         allowMultiSelection=True)
-    cmds.rowLayout(nc=3, adj=1, cw3=(1, 130, 130),
-                   ct3=("both", "both", "both"), co3=(2, 2, 2))
-    cmds.text(l="")
-    cmds.button(l="Add from Selection", h=24,
+                         allowMultiSelection=True, p=body_col)
+    col_row = cmds.rowLayout(nc=2, adj=1, p=body_col,
+                              cw2=(200, 200),
+                              ct2=("both", "both"), co2=(2, 2))
+    cmds.button(l="Add from Selection", h=26, p=col_row,
                 c=_ui_collider_add_from_sel, bgc=(0.30, 0.55, 0.30))
-    cmds.button(l="Remove Selected", h=24,
+    cmds.button(l="Remove Selected", h=26, p=col_row,
                 c=_ui_collider_remove_sel, bgc=(0.55, 0.30, 0.30))
-    cmds.setParent("..")
 
-    # ---- Per-category section ----
-    cmds.separator(h=8, style="in")
-    cmds.text(l="=== Chains by category ===", al="left", fn="boldLabelFont")
+    cmds.separator(h=8, style="in", p=body_col)
+    cmds.text(l="②/③ Chains by category  —  params は各枠内、setup は右列ボタン",
+              al="left", fn="boldLabelFont", p=body_col)
 
     try:
         detected = find_jiggle_chains()
@@ -681,70 +717,76 @@ def show_ui():
         detected = {}
 
     if not detected:
-        cmds.text(l="(揺れもの chain が検出されませんでした)",
-                  al="left", fn="smallObliqueLabelFont")
+        cmds.text(l="(揺れもの chain が検出されませんでした。"
+                     "scene に hair_*/skirt_*/tail_* 等の joint がありますか?)",
+                  al="left", fn="smallObliqueLabelFont", ww=True,
+                  p=body_col, w=490)
     else:
         for category, chain_list in sorted(detected.items()):
-            _build_category_section(category, chain_list)
+            _build_category_section(category, chain_list, parent=body_col)
 
-    # ---- Global actions ----
-    cmds.separator(h=8, style="in")
-    cmds.rowLayout(nc=3, adj=3, cw3=(160, 130, 200),
-                   ct3=("both", "both", "both"), co3=(4, 4, 4))
-    cmds.button(l="⚡ Setup All Enabled", h=32, c=_ui_setup_all_enabled,
-                bgc=(0.90, 0.55, 0.10))
-    cmds.button(l="Remove All", h=32, c=_ui_remove_all,
-                bgc=(0.55, 0.30, 0.30))
-    cmds.button(l="Refresh Detection", h=32, c=lambda *_: show_ui(),
-                bgc=(0.35, 0.55, 0.75))
-    cmds.setParent("..")
-
-    cmds.setParent("..")   # exit columnLayout
-    cmds.setParent("..")   # exit scrollLayout
+    # ---- formLayout で header / body / footer を配置 ----
+    cmds.formLayout(form, e=True,
+        af=[
+            (header, "top",    0),
+            (header, "left",   0),
+            (header, "right",  0),
+            (footer, "bottom", 0),
+            (footer, "left",   0),
+            (footer, "right",  0),
+            (body_scroll, "left",  0),
+            (body_scroll, "right", 0),
+        ],
+        ac=[
+            (body_scroll, "top",    2, header),
+            (body_scroll, "bottom", 2, footer),
+        ])
 
     _ui_refresh_colliders()
     cmds.showWindow(win)
     return win
 
 
-def _build_category_section(category, chain_list):
+def _build_category_section(category, chain_list, parent=None):
     """1 カテゴリ (hair / skirt 等) の param field + chain checkbox 群を作る。"""
     defaults = DEFAULT_PARAMS_BY_CATEGORY.get(category, {})
-    cmds.frameLayout(l=f" {category} ({len(chain_list)} chain)",
-                      cll=True, cl=False, mw=6, mh=4,
-                      bgc=(0.22, 0.24, 0.28))
+    frame_kwargs = dict(l=f"  {category}  ({len(chain_list)} chain)",
+                         cll=True, cl=False, mw=6, mh=4,
+                         bgc=(0.22, 0.24, 0.28))
+    if parent:
+        frame_kwargs["p"] = parent
+    frame = cmds.frameLayout(**frame_kwargs)
+    inner = cmds.columnLayout(adj=True, rs=3, p=frame)
 
     # param sliders (per-category)
     for attr in _PARAM_ATTRS:
         v = defaults.get(attr, 0.0)
         fld = cmds.floatFieldGrp(numberOfFields=1, label=attr + ":",
-                                   value1=v, cw2=(140, 80))
+                                   value1=v, cw2=(150, 80), p=inner)
         _UI_CATEGORY_FIELDS[(category, attr)] = fld
 
     cmds.button(l=f"Apply {category} params to existing hairSystem",
                 h=22, c=lambda _x=None, _c=category: _ui_apply_category_params(_c),
-                bgc=(0.30, 0.45, 0.55))
-    cmds.separator(h=4, style="none")
+                bgc=(0.30, 0.45, 0.55), p=inner)
+    cmds.separator(h=6, style="none", p=inner)
 
     # chain rows
     for chain in chain_list:
         cid = _chain_id(chain)
         active = is_chain_active(chain)
-        cmds.rowLayout(nc=4, adj=2, cw4=(30, 240, 80, 80),
-                       ct4=("both", "left", "both", "both"),
-                       co4=(2, 4, 2, 2))
-        cb = cmds.checkBox(l="", v=not active)  # default enable-if-not-active
+        row = cmds.rowLayout(nc=4, adj=2, p=inner,
+                              cw4=(28, 260, 80, 80),
+                              ct4=("both", "left", "both", "both"),
+                              co4=(2, 4, 2, 2))
+        cb = cmds.checkBox(l="", v=not active, p=row)
         _UI_CHAIN_CHECKS[(category, cid)] = cb
         status = "  [ACTIVE]" if active else ""
-        cmds.text(l=f"{cid}  ({len(chain)} joints → {_short(chain[-1])}){status}",
-                   al="left", fn="smallPlainLabelFont")
-        cmds.button(l="Setup", h=22,
+        cmds.text(l=f"{cid}  ({len(chain)} → {_short(chain[-1])}){status}",
+                   al="left", fn="smallPlainLabelFont", p=row)
+        cmds.button(l="Setup", h=22, p=row,
                     c=lambda _x=None, _c=category, _ch=chain:
                         _ui_setup_chain(_c, _ch),
                     bgc=(0.30, 0.55, 0.30))
-        cmds.button(l="Remove", h=22,
+        cmds.button(l="Remove", h=22, p=row,
                     c=lambda _x=None, _ch=chain: _ui_remove_chain(_ch),
                     bgc=(0.55, 0.30, 0.30))
-        cmds.setParent("..")
-
-    cmds.setParent("..")   # exit frameLayout

@@ -29,6 +29,7 @@ _SHELF_BUTTON_LABEL = "AttachCtrl"
 _REMOTE_FILES = (
     "attach_ctrls.py",   # メインツール
     "fbx_renamer.py",    # attach_ctrls から import される helper
+    "jiggle_bones.py",   # v0.9.34+: 揺れもの dynamics ("Jiggle Bones…" ボタンで起動)
 )
 # --- END CUSTOMIZE -------------------------------------------------------
 

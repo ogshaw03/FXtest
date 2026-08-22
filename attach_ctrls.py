@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.33"
+__version__ = "0.9.34"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3570,6 +3570,15 @@ def _build_body() -> None:
                 bgc=(0.35, 0.45, 0.65))
     cmds.setParent("..")
 
+    # v0.9.34: 揺れもの (hair/skirt/tail 等) 専用 dynamics UI 起動ボタン
+    # attach_ctrls では skip_decoration=True で除外される chain を、
+    # jiggle_bones (hairSystem + follicle + spline IK) で dynamics 化する。
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
+    cmds.button(l="🌊 Jiggle Bones…  (hair/skirt/tail 等 揺れもの dynamics)",
+                h=28, c=_ui_open_jiggle_bones,
+                bgc=(0.30, 0.55, 0.70))
+    cmds.setParent("..")
+
     cmds.separator(h=10, style="in")
 
     # ============ Section 1: 個別ステップ (advanced) ============
@@ -3721,6 +3730,31 @@ def _ui_attach(*_):
 
 def _ui_delete(*_):
     delete_generated()
+
+
+def _ui_open_jiggle_bones(*_):
+    """揺れもの UI (jiggle_bones.show_ui) を起動。
+    lazy import で attach_ctrls 単体運用時の依存を回避 (jiggle_bones.py が
+    scripts フォルダに無くても attach_ctrls 本体は動作する)。"""
+    try:
+        import importlib, sys as _sys
+        if "jiggle_bones" in _sys.modules:
+            importlib.reload(_sys.modules["jiggle_bones"])
+            jb = _sys.modules["jiggle_bones"]
+        else:
+            import jiggle_bones as jb
+        jb.show_ui()
+    except ImportError:
+        cmds.confirmDialog(
+            title="Jiggle Bones not installed",
+            message="jiggle_bones.py が Maya scripts フォルダ (または sys.path) に\n"
+                    "見つかりません。\n\n"
+                    "GitHub raw から取得:\n"
+                    "https://raw.githubusercontent.com/ogshaw03/FXtest/main/jiggle_bones.py\n"
+                    "を C:/Users/<user>/Documents/maya/2023/scripts/ に保存してください。",
+            button=["OK"], defaultButton="OK")
+    except Exception as exc:
+        cmds.warning(f"[attach_ctrls] jiggle_bones の起動に失敗: {exc}")
 
 
 # =========================================================================
