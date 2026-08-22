@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -677,7 +677,21 @@ def _add_follicle_to_hair_system(rest_curve, hs_shape, chain):
     except Exception:
         pass
 
+    # 先に reparent (translate connect 後だと absolute 保持で conflict する)
     _parent_to_jb(foll_xform)
+
+    # v0.4.4 collision 修正: follicle transform を hair root 位置に driven させる
+    # (Maya 標準 makeCurvesDynamic と同じ接続)。これが無いと follicle が
+    # 常に origin に居続け、simulation の hair CV 座標系と collider mesh の
+    # world 座標系がズレて衝突判定が起きない。
+    try:
+        cmds.connectAttr(foll_shape + ".outTranslate",
+                          foll_xform + ".translate", f=True)
+        cmds.connectAttr(foll_shape + ".outRotate",
+                          foll_xform + ".rotate", f=True)
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] follicle self-connect failed: {exc}")
+
     return dyn_shape
 
 
