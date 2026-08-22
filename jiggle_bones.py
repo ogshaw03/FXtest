@@ -57,10 +57,28 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.3.0"
+__version__ = "0.3.3"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
+
+# UI 表示用の日本語ラベル (API 用 identifier は英語のまま維持)
+_CATEGORY_JP = {
+    "hair":    "髪",
+    "skirt":   "スカート",
+    "ribbon":  "リボン",
+    "sleeve":  "袖",
+    "necktie": "ネクタイ",
+    "coat":    "コート",
+    "ear":     "耳",
+    "tail":    "しっぽ",
+}
+_PARAM_LABEL_JP = {
+    "stiffness":         "硬さ (stiffness)",
+    "damp":              "減衰 (damp)",
+    "startCurveAttract": "元形状復元 (attract)",
+    "mass":              "質量 (mass)",
+}
 
 # =========================================================================
 # Chain classification / detection (v0.1.0 と同一)
@@ -956,12 +974,15 @@ def show_ui():
     # ---- HEADER (title + 使い方 workflow) ----
     header = cmds.columnLayout("jbHeader", adj=True, rs=3,
                                 cat=("both", 10), p=form)
-    cmds.text(l=f"Jiggle Bones  v{__version__}  —  FK ctls + hairSystem overlay",
+    cmds.text(l=f"Jiggle Bones  v{__version__}  —  FK コントローラー + "
+                 "hairSystem オーバーレイ",
               al="left", fn="boldLabelFont", p=header)
-    cmds.text(l="使い方: ①collider Add ②params 調整 ③chain 単位 [Setup] "
-                "→ 各 joint に FK cube ctl 生成 (root は tR自由・子はR)。"
-                "④root ctl の dynBlend attr で FK(0)↔dynamics(1) blend。"
-                "⑤timeline scrub で dynamics 確認",
+    cmds.text(l="使い方:  ①コライダー mesh を追加  ②各カテゴリで"
+                "シミュレーションパラメータを調整  ③chain ごとに「セット"
+                "アップ」→ 全 joint に FK cube ctl が生成される (root ctl は"
+                "移動+回転可、子 ctl は回転のみ)。 ④root ctl の "
+                "dynBlend アトリビュートで FK(0) ↔ dynamics(1) をブレンド。"
+                " ⑤タイムラインを再生してシミュレーション確認",
               al="left", fn="smallObliqueLabelFont", ww=True, p=header,
               w=520)
     cmds.separator(h=6, style="in", p=header)
@@ -974,11 +995,11 @@ def show_ui():
                                  cw3=(200, 130, 160),
                                  ct3=("both", "both", "both"),
                                  co3=(4, 4, 4))
-    cmds.button(l="⚡ Setup All Enabled", h=34, c=_ui_setup_all_enabled,
-                bgc=(0.90, 0.55, 0.10), p=footer_row)
-    cmds.button(l="Remove All", h=34, c=_ui_remove_all,
+    cmds.button(l="⚡ チェック済 chain を一括セットアップ", h=34,
+                c=_ui_setup_all_enabled, bgc=(0.90, 0.55, 0.10), p=footer_row)
+    cmds.button(l="すべて削除", h=34, c=_ui_remove_all,
                 bgc=(0.55, 0.30, 0.30), p=footer_row)
-    cmds.button(l="Refresh Detection", h=34, c=lambda *_: show_ui(),
+    cmds.button(l="chain 再検出", h=34, c=lambda *_: show_ui(),
                 bgc=(0.35, 0.55, 0.75), p=footer_row)
 
     # ---- BODY (scroll 領域: collider + カテゴリ) ----
@@ -988,9 +1009,10 @@ def show_ui():
                                   p=body_scroll)
 
     # collider セクション
-    cmds.text(l="① Collider mesh(es)", al="left",
+    cmds.text(l="① コライダー (衝突対象 mesh)", al="left",
               fn="boldLabelFont", p=body_col)
-    cmds.text(l="body/leg 等の mesh を選んで Add。skirt vs 脚 の衝突判定に使う。",
+    cmds.text(l="体・脚など mesh を選んで「選択から追加」。スカート ⇄ 脚の"
+                "衝突判定に使います。",
               al="left", fn="smallObliqueLabelFont", ww=True, p=body_col,
               w=490)
     cmds.textScrollList(_UI_COLLIDER_LIST, numberOfRows=4, h=80,
@@ -998,13 +1020,14 @@ def show_ui():
     col_row = cmds.rowLayout(nc=2, adj=1, p=body_col,
                               cw2=(200, 200),
                               ct2=("both", "both"), co2=(2, 2))
-    cmds.button(l="Add from Selection", h=26, p=col_row,
+    cmds.button(l="選択から追加", h=26, p=col_row,
                 c=_ui_collider_add_from_sel, bgc=(0.30, 0.55, 0.30))
-    cmds.button(l="Remove Selected", h=26, p=col_row,
+    cmds.button(l="選択を削除", h=26, p=col_row,
                 c=_ui_collider_remove_sel, bgc=(0.55, 0.30, 0.30))
 
     cmds.separator(h=8, style="in", p=body_col)
-    cmds.text(l="②/③ Chains by category  —  params は各枠内、setup は右列ボタン",
+    cmds.text(l="②/③ カテゴリ別 chain — シミュレーションパラメータは各枠内、"
+                "セットアップ/削除は右列のボタン",
               al="left", fn="boldLabelFont", p=body_col)
 
     try:
@@ -1015,7 +1038,8 @@ def show_ui():
 
     if not detected:
         cmds.text(l="(揺れもの chain が検出されませんでした。"
-                     "scene に hair_*/skirt_*/tail_* 等の joint がありますか?)",
+                     "scene に hair_*/skirt_*/tail_*/coat_*/ear_* 等の "
+                     "joint がありますか?)",
                   al="left", fn="smallObliqueLabelFont", ww=True,
                   p=body_col, w=490)
     else:
@@ -1047,24 +1071,29 @@ def show_ui():
 def _build_category_section(category, chain_list, parent=None):
     """1 カテゴリ (hair / skirt 等) の param field + chain checkbox 群を作る。"""
     defaults = DEFAULT_PARAMS_BY_CATEGORY.get(category, {})
-    frame_kwargs = dict(l=f"  {category}  ({len(chain_list)} chain)",
-                         cll=True, cl=False, mw=6, mh=4,
-                         bgc=(0.22, 0.24, 0.28))
+    cat_jp = _CATEGORY_JP.get(category, category)
+    frame_kwargs = dict(
+        l=f"  {cat_jp}  ({category} / {len(chain_list)} 本)",
+        cll=True, cl=False, mw=6, mh=4,
+        bgc=(0.22, 0.24, 0.28),
+    )
     if parent:
         frame_kwargs["p"] = parent
     frame = cmds.frameLayout(**frame_kwargs)
     inner = cmds.columnLayout(adj=True, rs=3, p=frame)
 
-    # param sliders (per-category)
+    # シミュレーションパラメータ (per-category)
     for attr in _PARAM_ATTRS:
         v = defaults.get(attr, 0.0)
-        fld = cmds.floatFieldGrp(numberOfFields=1, label=attr + ":",
-                                   value1=v, cw2=(150, 80), p=inner)
+        label_jp = _PARAM_LABEL_JP.get(attr, attr) + " :"
+        fld = cmds.floatFieldGrp(numberOfFields=1, label=label_jp,
+                                   value1=v, cw2=(180, 80), p=inner)
         _UI_CATEGORY_FIELDS[(category, attr)] = fld
 
-    cmds.button(l=f"Apply {category} params to existing hairSystem",
+    cmds.button(l=f"{cat_jp} のパラメータを反映",
                 h=22, c=lambda _x=None, _c=category: _ui_apply_category_params(_c),
-                bgc=(0.30, 0.45, 0.55), p=inner)
+                bgc=(0.30, 0.45, 0.55), p=inner,
+                ann=f"上記の値を既存の hairSystem ({category}) に上書き適用")
     cmds.separator(h=6, style="none", p=inner)
 
     # chain rows
@@ -1072,18 +1101,21 @@ def _build_category_section(category, chain_list, parent=None):
         cid = _chain_id(chain)
         active = is_chain_active(chain)
         row = cmds.rowLayout(nc=4, adj=2, p=inner,
-                              cw4=(28, 260, 80, 80),
+                              cw4=(28, 260, 90, 70),
                               ct4=("both", "left", "both", "both"),
                               co4=(2, 4, 2, 2))
-        cb = cmds.checkBox(l="", v=not active, p=row)
+        cb = cmds.checkBox(l="", v=not active, p=row,
+                            ann="チェックを入れると「一括セットアップ」の対象")
         _UI_CHAIN_CHECKS[(category, cid)] = cb
-        status = "  [ACTIVE]" if active else ""
-        cmds.text(l=f"{cid}  ({len(chain)} → {_short(chain[-1])}){status}",
+        status = "  [適用中]" if active else ""
+        cmds.text(l=f"{cid}  ({len(chain)} 個 → {_short(chain[-1])}){status}",
                    al="left", fn="smallPlainLabelFont", p=row)
-        cmds.button(l="Setup", h=22, p=row,
+        cmds.button(l="セットアップ", h=22, p=row,
                     c=lambda _x=None, _c=category, _ch=chain:
                         _ui_setup_chain(_c, _ch),
-                    bgc=(0.30, 0.55, 0.30))
-        cmds.button(l="Remove", h=22, p=row,
+                    bgc=(0.30, 0.55, 0.30),
+                    ann="この chain に FK ctl + hairSystem dynamics を構築")
+        cmds.button(l="削除", h=22, p=row,
                     c=lambda _x=None, _ch=chain: _ui_remove_chain(_ch),
-                    bgc=(0.55, 0.30, 0.30))
+                    bgc=(0.55, 0.30, 0.30),
+                    ann="この chain の jiggle 関連 node を全削除")
