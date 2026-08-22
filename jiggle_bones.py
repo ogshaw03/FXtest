@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -634,12 +634,11 @@ def create_jiggle_for_chain(chain, category=None):
         except Exception as exc:
             cmds.warning(f"[jiggle_bones] root translate constraint failed: {exc}")
 
-    # v0.3.1: setup 時に sim-follow scriptJob を auto-enable (mayapy standalone
-    # では scriptJob 使えないので try/except で無害化)
-    try:
-        enable_sim_follow()
-    except Exception:
-        pass
+    # v0.3.2: sim → ctl follow は default OFF (安定性優先)。
+    # 必要な user だけ UI の "Sim → Ctl Follow" ボタンで opt-in する。
+    # (feedback ループ回避のため 1-frame 遅延で書き戻すが、setup 時に自動で
+    #  scriptJob を立ち上げるのは動作予測性を損なうため v0.3.1 → v0.3.2 で
+    #  auto-enable を撤回)
 
     print(f"[jiggle_bones] setup {_chain_id(chain)} → category={category}, "
           f"joints={len(chain)}, root ctl={root_ctl} (dynBlend attr on this)")
@@ -1149,7 +1148,9 @@ def show_ui():
     cmds.text(l="使い方: ①collider Add ②params 調整 ③chain 単位 [Setup] "
                 "→ 各 joint に FK cube ctl 生成 (root は tR自由・子はR)。"
                 "④root ctl の dynBlend attr で FK(0)↔dynamics(1) blend。"
-                "⑤timeline scrub で dynamics 確認",
+                "⑤timeline scrub で dynamics 確認。"
+                "※ sim ON 時に ctl も揺らしたい場合のみ footer の Sim→Ctl "
+                "Follow を opt-in (default OFF、安定性優先)",
               al="left", fn="smallObliqueLabelFont", ww=True, p=header,
               w=520)
     cmds.separator(h=6, style="in", p=header)
