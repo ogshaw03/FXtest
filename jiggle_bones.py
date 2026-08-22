@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -322,6 +322,16 @@ def _get_or_create_nucleus():
                       cmds.playbackOptions(q=True, min=True))
     except Exception:
         pass
+    # v0.4.2 貫通対策: default より高精度化
+    #   subSteps: 3 → 6 (frame 間の計算刻み倍増)
+    #   maxCollisionIterations: 4 → 8 (衝突ペア反復)
+    #   spaceScale: 1.0 のまま (キャラサイズ依存なので UI で調整予定)
+    for attr, val in (("subSteps", 6),
+                       ("maxCollisionIterations", 8)):
+        try:
+            cmds.setAttr(f"{n}.{attr}", val)
+        except Exception:
+            pass
     # nucleus は shape なので transform を取得
     parents = cmds.listRelatives(n, p=True) or []
     top = parents[0] if parents else n
@@ -390,9 +400,15 @@ def _get_or_create_hair_system(category):
     # を追加しても衝突判定が効かない (hair が mesh を貫通する) 現象があった。
     # nRigid を nucleus に登録しても、hair 側で collide=1 にしないと反応
     # しない仕様なので明示 setAttr する。
+    # v0.4.2 貫通対策強化: iterations と collide サンプリング数を増やす
+    #   iterations: 1 → 3 (毎フレーム solver 反復)
+    #   collideOverSample: 1 → 4 (frame 間の collide 検出回数)
+    #   collideWidthOffset: 0 → 0.1 (少しマージン)
     for coll_attr, val in (("collide", 1),
                             ("collideStrength", 1.0),
-                            ("collideOverSample", 2),
+                            ("iterations", 3),
+                            ("collideOverSample", 4),
+                            ("collideWidthOffset", 0.1),
                             ("selfCollide", 0)):
         try:
             cmds.setAttr(f"{hs_shape}.{coll_attr}", val)
@@ -924,6 +940,30 @@ def add_collider(mesh):
     except Exception as exc:
         cmds.warning(f"[jiggle_bones] nucleus 接続失敗: {exc}")
 
+    # v0.4.2 貫通対策: nRigid.thickness の default (0.1) は薄すぎて MMD 系
+    # キャラ (Y=20+) では実質透明。mesh bbox の最短辺の 2% を目安に厚みを
+    # 自動算出する。最小 0.1, 最大 5.0 でクランプ。pushOut も同じ値に。
+    try:
+        bb = cmds.exactWorldBoundingBox(mesh)   # [xmin,ymin,zmin, xmax,ymax,zmax]
+        dims = sorted([bb[3]-bb[0], bb[4]-bb[1], bb[5]-bb[2]])
+        min_dim = dims[0]                       # 最短辺
+        thickness = max(0.1, min(5.0, min_dim * 0.02))
+    except Exception:
+        thickness = 0.5
+    for a, v in (("thickness", thickness),
+                  ("pushOut", thickness * 0.5),
+                  ("pushOutRadius", thickness * 4.0),
+                  ("bounce", 0.0),
+                  ("friction", 0.2),
+                  ("stickiness", 0.0),
+                  ("collisionFlag", 4)):   # 4 = mesh face (default 3 = surface)
+        try:
+            cmds.setAttr(f"{nr_shape}.{a}", v)
+        except Exception:
+            pass
+    print(f"[jiggle_bones] nRigid thickness={thickness:.3f} (mesh bbox 最短辺 "
+          f"の 2%、貫通しづらい厚みに自動設定)")
+
     _parent_to_jb(nr_xform)
 
     # v0.4.1: コライダーを追加した瞬間に全 hairSystem の collide=1 も張って
@@ -946,23 +986,57 @@ def remove_collider(mesh):
 
 
 def enable_collision_on_all_hair_systems():
-    """既存の jb_hairSystem_* すべてに collide=1 を強制セット。
-    v0.4.0 以前で作った setup を v0.4.1+ の collision 対応に upgrade する。
+    """既存の jb_hairSystem_* すべてに collide=1 + 高精度パラメータを強制セット。
+    v0.4.0 以前で作った setup を v0.4.2+ の collision 対応に upgrade する。
+    さらに nucleus と全 nRigid も高精度化 (subSteps / thickness auto)。
     Returns: 更新した hairSystem 数。"""
     n = 0
+    # hairSystem
     for xf in cmds.ls("jb_hairSystem_*", type="transform") or []:
         shapes = cmds.listRelatives(xf, s=True, type="hairSystem") or []
         for sh in shapes:
             for coll_attr, val in (("collide", 1),
                                     ("collideStrength", 1.0),
-                                    ("collideOverSample", 2)):
+                                    ("iterations", 3),
+                                    ("collideOverSample", 4),
+                                    ("collideWidthOffset", 0.1)):
                 try:
                     cmds.setAttr(f"{sh}.{coll_attr}", val)
                 except Exception:
                     pass
             n += 1
+    # nucleus
+    if cmds.objExists(NUCLEUS_NAME):
+        for attr, val in (("subSteps", 6), ("maxCollisionIterations", 8)):
+            try:
+                cmds.setAttr(f"{NUCLEUS_NAME}.{attr}", val)
+            except Exception:
+                pass
+    # nRigid collider の thickness を mesh bbox から再算出
+    for coll_xf in cmds.ls("jb_collider_*", type="transform") or []:
+        # jb_collider_<meshName> → 元 mesh 名を復元して bbox 取得
+        mesh_name = coll_xf[len("jb_collider_"):]
+        if not cmds.objExists(mesh_name):
+            continue
+        try:
+            bb = cmds.exactWorldBoundingBox(mesh_name)
+            dims = sorted([bb[3]-bb[0], bb[4]-bb[1], bb[5]-bb[2]])
+            thickness = max(0.1, min(5.0, dims[0] * 0.02))
+        except Exception:
+            thickness = 0.5
+        nr_shapes = cmds.listRelatives(coll_xf, s=True, type="nRigid") or []
+        for sh in nr_shapes:
+            for a, v in (("thickness", thickness),
+                          ("pushOut", thickness * 0.5),
+                          ("pushOutRadius", thickness * 4.0),
+                          ("collisionFlag", 4)):
+                try:
+                    cmds.setAttr(f"{sh}.{a}", v)
+                except Exception:
+                    pass
     if n:
-        print(f"[jiggle_bones] enabled collision on {n} hairSystem(s)")
+        print(f"[jiggle_bones] enabled collision on {n} hairSystem(s), "
+              f"boosted nucleus + nRigid params")
     return n
 
 
