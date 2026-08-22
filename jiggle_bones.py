@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -278,19 +278,195 @@ def _ik_handle_name(chain):
     return f"jb_ikh_{_chain_id(chain)}"
 
 
+# v0.3.0 追加: FK ctl / dual chain 用の命名
+def _fk_joint_name(orig_joint):
+    return _short(orig_joint) + "_jbFK"
+
+
+def _dyn_joint_name(orig_joint):
+    return _short(orig_joint) + "_jbDYN"
+
+
+def _fk_ctl_name(orig_joint):
+    return _short(orig_joint) + "_jbCtl"
+
+
+def _fk_npo_name(orig_joint):
+    return _short(orig_joint) + "_jbNpo"
+
+
+def _blend_pc_name(orig_joint):
+    return _short(orig_joint) + "_jbPC"
+
+
+def _dynrev_name(chain):
+    return f"jb_dynrev_{_chain_id(chain)}"
+
+
+def _root_pc_name(chain):
+    return f"jb_rootpc_{_chain_id(chain)}"
+
+
+def _root_offset_pc_name(chain):
+    return f"jb_rootoff_{_chain_id(chain)}"
+
+
+def _cluster_name(chain, cv_idx):
+    return f"jb_clu_{_chain_id(chain)}_cv{cv_idx}"
+
+
+# =========================================================================
+# v0.3.0 helpers: FK ctl / dual chain / rest curve binding
+# =========================================================================
+
+def _make_cube_curve(name, size=1.0):
+    """簡易 wireframe cube (単一 nurbsCurve、d=1)。attach_ctrls と同形。"""
+    s = size * 0.5
+    pts = [(-s, s, s), (s, s, s), (s, -s, s), (-s, -s, s), (-s, s, s),
+           (-s, s, -s), (s, s, -s), (s, s, s), (s, s, -s), (s, -s, -s),
+           (s, -s, s), (s, -s, -s), (-s, -s, -s), (-s, -s, s),
+           (-s, -s, -s), (-s, s, -s)]
+    knots = list(range(len(pts)))
+    return cmds.curve(d=1, p=pts, k=knots, n=name)
+
+
+def _set_ctl_color(ctl, index):
+    """override color index を curve shape に設定。"""
+    shapes = cmds.listRelatives(ctl, s=True, type="nurbsCurve") or []
+    for sh in shapes:
+        try:
+            cmds.setAttr(sh + ".overrideEnabled", 1)
+            cmds.setAttr(sh + ".overrideColor", index)
+        except Exception:
+            pass
+
+
+def _lock_hide_attrs(node, attrs):
+    for a in attrs:
+        try:
+            cmds.setAttr(f"{node}.{a}", l=True, k=False, cb=False)
+        except Exception:
+            pass
+
+
+def _chain_segment_length(chain):
+    """chain 内 joint 間の平均距離 (ctl scale 計算用)。"""
+    import math
+    if len(chain) < 2:
+        return 1.0
+    dists = []
+    for a, b in zip(chain, chain[1:]):
+        pa = cmds.xform(a, q=True, ws=True, t=True)
+        pb = cmds.xform(b, q=True, ws=True, t=True)
+        dists.append(math.sqrt(sum((x - y) ** 2 for x, y in zip(pa, pb))))
+    return sum(dists) / len(dists) if dists else 1.0
+
+
+def _dup_chain(orig_chain, suffix_fn):
+    """orig_chain と同 world 位置の clean duplicate chain を作って返す。
+    元 chain の親子関係を保つ (親→子順)。twist bones や子骨は含めない。"""
+    new = []
+    for j in orig_chain:
+        nm = suffix_fn(j)
+        if cmds.objExists(nm):
+            cmds.delete(nm)
+        # po=True で children を含めず duplicate
+        dup = cmds.duplicate(j, po=True, n=nm)[0]
+        # 一旦 world に出す (再親子付けのため)
+        try:
+            cmds.parent(dup, world=True)
+        except Exception:
+            pass
+        new.append(dup)
+    # 親子付け (world 位置は自動保持)
+    for i in range(1, len(new)):
+        cmds.parent(new[i], new[i - 1])
+    return new
+
+
+def _create_fk_ctls_for_chain(orig_chain):
+    """各 orig joint 位置に FK cube ctl を配置。
+    root ctl は translate + rotate 自由、子 ctl は rotate のみ。
+    root ctl の npo は jiggle_bones_grp 下 (親骨があれば parentConstraint 追従)。
+    子 ctl の npo は親 ctl の下 (nested hierarchy)。
+
+    Returns: (ctls, npos)  ← 各 list は root → tip 順
+    """
+    seg = _chain_segment_length(orig_chain)
+    ctl_size = max(seg * 0.4, 0.1)
+    ctls, npos = [], []
+    prev_ctl = None
+    for i, j in enumerate(orig_chain):
+        ctl_name = _fk_ctl_name(j)
+        npo_name = _fk_npo_name(j)
+        # 既存があれば削除 (再セットアップ対応)
+        for nm in (ctl_name, npo_name):
+            if cmds.objExists(nm):
+                cmds.delete(nm)
+        ctl = _make_cube_curve(ctl_name, size=ctl_size)
+        # color: root = orange(21), child = light-blue(28)
+        _set_ctl_color(ctl, 21 if i == 0 else 28)
+        npo = cmds.group(em=True, n=npo_name)
+        cmds.parent(ctl, npo)
+        cmds.matchTransform(npo, j, pos=True, rot=True)
+        if i == 0:
+            _parent_to_jb(npo)
+            # 元 chain root に親骨があれば、その親骨に npo を parentConstraint
+            # (キャラの動きに ctl 自体が追従、animator は local offset を打つ形)
+            parent_j = cmds.listRelatives(j, p=True, type="joint") or []
+            if parent_j:
+                try:
+                    cmds.parentConstraint(parent_j[0], npo, mo=True,
+                                            n=_root_offset_pc_name(orig_chain))
+                except Exception:
+                    pass
+            # root ctl: translate + rotate 開放、scale + visibility ロック
+            _lock_hide_attrs(ctl, ["sx", "sy", "sz", "v"])
+        else:
+            cmds.parent(npo, prev_ctl)
+            # 子 ctl: rotate のみ (translate/scale ロック)
+            _lock_hide_attrs(ctl, ["tx", "ty", "tz", "sx", "sy", "sz", "v"])
+        prev_ctl = ctl
+        ctls.append(ctl)
+        npos.append(npo)
+    return ctls, npos
+
+
+def _bind_curve_cvs_to_joints(curve, joints):
+    """curve の各 CV を対応 joint に cluster で固定 (CV 数 == joints 数 想定)。
+    joint が動くと curve CV が同期して動く → rest curve が FK 追従。
+    Returns: cluster transform 名の list。"""
+    shape = cmds.listRelatives(curve, s=True, type="nurbsCurve") or []
+    if not shape:
+        return []
+    shape = shape[0]
+    n_cv = cmds.getAttr(shape + ".spans") + cmds.getAttr(shape + ".degree")
+    clusters = []
+    for i in range(min(n_cv, len(joints))):
+        clu = cmds.cluster(f"{curve}.cv[{i}]",
+                            n=_cluster_name([joints[0]], i))
+        # returned = [clusterNode, clusterHandle]
+        handle = clu[1]
+        # cluster handle を joint 下に parent (joint 動くと CV も動く)
+        try:
+            cmds.parent(handle, joints[i])
+            # cluster handle の visibility off (viewport 邪魔なので)
+            cmds.setAttr(handle + ".visibility", 0)
+        except Exception as exc:
+            cmds.warning(f"[jiggle_bones] cluster parent failed: {exc}")
+        clusters.append(handle)
+    return clusters
+
+
 def _create_rest_curve_from_chain(chain):
-    """chain の joint 位置に沿って NURBS curve を作り、親骨に parentConstraint する。"""
+    """chain の joint 位置に沿って NURBS curve を作る (親追従は呼び出し側で設定)。"""
     pts = [cmds.xform(j, q=True, ws=True, t=True) for j in chain]
     degree = 3 if len(pts) >= 4 else max(1, len(pts) - 1)
-    curve = cmds.curve(d=degree, p=pts, n=_rest_curve_name(chain))
-    # 親骨 (chain の start joint の親)
-    parent = cmds.listRelatives(chain[0], p=True, type="joint") or []
-    if parent:
-        try:
-            cmds.parentConstraint(parent[0], curve, mo=True,
-                                    n=curve + "_pc")
-        except Exception as exc:
-            cmds.warning(f"[jiggle_bones] rest curve parentConstraint failed: {exc}")
+    # 既存を削除して作り直し (再セットアップ対応)
+    curve_name = _rest_curve_name(chain)
+    if cmds.objExists(curve_name):
+        cmds.delete(curve_name)
+    curve = cmds.curve(d=degree, p=pts, n=curve_name)
     _parent_to_jb(curve)
     return curve
 
@@ -362,7 +538,23 @@ def _create_spline_ik(chain, dynamic_curve_shape):
 
 
 def create_jiggle_for_chain(chain, category=None):
-    """chain (親→末端 joint list) に hairSystem dynamics を組む。"""
+    """chain (親→末端 joint list) に FK ctls + hairSystem dynamics overlay を組む。
+
+    ## v0.3.0 挙動 (通常セットアップ + dynamics overlay)
+      1. FK ctls を各 joint 位置に配置 (root は translate + rotate、子は rotate のみ)
+      2. FK duplicate chain: FK ctls が rotate を駆動
+      3. DYN duplicate chain: hairSystem 経由の spline IK が rotate を駆動
+      4. 元 joint の rotate = parentConstraint(fk_j, dyn_j, orig, mo=True, st=(...))
+         weight は root FK ctl の `dynamics` attr (0..1) で blend
+         (dynamics=0 → FK 100%、dynamics=1 → DYN 100%)
+      5. chain root が world-parented (親骨無し) の場合、root ctl → chain[0]
+         への parentConstraint (translate のみ) で animator が chain 全体を
+         移動できるように
+
+    Args:
+        chain:    元 joint 名 list (親→末端)
+        category: hair/skirt/tail 等 (None なら _classify で自動判定)
+    """
     if cmds is None:
         raise RuntimeError("Must run inside Maya.")
     if not chain or len(chain) < 2:
@@ -371,49 +563,153 @@ def create_jiggle_for_chain(chain, category=None):
     if category is None:
         category = _classify(chain[0]) or "hair"
 
-    # 既存 jiggle があれば先に remove (二重張り防止)
-    if cmds.objExists(_ik_handle_name(chain)):
+    # 既存があれば先に remove (二重張り防止)
+    if is_chain_active(chain):
         remove_jiggle_for_chain(chain)
 
     _ensure_jb_group()
     hs_xform, hs_shape = _get_or_create_hair_system(category)
 
+    # ---- 1. FK ctls (各 joint 位置に nested cube) ----
+    fk_ctls, fk_npos = _create_fk_ctls_for_chain(chain)
+    root_ctl = fk_ctls[0]
+
+    # ---- 2. FK duplicate chain (FK ctls が rotate 駆動) ----
+    fk_chain = _dup_chain(chain, _fk_joint_name)
+    _parent_to_jb(fk_chain[0])
+    for ctl, fkj in zip(fk_ctls, fk_chain):
+        # orientConstraint: ctl の world rotate → fk joint の rotate
+        cmds.orientConstraint(ctl, fkj, mo=False,
+                                n=fkj + "_oc")
+    # FK chain root は root ctl の WS transform に完全追従させる (translate も)
+    cmds.pointConstraint(root_ctl, fk_chain[0], mo=False,
+                          n=fk_chain[0] + "_pc")
+
+    # ---- 3. DYN duplicate chain (spline IK が rotate 駆動) ----
+    dyn_chain = _dup_chain(chain, _dyn_joint_name)
+    _parent_to_jb(dyn_chain[0])
+    # DYN chain root も root ctl に位置追従 (spline IK は rotate 駆動、
+    # 起点位置は curve root から取るが、root joint も揃えておく)
+    cmds.pointConstraint(root_ctl, dyn_chain[0], mo=False,
+                          n=dyn_chain[0] + "_pc")
+
+    # ---- 4. Rest curve: joint 位置に沿って作り、CV を FK chain に cluster 束縛 ----
     rest_curve = _create_rest_curve_from_chain(chain)
+    _bind_curve_cvs_to_joints(rest_curve, fk_chain)
+
+    # ---- 5. hairSystem follicle + dynamic curve + spline IK on DYN chain ----
     dyn_shape = _add_follicle_to_hair_system(rest_curve, hs_shape, chain)
-    ikh = _create_spline_ik(chain, dyn_shape)
+    ikh = _create_spline_ik(dyn_chain, dyn_shape)
+
+    # ---- 6. dynamics attr を root FK ctl に追加 (0..1、0=手付け FK / 1=full dyn) ----
+    if not cmds.attributeQuery("dynBlend", node=root_ctl, exists=True):
+        cmds.addAttr(root_ctl, ln="dynBlend", at="float",
+                      min=0.0, max=1.0, dv=1.0, k=True)
+
+    # ---- 7. 元 joint に FK/DYN rotate blend の parentConstraint (translate skip) ----
+    rev = cmds.createNode("reverse", n=_dynrev_name(chain))
+    cmds.connectAttr(f"{root_ctl}.dynBlend", rev + ".inputX", f=True)
+    for orig, fkj, dynj in zip(chain, fk_chain, dyn_chain):
+        pc = cmds.parentConstraint(
+            fkj, dynj, orig, mo=True,
+            st=("x", "y", "z"),   # translate は元階層 or 別 constraint に任せる
+            n=_blend_pc_name(orig),
+        )[0]
+        wal = cmds.parentConstraint(pc, q=True, wal=True)  # [fkW, dynW]
+        try:
+            cmds.setAttr(pc + ".interpType", 2)  # shortest, euler flip 回避
+        except Exception:
+            pass
+        cmds.connectAttr(f"{root_ctl}.dynBlend", pc + "." + wal[1], f=True)
+        cmds.connectAttr(rev + ".outputX",       pc + "." + wal[0], f=True)
+
+    # ---- 8. root joint に translate 用の parentConstraint (root_ctl → chain[0]) ----
+    # 親骨があれば chain[0].translate は元 hierarchy 任せで OK。無ければ
+    # root ctl の world 移動を chain[0] に反映する必要がある。
+    parent_j = cmds.listRelatives(chain[0], p=True, type="joint") or []
+    if not parent_j:
+        try:
+            cmds.pointConstraint(root_ctl, chain[0], mo=True,
+                                    n=_root_pc_name(chain))
+        except Exception as exc:
+            cmds.warning(f"[jiggle_bones] root translate constraint failed: {exc}")
 
     print(f"[jiggle_bones] setup {_chain_id(chain)} → category={category}, "
-          f"joints={len(chain)}")
+          f"joints={len(chain)}, root ctl={root_ctl} (dynamics attr on this)")
     return {
         "chain":         chain,
         "category":      category,
+        "fk_chain":      fk_chain,
+        "dyn_chain":     dyn_chain,
+        "fk_ctls":       fk_ctls,
+        "root_ctl":      root_ctl,
         "rest_curve":    rest_curve,
         "dynamic_curve": dyn_shape,
         "follicle":      _follicle_name(chain),
         "ik_handle":     ikh,
         "hair_system":   hs_xform,
+        "dynamics_attr": f"{root_ctl}.dynBlend",  # UI や API に露出する blend attr
     }
 
 
 def remove_jiggle_for_chain(chain):
-    """create_jiggle_for_chain で作った node を掃除する。"""
+    """create_jiggle_for_chain で作った node を掃除する (v0.3.0 dual chain 対応)。"""
     if cmds is None:
         return
-    for nm in (_ik_handle_name(chain),
-               _dyn_curve_name(chain),
-               _follicle_name(chain),
-               _rest_curve_name(chain) + "_pc",
+    # 1. constraint 系 (元 joint への blend PC、root PC/offset PC、rev)
+    for orig in chain:
+        pc = _blend_pc_name(orig)
+        if cmds.objExists(pc):
+            try: cmds.delete(pc)
+            except Exception: pass
+    for nm in (_dynrev_name(chain), _root_pc_name(chain),
+               _root_offset_pc_name(chain)):
+        if cmds.objExists(nm):
+            try: cmds.delete(nm)
+            except Exception: pass
+
+    # 2. dynamics attr (root FK ctl から除去)
+    root_ctl_name = _fk_ctl_name(chain[0])
+    if cmds.objExists(root_ctl_name) \
+            and cmds.attributeQuery("dynBlend", node=root_ctl_name, exists=True):
+        try:
+            cmds.deleteAttr(root_ctl_name + ".dynBlend")
+        except Exception:
+            pass
+
+    # 3. spline IK handle + effector
+    ikh = _ik_handle_name(chain)
+    if cmds.objExists(ikh):
+        try: cmds.delete(ikh)
+        except Exception: pass
+
+    # 4. follicle + dyn curve + rest curve + clusters
+    for nm in (_dyn_curve_name(chain), _follicle_name(chain),
                _rest_curve_name(chain)):
         if cmds.objExists(nm):
-            try:
-                cmds.delete(nm)
-            except Exception as exc:
-                cmds.warning(f"[jiggle_bones] delete {nm} failed: {exc}")
+            try: cmds.delete(nm)
+            except Exception: pass
+    # clusters: CV 数だけ (実際の CV 数は curve が既に消えているので、
+    # 元 chain の joint 数を上限に片っ端から検索)
+    for i in range(len(chain) + 4):  # 少し余裕を持たせて
+        clu = _cluster_name(chain, i)
+        if cmds.objExists(clu):
+            try: cmds.delete(clu)
+            except Exception: pass
+
+    # 5. FK ctls + npo + FK chain + DYN chain
+    for orig in chain:
+        for nm in (_fk_ctl_name(orig), _fk_npo_name(orig),
+                    _fk_joint_name(orig), _dyn_joint_name(orig)):
+            if cmds.objExists(nm):
+                try: cmds.delete(nm)
+                except Exception: pass
 
 
 def is_chain_active(chain):
-    """spline IK handle があれば active とみなす。"""
-    return cmds.objExists(_ik_handle_name(chain))
+    """v0.3.0: root FK ctl があれば active とみなす (spline IK も併存)。"""
+    return cmds.objExists(_fk_ctl_name(chain[0])) \
+        or cmds.objExists(_ik_handle_name(chain))
 
 
 # =========================================================================
@@ -660,11 +956,12 @@ def show_ui():
     # ---- HEADER (title + 使い方 workflow) ----
     header = cmds.columnLayout("jbHeader", adj=True, rs=3,
                                 cat=("both", 10), p=form)
-    cmds.text(l=f"Jiggle Bones  v{__version__}  —  hairSystem dynamics",
+    cmds.text(l=f"Jiggle Bones  v{__version__}  —  FK ctls + hairSystem overlay",
               al="left", fn="boldLabelFont", p=header)
-    cmds.text(l="使い方: ①collider を選択して Add  ②各カテゴリで params 調整  "
-                "③chain 単位 [Setup] or 底部 [Setup All Enabled]  "
-                "④timeline scrub で確認",
+    cmds.text(l="使い方: ①collider Add ②params 調整 ③chain 単位 [Setup] "
+                "→ 各 joint に FK cube ctl 生成 (root は tR自由・子はR)。"
+                "④root ctl の dynBlend attr で FK(0)↔dynamics(1) blend。"
+                "⑤timeline scrub で dynamics 確認",
               al="left", fn="smallObliqueLabelFont", ww=True, p=header,
               w=520)
     cmds.separator(h=6, style="in", p=header)

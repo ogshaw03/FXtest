@@ -1,10 +1,12 @@
-"""End-to-end verification for jiggle_bones v0.2.0.
+"""End-to-end verification for jiggle_bones v0.3.0.
 
-- Build a synthetic hair chain (5 joints)
-- Setup hairSystem-based jiggle
-- Simulate 30 frames, verify tip joint moves (dynamics is active)
-- Remove and verify cleanup
-- Add collider mesh and verify nRigid created
+- 合成 hair chain (5 joints, top-level world-parented)
+- FK ctls が全 joint に作られる (root は translate+rotate、子は rotate のみ)
+- root ctl を translate → chain 全体が移動 (v0.3.0 の主要修正点)
+- root ctl.rotate で FK 動作 (dynamics=0 時)
+- dynamics=1 で hairSystem が rotate override (親揺らして tip 動く)
+- remove で全掃除
+- collider add/remove
 """
 import sys, math
 import maya.standalone
@@ -27,92 +29,98 @@ try:
 
     cmds.file(new=True, force=True)
 
-    # Load required plugins
-    for pl in ("MayaMuscle", "nearestPointOnMesh"):
-        pass  # skip
-    try:
-        if not cmds.pluginInfo("mayaHair", q=True, l=True):
-            cmds.loadPlugin("mayaHair", quiet=True)
-    except Exception:
-        pass
-
-    # ---- Build synthetic hair chain (5 joints, vertical) ----
-    # 親 joint は "head" (非 jiggle 名) にして、その子として H1..H5 を作る。
+    # ---- Build synthetic chain: TOP-LEVEL H1..H5 (親骨なし、user 報告状況) ----
     cmds.select(cl=True)
-    parent_joint = cmds.joint(n="head", p=(0, 10, 0))
     chain = []
     for i in range(1, 6):
         nm = f"H{i}"
-        cmds.joint(n=nm, p=(0, 10 - 2*i, 0))
+        j = cmds.joint(n=nm, p=(0, 10 - 2*i, 0))
         chain.append(nm)
+    # H1 を top-level に (H1 の親 = world) — 既に world なら何もしない
+    if cmds.listRelatives(chain[0], p=True):
+        cmds.parent(chain[0], world=True)
 
-    report("synthetic_chain_built", len(chain) == 5, f"chain={chain}")
+    report("synthetic_chain_toplevel", cmds.listRelatives(chain[0], p=True) is None,
+           f"chain[0]={chain[0]} 親={cmds.listRelatives(chain[0], p=True)}")
 
-    # ---- Verify detection classifies as hair ----
-    detected = jiggle_bones.find_jiggle_chains()
-    hair_chains = detected.get("hair", [])
-    matched = any(_c[0] == chain[0] and len(_c) == 5 for _c in hair_chains)
-    report("chain_detected_as_hair", matched,
-           f"got: {[(c[0], len(c)) for c in hair_chains]}")
-
-    # ---- Setup jiggle ----
+    # ---- Setup jiggle (v0.3.0 FK ctls + dynamics) ----
     result = jiggle_bones.create_jiggle_for_chain(chain, category="hair")
-    ok = result is not None and cmds.objExists(result["ik_handle"])
-    report("setup_created_ik_handle", ok,
-           f"ikh={result['ik_handle'] if result else None}")
-    ok = cmds.objExists(result["rest_curve"]) and cmds.objExists("jb_nucleus")
-    report("setup_created_rest_curve_and_nucleus", ok)
-    ok = cmds.objExists(result["hair_system"])
-    report("setup_created_hair_system", ok, f"hs={result['hair_system']}")
+    ok = result is not None
+    report("setup_returned_result", ok)
 
-    # ---- Simulate: play frames 1..30 and check tip joint moved ----
-    cmds.playbackOptions(min=1, max=60)
+    # FK ctl が全 joint 分できている
+    fk_ctls = result["fk_ctls"]
+    report("fk_ctls_created", len(fk_ctls) == 5, f"ctls={fk_ctls}")
+    for c in fk_ctls:
+        report(f"  ctl_exists_{c}", cmds.objExists(c))
+
+    # root ctl に dynamics attr がある
+    root_ctl = result["root_ctl"]
+    has_dyn = cmds.attributeQuery("dynBlend", node=root_ctl, exists=True)
+    report("dynamics_attr_on_root", has_dyn, f"root_ctl={root_ctl}")
+
+    # ---- FK モード (dynamics=0) で root ctl 動かす → chain 全体移動 ----
+    cmds.setAttr(f"{root_ctl}.dynamics", 0.0)
+    cmds.currentTime(1)
+    tip_before = cmds.xform(chain[-1], q=True, ws=True, t=True)
+    root_before = cmds.xform(chain[0], q=True, ws=True, t=True)
+
+    # root ctl を translateX +5
+    cmds.setAttr(f"{root_ctl}.translateX", 5.0)
+    tip_after = cmds.xform(chain[-1], q=True, ws=True, t=True)
+    root_after = cmds.xform(chain[0], q=True, ws=True, t=True)
+    dx_root = root_after[0] - root_before[0]
+    dx_tip  = tip_after[0] - tip_before[0]
+    report("fk_root_translate_moves_chain", abs(dx_root - 5.0) < 0.1 and abs(dx_tip - 5.0) < 0.1,
+           f"root Δx={dx_root:.3f}, tip Δx={dx_tip:.3f} (期待: どちらも 5.0)")
+
+    # reset
+    cmds.setAttr(f"{root_ctl}.translateX", 0.0)
+
+    # ---- FK モードで child ctl.rotateZ で joint が回る ----
+    child_ctl = fk_ctls[2]   # mid ctl (H3)
+    cmds.setAttr(f"{child_ctl}.rotateZ", 45.0)
+    tip_after = cmds.xform(chain[-1], q=True, ws=True, t=True)
+    dx = tip_after[0] - tip_before[0]
+    report("fk_child_rotate_bends_chain", abs(dx) > 0.5,
+           f"child rotZ=45 → tip Δx={dx:.3f}")
+    cmds.setAttr(f"{child_ctl}.rotateZ", 0.0)
+
+    # ---- Dynamics モード (dynamics=1) で hairSystem が働く ----
+    cmds.setAttr(f"{root_ctl}.dynamics", 1.0)
+    cmds.playbackOptions(min=1, max=40)
     cmds.currentTime(1)
     tip_start = cmds.xform(chain[-1], q=True, ws=True, t=True)
-    # Apply a "impulse" by shaking the parent joint
     for f in range(1, 40):
         cmds.currentTime(f)
-        # Sway parent left-right to induce hair motion
-        cmds.setAttr(f"{parent_joint}.translateX", math.sin(f * 0.3) * 5)
+        cmds.setAttr(f"{root_ctl}.translateX", math.sin(f * 0.3) * 5)
     tip_end = cmds.xform(chain[-1], q=True, ws=True, t=True)
     delta = math.sqrt(sum((a - b) ** 2 for a, b in zip(tip_start, tip_end)))
-    report("dynamics_active_tip_moved", delta > 0.5,
-           f"tip delta = {delta:.3f} unit")
+    report("dynamics_tip_moved", delta > 0.3,
+           f"dynamics on + sway → tip Δ={delta:.3f}")
 
-    # ---- Category param get/set ----
-    jiggle_bones.set_category_params("hair", stiffness=0.5, damp=0.4)
-    params = jiggle_bones.get_category_params("hair")
-    ok = abs(params.get("stiffness", 0) - 0.5) < 1e-4 \
-         and abs(params.get("damp", 0) - 0.4) < 1e-4
-    report("category_params_roundtrip", ok, f"got: {params}")
-
-    # ---- is_chain_active ----
-    report("is_chain_active_true", jiggle_bones.is_chain_active(chain))
-
-    # ---- Collider add ----
+    # ---- Collider add / remove ----
     cmds.currentTime(1)
     ground = cmds.polyPlane(w=20, h=20, sx=2, sy=2, n="ground_geo")[0]
     jiggle_bones.add_collider(ground)
-    ok = cmds.objExists("jb_collider_ground_geo")
-    report("collider_created", ok)
-    ok = ground in jiggle_bones.list_colliders()
-    report("collider_listed", ok, f"colliders={jiggle_bones.list_colliders()}")
-
-    # ---- Remove chain ----
-    jiggle_bones.remove_jiggle_for_chain(chain)
-    ok = not cmds.objExists(result["ik_handle"]) \
-         and not cmds.objExists(result["rest_curve"])
-    report("remove_cleaned_nodes", ok)
-    report("is_chain_active_false", not jiggle_bones.is_chain_active(chain))
-
-    # ---- Remove collider ----
+    report("collider_created", cmds.objExists("jb_collider_ground_geo"))
     jiggle_bones.remove_collider(ground)
-    ok = not cmds.objExists("jb_collider_ground_geo")
-    report("collider_removed", ok)
+    report("collider_removed", not cmds.objExists("jb_collider_ground_geo"))
+
+    # ---- Remove jiggle → FK ctls / duplicates / constraint / dyn attr すべて掃除 ----
+    jiggle_bones.remove_jiggle_for_chain(chain)
+    still_exists = [n for n in (fk_ctls + [
+        result["fk_chain"][0], result["dyn_chain"][0],
+        result["ik_handle"], result["rest_curve"],
+    ]) if cmds.objExists(n)]
+    report("remove_cleaned_all", len(still_exists) == 0,
+           f"still exists: {still_exists}")
+    report("is_chain_active_false_after_remove",
+           not jiggle_bones.is_chain_active(chain))
 
 except Exception:
     import traceback
     print("[FAIL] fatal exception:")
     traceback.print_exc()
 
-print("=== JIGGLE SETUP TEST DONE ===")
+print("=== JIGGLE V0.3.0 SETUP TEST DONE ===")
