@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -404,14 +404,23 @@ def _get_or_create_hair_system(category):
     #   iterations: 1 → 3 (毎フレーム solver 反復)
     #   collideOverSample: 1 → 4 (frame 間の collide 検出回数)
     #   collideWidthOffset: 0 → 0.1 (少しマージン)
+    # v0.4.7 記事準拠 (backbone-studio.com/blog-nhairrig):
+    #   collideWidthOffset は「値を上げる」ことで初めて衝突判定が有効化する。
+    #   default 0 は実質 collision OFF。1.0 前後を明示。solverDisplay=1 で
+    #   Collision Thickness を viewport に可視化 (デバッグ用)。
     for coll_attr, val in (("collide", 1),
                             ("collideStrength", 1.0),
                             ("iterations", 3),
                             ("collideOverSample", 4),
-                            ("collideWidthOffset", 0.1),
-                            ("selfCollide", 0)):
+                            ("collideWidthOffset", 1.0),
+                            ("selfCollide", 0),
+                            ("displayColor", (1.0, 1.0, 0.5)),
+                            ):
         try:
-            cmds.setAttr(f"{hs_shape}.{coll_attr}", val)
+            if isinstance(val, tuple):
+                cmds.setAttr(f"{hs_shape}.{coll_attr}", *val, type="double3")
+            else:
+                cmds.setAttr(f"{hs_shape}.{coll_attr}", val)
         except Exception:
             pass
 
@@ -780,8 +789,10 @@ def _add_follicle_to_hair_system(rest_curve, hs_shape, chain):
 def _create_spline_ik(chain, dynamic_curve_shape):
     """chain (親→末端) に spline IK を張り、dynamic curve に追従させる。
 
-    ikHandle は ccv=False で「existing curve を使う」モードにすると返り値は
-    (handleName, effectorName) の 2 要素 (curve 引数は既存指定なので入らない)。
+    v0.4.7 記事準拠: ikHandle 作成後、明示的に
+    `dynamic_curve.worldSpace[0] → ikHandle.inCurve` を再接続する。
+    Maya version によっては `.local` が接続され、follicle 変位が反映
+    されない可能性があるため。
     """
     ikh_name = _ik_handle_name(chain)
     ret = cmds.ikHandle(
@@ -793,6 +804,20 @@ def _create_spline_ik(chain, dynamic_curve_shape):
     )
     ikh = ret[0] if isinstance(ret, (list, tuple)) else ret
     _parent_to_jb(ikh)
+
+    # v0.4.7: worldSpace[0] を明示接続 (記事準拠)
+    try:
+        # 既存 inCurve 接続を切って worldSpace[0] を張り直す
+        cur = cmds.listConnections(ikh + ".inCurve", s=True, d=False,
+                                     plugs=True) or []
+        for c in cur:
+            try: cmds.disconnectAttr(c, ikh + ".inCurve")
+            except Exception: pass
+        cmds.connectAttr(dynamic_curve_shape + ".worldSpace[0]",
+                          ikh + ".inCurve", f=True)
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] spline IK worldSpace connect failed: {exc}")
+
     return ikh
 
 
@@ -990,16 +1015,15 @@ def _collider_name(mesh):
 def add_collider(mesh):
     """指定 mesh を nRigid collider として nucleus に登録。
 
-    Maya の `makeCollideNCloth` MEL は plugin 未 load の環境や mayapy standalone
-    で `setActiveNucleusNode` が見つからないケースがあるため、node を直接
-    createNode + connectAttr で組み立てる (依存少・移植性高)。
+    v0.4.7 記事準拠: Maya 標準の `makeCollideNCloth` MEL を優先使用
+    (FX > nCloth > Create Passive Collider 相当)。mayapy 等で MEL 未使用の
+    fallback として直接 createNode 経路を残す。
     """
     if cmds is None:
         raise RuntimeError("Must run inside Maya.")
     if not cmds.objExists(mesh):
         cmds.warning(f"[jiggle_bones] mesh not found: {mesh}")
         return None
-    # mesh shape 取得
     mesh_shapes = cmds.listRelatives(mesh, s=True, type="mesh") or []
     if not mesh_shapes:
         cmds.warning(f"[jiggle_bones] {mesh} に mesh shape が無い")
@@ -1008,41 +1032,66 @@ def add_collider(mesh):
 
     nucleus = _get_or_create_nucleus()
 
-    # nRigid shape 作成 (transform も自動で作られる)
-    shape_name = _collider_name(mesh) + "Shape"
-    nr_shape = cmds.createNode("nRigid", n=shape_name)
+    # nCloth plugin load
+    try:
+        if not cmds.pluginInfo("nCloth", q=True, l=True):
+            cmds.loadPlugin("nCloth", quiet=True)
+    except Exception:
+        pass
+
+    nr_before = set(cmds.ls(type="nRigid"))
+    created_via_mel = False
+    nr_shape = None
+
+    # ------ Route A: Maya 標準 MEL (interactive Maya) ------
+    try:
+        mel.eval(f'setActiveNucleusNode "{nucleus}"')
+        sel_before = cmds.ls(sl=True)
+        cmds.select(mesh, r=True)
+        mel.eval("makeCollideNCloth;")
+        cmds.select(sel_before or None, r=True)
+        new_nr = list(set(cmds.ls(type="nRigid")) - nr_before)
+        if new_nr:
+            nr_shape = new_nr[0]
+            created_via_mel = True
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] makeCollideNCloth MEL failed → "
+                      f"fallback to manual: {exc}")
+
+    # ------ Route B: 手組み fallback (mayapy standalone 用) ------
+    if nr_shape is None:
+        shape_name = _collider_name(mesh) + "Shape"
+        nr_shape = cmds.createNode("nRigid", n=shape_name)
+        try:
+            cmds.connectAttr(mesh_shape + ".worldMesh[0]",
+                              nr_shape + ".inputMesh", f=True)
+        except Exception as exc:
+            cmds.warning(f"[jiggle_bones] mesh 接続失敗: {exc}")
+        idx = _next_multi_index(nucleus, "inputPassive")
+        try:
+            cmds.connectAttr(nr_shape + ".currentState",
+                              f"{nucleus}.inputPassive[{idx}]", f=True)
+            cmds.connectAttr(nr_shape + ".startState",
+                              f"{nucleus}.inputPassiveStart[{idx}]", f=True)
+            cmds.connectAttr(f"{nucleus}.startFrame",
+                              nr_shape + ".startFrame", f=True)
+            cmds.connectAttr("time1.outTime",
+                              nr_shape + ".currentTime", f=True)
+        except Exception as exc:
+            cmds.warning(f"[jiggle_bones] nucleus 接続失敗: {exc}")
+
+    # transform を jb 規則で rename
     nr_xform_parents = cmds.listRelatives(nr_shape, p=True) or []
     if nr_xform_parents:
-        try:
-            cmds.rename(nr_xform_parents[0], _collider_name(mesh))
-        except Exception:
-            pass
-    # rebuild shape name after rename
-    nr_xform = _collider_name(mesh)
-    shape_now = cmds.listRelatives(nr_xform, s=True) or []
-    if shape_now:
-        nr_shape = shape_now[0]
-
-    # mesh → nRigid: worldMesh を inputMesh に接続
-    try:
-        cmds.connectAttr(mesh_shape + ".worldMesh[0]",
-                          nr_shape + ".inputMesh", f=True)
-    except Exception as exc:
-        cmds.warning(f"[jiggle_bones] mesh 接続失敗: {exc}")
-
-    # nucleus に passive collider として登録
-    idx = _next_multi_index(nucleus, "inputPassive")
-    try:
-        cmds.connectAttr(nr_shape + ".currentState",
-                          f"{nucleus}.inputPassive[{idx}]", f=True)
-        cmds.connectAttr(nr_shape + ".startState",
-                          f"{nucleus}.inputPassiveStart[{idx}]", f=True)
-        cmds.connectAttr(f"{nucleus}.startFrame",
-                          nr_shape + ".startFrame", f=True)
-        cmds.connectAttr("time1.outTime",
-                          nr_shape + ".currentTime", f=True)
-    except Exception as exc:
-        cmds.warning(f"[jiggle_bones] nucleus 接続失敗: {exc}")
+        old_xform = nr_xform_parents[0]
+        target_name = _collider_name(mesh)
+        if old_xform != target_name and not cmds.objExists(target_name):
+            try:
+                cmds.rename(old_xform, target_name)
+                nr_shape = cmds.listRelatives(target_name, s=True)[0]
+            except Exception:
+                pass
+    nr_xform = cmds.listRelatives(nr_shape, p=True)[0]
 
     # v0.4.2 貫通対策 (v0.4.3 改良): nRigid.thickness の default (0.1) は
     # 薄すぎて MMD 系キャラ (Y=20+) では実質透明。
@@ -1104,7 +1153,7 @@ def enable_collision_on_all_hair_systems():
                                     ("collideStrength", 1.0),
                                     ("iterations", 3),
                                     ("collideOverSample", 4),
-                                    ("collideWidthOffset", 0.1)):
+                                    ("collideWidthOffset", 1.0)):
                 try:
                     cmds.setAttr(f"{sh}.{coll_attr}", val)
                 except Exception:
