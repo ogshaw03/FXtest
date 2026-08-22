@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -635,89 +635,144 @@ def _create_rest_curve_from_chain(chain):
 
 
 def _add_follicle_to_hair_system(rest_curve, hs_shape, chain):
-    """rest_curve を follicle 経由で hairSystem に接続し、output dynamic curve を返す。
+    """v0.4.6: Maya 標準 `makeCurvesDynamic` MEL に完全依存する版。
 
-    v0.4.5: Maya 標準 `makeCurvesDynamic` MEL の実際の接続 dump 結果に合わせて
-    リファクタ。rebuildCurve node を rest_curve と follicle の間に挿入して
-    CV 密度を標準化 (nHair sim の collision 精度が joint 数依存にならなくなる)。
-    v0.4.4 で追加した follicle self-connect (outTranslate → translate) は
-    MCD には無く cycle の原因になり得るため撤回。
+    自分で follicle/rebuildCurve を組む方式 (v0.4.5 まで) は視覚上 collision が
+    発火しない問題があった。MEL に丸投げして Maya-blessed 接続を得る。
+    その後 hairSystem を我々のカテゴリ hairSystem に付け替え、余計な
+    自動生成 hairSystem を削除する。
+
+    Args:
+        rest_curve: 元の rest curve transform (cluster で FK chain 追従済み)
+        hs_shape:   我々のカテゴリ hairSystem shape (jb_hairSystem_<cat>Shape)
+        chain:      元 joint chain (id 生成用)
+
+    Returns:
+        dyn_shape:  spline IK 用の dynamic curve shape 名
     """
     _ensure_jb_group()
-    rest_shape = cmds.listRelatives(rest_curve, s=True, type="nurbsCurve") or []
-    if not rest_shape:
-        raise RuntimeError(f"rest curve {rest_curve} に nurbsCurve shape が無い")
-    rest_shape = rest_shape[0]
+    nucleus = _get_or_create_nucleus()
 
-    # ---- rebuildCurve で 密度を標準化 (MCD 準拠) ----
-    # spans = joint 数 × 5 (最低 20)、degree = 3。uniform param。
-    orig_span_count = cmds.getAttr(rest_shape + ".spans")
-    target_spans = max(20, (orig_span_count + 1) * 5)
-    rebuild_node = cmds.createNode("rebuildCurve",
-                                    n=_rest_curve_name(chain) + "_rebuild")
-    cmds.setAttr(rebuild_node + ".spans", target_spans)
-    cmds.setAttr(rebuild_node + ".degree", 3)
-    cmds.setAttr(rebuild_node + ".rebuildType", 0)   # 0 = uniform
-    cmds.setAttr(rebuild_node + ".keepRange", 1)     # 0..1 parameterization
-    cmds.setAttr(rebuild_node + ".keepEndPoints", True)
-    cmds.setAttr(rebuild_node + ".keepTangents", True)
-    cmds.connectAttr(rest_shape + ".worldSpace[0]",
-                      rebuild_node + ".inputCurve", f=True)
-
-    # rebuilt curve shape を作って rebuild の output を受ける
-    rebuilt_shape_name = _rest_curve_name(chain) + "_rebuiltShape"
-    rebuilt_shape = cmds.createNode("nurbsCurve", n=rebuilt_shape_name,
-                                     p=rest_curve)
-    cmds.connectAttr(rebuild_node + ".outputCurve",
-                      rebuilt_shape + ".create", f=True)
-    # 描画上は元 shape だけ見せる (rebuilt は intermediate)
+    # nHair plugin ロード必須
     try:
-        cmds.setAttr(rebuilt_shape + ".intermediateObject", 1)
+        if not cmds.pluginInfo("nHair", q=True, l=True):
+            cmds.loadPlugin("nHair", quiet=True)
     except Exception:
         pass
 
-    # ---- follicle 生成 ----
-    foll_shape = cmds.createNode("follicle", n=_follicle_name(chain) + "Shape")
-    foll_xform = cmds.listRelatives(foll_shape, p=True)[0]
-    foll_xform = cmds.rename(foll_xform, _follicle_name(chain))
-    foll_shape = cmds.listRelatives(foll_xform, s=True)[0]
+    # 既存の hairSystem / follicle を記録 → 新規生成分を差分検出するため
+    hs_before = set(cmds.ls(type="hairSystem"))
+    foll_before = set(cmds.ls(type="follicle"))
+    curves_before = set(cmds.ls(type="nurbsCurve"))
+    nuc_before = set(cmds.ls(type="nucleus"))
 
-    # curve → follicle 接続 (MCD 準拠):
-    #   .startPosition ← rebuiltCurve.local  (密度標準化された CV)
-    #   .startPositionMatrix ← rest_curve.worldMatrix (元 curve の world 変換)
-    cmds.connectAttr(rebuilt_shape + ".local",
-                      foll_shape + ".startPosition", f=True)
-    cmds.connectAttr(rest_shape + ".worldMatrix[0]",
-                      foll_shape + ".startPositionMatrix", f=True)
+    # 現在 nucleus を我々のものに (makeCurvesDynamic はこの nucleus を使う)
+    try:
+        mel.eval(f'setActiveNucleusNode "{nucleus}"')
+    except Exception:
+        pass
 
-    # follicle を hairSystem に登録
-    idx = _next_multi_index(hs_shape, "inputHair")
-    cmds.connectAttr(foll_shape + ".outHair",
-                      f"{hs_shape}.inputHair[{idx}]", f=True)
-    cmds.connectAttr(f"{hs_shape}.outputHair[{idx}]",
-                      foll_shape + ".currentPosition", f=True)
+    # makeCurvesDynamic 実行 (curve を選択して MEL 呼出)
+    sel_before = cmds.ls(sl=True)
+    cmds.select(rest_curve, r=True)
+    try:
+        # args: hairSystemMode ({1:existing,2:new}), flags:
+        #   0: attachToSelected 0/1
+        #   1: createRestCurves 0/1
+        #   2: createOutputCurves 1
+        #   3: overwriteExisting 1
+        #   4: static 0
+        mel.eval('makeCurvesDynamic 2 { "0", "0", "1", "1", "0" };')
+    except Exception as exc:
+        cmds.select(sel_before or None, r=True)
+        raise RuntimeError(f"makeCurvesDynamic failed: {exc}")
+    cmds.select(sel_before or None, r=True)
 
-    # output dynamic curve を生成
-    dyn_shape_name = _dyn_curve_name(chain)
-    dyn_shape = cmds.createNode("nurbsCurve", n=dyn_shape_name + "Shape",
-                                 p=foll_xform)
-    cmds.connectAttr(foll_shape + ".outCurve", dyn_shape + ".create", f=True)
+    # 差分で新規 node 検出
+    new_hs = list(set(cmds.ls(type="hairSystem")) - hs_before)
+    new_foll = list(set(cmds.ls(type="follicle")) - foll_before)
+    new_curves = list(set(cmds.ls(type="nurbsCurve")) - curves_before)
+    new_nuc = list(set(cmds.ls(type="nucleus")) - nuc_before)
 
-    # follicle の default 設定
-    for a, v in (("simulationMethod", 2),   # dynamic
-                  ("pointLock", 1),          # base = root fixed
-                  ("restPose", 1),           # 1 = start curve
-                  ("startDirection", 0),     # U=0 start
-                  ("collide", 1)):
+    if not new_foll:
+        raise RuntimeError("makeCurvesDynamic did not create follicle")
+
+    new_foll_shape = new_foll[0]
+    new_hs_shape = new_hs[0] if new_hs else None
+
+    # dyn curve = follicle.outCurve → nurbsCurve.create
+    dyn_shape = None
+    for c in new_curves:
+        conns = cmds.listConnections(c + ".create", s=True, d=False,
+                                       type="follicle") or []
+        if conns:
+            dyn_shape = c
+            break
+
+    # 自動生成された余計な nucleus を削除 (我々の jb_nucleus に統一する)
+    for n in new_nuc:
+        n_xform_parents = cmds.listRelatives(n, p=True) or []
+        target = n_xform_parents[0] if n_xform_parents else n
         try:
-            cmds.setAttr(f"{foll_shape}.{a}", v)
+            cmds.delete(target)
         except Exception:
             pass
 
+    # 我々のカテゴリ hairSystem に follicle を移動:
+    #   自動生成 hairSystem を切断 → jb hairSystem に接続 → 自動生成 hairSystem 削除
+    if new_hs_shape and new_hs_shape != hs_shape:
+        # 切断 (outHair, currentPosition の両方向)
+        for c in cmds.listConnections(new_foll_shape + ".outHair",
+                                        s=False, d=True, plugs=True) or []:
+            try: cmds.disconnectAttr(new_foll_shape + ".outHair", c)
+            except Exception: pass
+        for c in cmds.listConnections(new_foll_shape + ".currentPosition",
+                                        s=True, d=False, plugs=True) or []:
+            try: cmds.disconnectAttr(c, new_foll_shape + ".currentPosition")
+            except Exception: pass
+        # 我々の hairSystem に再接続
+        idx = _next_multi_index(hs_shape, "inputHair")
+        cmds.connectAttr(new_foll_shape + ".outHair",
+                          f"{hs_shape}.inputHair[{idx}]", f=True)
+        cmds.connectAttr(f"{hs_shape}.outputHair[{idx}]",
+                          new_foll_shape + ".currentPosition", f=True)
+        # 自動生成 hairSystem を削除
+        hs_xform_parents = cmds.listRelatives(new_hs_shape, p=True) or []
+        target = hs_xform_parents[0] if hs_xform_parents else new_hs_shape
+        try:
+            cmds.delete(target)
+        except Exception:
+            pass
+
+    # jiggle 用に pointLock=1 (base only、tip 自由) を明示 (MCD default は 3)
+    try:
+        cmds.setAttr(new_foll_shape + ".pointLock", 1)
+    except Exception:
+        pass
+
+    # 命名を jb_ 規則に統一
+    foll_xform = cmds.listRelatives(new_foll_shape, p=True)[0]
+    try:
+        foll_xform = cmds.rename(foll_xform, _follicle_name(chain))
+        new_foll_shape = cmds.listRelatives(foll_xform, s=True)[0]
+    except Exception:
+        pass
+    if dyn_shape:
+        dyn_xform_parents = cmds.listRelatives(dyn_shape, p=True) or []
+        if dyn_xform_parents:
+            try:
+                new_dyn_xform = cmds.rename(dyn_xform_parents[0],
+                                              _dyn_curve_name(chain))
+                dyn_shape = cmds.listRelatives(new_dyn_xform, s=True)[0]
+            except Exception:
+                pass
+
+    # jb_group 配下に整理 (dyn curve は follicle 下ではなく独立に残る)
     _parent_to_jb(foll_xform)
-    # v0.4.4 の outTranslate/outRotate 自己接続は MCD には無く、
-    # cycle 誘発するため v0.4.5 で撤回。follicle は origin のまま。
-    # simulation は startPositionMatrix (world 変換) を通じて world 座標系で走る。
+    if dyn_shape:
+        dyn_xf = cmds.listRelatives(dyn_shape, p=True)
+        if dyn_xf:
+            _parent_to_jb(dyn_xf[0])
 
     return dyn_shape
 
@@ -887,16 +942,19 @@ def remove_jiggle_for_chain(chain):
         try: cmds.delete(ikh)
         except Exception: pass
 
-    # 4. follicle + dyn curve + rest curve + clusters + rebuildCurve node
-    #    rebuild node は rest curve と別 node なので個別 delete
-    rebuild_node = _rest_curve_name(chain) + "_rebuild"
-    if cmds.objExists(rebuild_node):
-        try: cmds.delete(rebuild_node)
-        except Exception: pass
+    # 4. follicle + dyn curve + rest curve + clusters
+    # (v0.4.6: rebuildCurve は MCD 自動生成分は connection 破棄で参照解除、
+    #  遺る場合は cmds.ls で clean up)
     for nm in (_dyn_curve_name(chain), _follicle_name(chain),
                _rest_curve_name(chain)):
         if cmds.objExists(nm):
             try: cmds.delete(nm)
+            except Exception: pass
+    # 名前規則不定の rebuildCurve / hair intermediate curve を掃除
+    chain_id = _chain_id(chain)
+    for pat in (f"*{chain_id}*rebuild*", f"*{chain_id}*Rebuilt*"):
+        for n in cmds.ls(pat) or []:
+            try: cmds.delete(n)
             except Exception: pass
     # clusters: CV 数だけ (実際の CV 数は curve が既に消えているので、
     # 元 chain の joint 数を上限に片っ端から検索)
