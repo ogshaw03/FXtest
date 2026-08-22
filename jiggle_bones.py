@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -383,6 +383,19 @@ def _get_or_create_hair_system(category):
     for attr, val in DEFAULT_PARAMS_BY_CATEGORY.get(category, {}).items():
         try:
             cmds.setAttr(f"{hs_shape}.{attr}", val)
+        except Exception:
+            pass
+
+    # v0.4.1 bugfix: hairSystem の collide default は OFF なので、コライダー
+    # を追加しても衝突判定が効かない (hair が mesh を貫通する) 現象があった。
+    # nRigid を nucleus に登録しても、hair 側で collide=1 にしないと反応
+    # しない仕様なので明示 setAttr する。
+    for coll_attr, val in (("collide", 1),
+                            ("collideStrength", 1.0),
+                            ("collideOverSample", 2),
+                            ("selfCollide", 0)):
+        try:
+            cmds.setAttr(f"{hs_shape}.{coll_attr}", val)
         except Exception:
             pass
 
@@ -912,6 +925,11 @@ def add_collider(mesh):
         cmds.warning(f"[jiggle_bones] nucleus 接続失敗: {exc}")
 
     _parent_to_jb(nr_xform)
+
+    # v0.4.1: コライダーを追加した瞬間に全 hairSystem の collide=1 も張って
+    # 「add した瞬間に効く」ようにする。既存 setup (v0.4.0 以前) にも安全。
+    enable_collision_on_all_hair_systems()
+
     print(f"[jiggle_bones] collider added: {mesh} → {nr_xform}")
     return nr_xform
 
@@ -925,6 +943,27 @@ def remove_collider(mesh):
             print(f"[jiggle_bones] collider removed: {mesh}")
         except Exception as exc:
             cmds.warning(f"[jiggle_bones] delete collider {nm} failed: {exc}")
+
+
+def enable_collision_on_all_hair_systems():
+    """既存の jb_hairSystem_* すべてに collide=1 を強制セット。
+    v0.4.0 以前で作った setup を v0.4.1+ の collision 対応に upgrade する。
+    Returns: 更新した hairSystem 数。"""
+    n = 0
+    for xf in cmds.ls("jb_hairSystem_*", type="transform") or []:
+        shapes = cmds.listRelatives(xf, s=True, type="hairSystem") or []
+        for sh in shapes:
+            for coll_attr, val in (("collide", 1),
+                                    ("collideStrength", 1.0),
+                                    ("collideOverSample", 2)):
+                try:
+                    cmds.setAttr(f"{sh}.{coll_attr}", val)
+                except Exception:
+                    pass
+            n += 1
+    if n:
+        print(f"[jiggle_bones] enabled collision on {n} hairSystem(s)")
+    return n
 
 
 def list_colliders():
@@ -1188,6 +1227,17 @@ def show_ui():
                 c=_ui_collider_add_from_sel, bgc=(0.30, 0.55, 0.30))
     cmds.button(l="選択を削除", h=26, p=col_row,
                 c=_ui_collider_remove_sel, bgc=(0.55, 0.30, 0.30))
+
+    # v0.4.1: 既存 setup (v0.4.0 以前) で hairSystem.collide=0 のままの
+    # ケース用に collide 強制有効化ボタンを露出
+    coll_fix_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
+    cmds.button(l="全 hairSystem の衝突判定を強制 ON (貫通する時に押す)",
+                h=22, p=coll_fix_row, bgc=(0.55, 0.55, 0.30),
+                c=lambda *_: enable_collision_on_all_hair_systems(),
+                ann="Maya の hairSystem.collide default が OFF なので、"
+                     "v0.4.0 以前の setup では衝突判定が効いていないことが"
+                     "あります。このボタンで全 hairSystem に collide=1 を"
+                     "強制セットします")
 
     cmds.separator(h=8, style="in", p=body_col)
     cmds.text(l="② chain 登録 (選択ピック方式)", al="left",
