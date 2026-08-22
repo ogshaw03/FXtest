@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -940,14 +940,15 @@ def add_collider(mesh):
     except Exception as exc:
         cmds.warning(f"[jiggle_bones] nucleus 接続失敗: {exc}")
 
-    # v0.4.2 貫通対策: nRigid.thickness の default (0.1) は薄すぎて MMD 系
-    # キャラ (Y=20+) では実質透明。mesh bbox の最短辺の 2% を目安に厚みを
-    # 自動算出する。最小 0.1, 最大 5.0 でクランプ。pushOut も同じ値に。
+    # v0.4.2 貫通対策 (v0.4.3 改良): nRigid.thickness の default (0.1) は
+    # 薄すぎて MMD 系キャラ (Y=20+) では実質透明。
+    # 平面 mesh (minDim=0) にも対応するため MAX 辺基準に変更。
+    # 目安: 最大辺の 1% (最小 0.2、最大 5.0 でクランプ)
     try:
         bb = cmds.exactWorldBoundingBox(mesh)   # [xmin,ymin,zmin, xmax,ymax,zmax]
-        dims = sorted([bb[3]-bb[0], bb[4]-bb[1], bb[5]-bb[2]])
-        min_dim = dims[0]                       # 最短辺
-        thickness = max(0.1, min(5.0, min_dim * 0.02))
+        dims = [bb[3]-bb[0], bb[4]-bb[1], bb[5]-bb[2]]
+        max_dim = max(dims)
+        thickness = max(0.2, min(5.0, max_dim * 0.01))
     except Exception:
         thickness = 0.5
     for a, v in (("thickness", thickness),
@@ -1020,8 +1021,9 @@ def enable_collision_on_all_hair_systems():
             continue
         try:
             bb = cmds.exactWorldBoundingBox(mesh_name)
-            dims = sorted([bb[3]-bb[0], bb[4]-bb[1], bb[5]-bb[2]])
-            thickness = max(0.1, min(5.0, dims[0] * 0.02))
+            dims = [bb[3]-bb[0], bb[4]-bb[1], bb[5]-bb[2]]
+            max_dim = max(dims)
+            thickness = max(0.2, min(5.0, max_dim * 0.01))
         except Exception:
             thickness = 0.5
         nr_shapes = cmds.listRelatives(coll_xf, s=True, type="nRigid") or []
@@ -1038,6 +1040,153 @@ def enable_collision_on_all_hair_systems():
         print(f"[jiggle_bones] enabled collision on {n} hairSystem(s), "
               f"boosted nucleus + nRigid params")
     return n
+
+
+_NUCLEUS_ATTRS = ("spaceScale", "subSteps", "maxCollisionIterations",
+                   "gravity")
+_COLLIDER_ATTRS = ("thickness", "pushOut", "pushOutRadius",
+                    "friction", "bounce")
+
+
+def get_nucleus_params():
+    """nucleus の主要 attr を dict で返す (無ければ空)。"""
+    if not cmds.objExists(NUCLEUS_NAME):
+        return {}
+    out = {}
+    for a in _NUCLEUS_ATTRS:
+        try:
+            out[a] = cmds.getAttr(f"{NUCLEUS_NAME}.{a}")
+        except Exception:
+            pass
+    return out
+
+
+def set_nucleus_params(**params):
+    """nucleus に param を適用 (existing のみ、無ければ何もしない)。"""
+    if not cmds.objExists(NUCLEUS_NAME):
+        return
+    for a, v in params.items():
+        try:
+            cmds.setAttr(f"{NUCLEUS_NAME}.{a}", v)
+        except Exception as exc:
+            cmds.warning(f"[jiggle_bones] nucleus.{a}={v} failed: {exc}")
+
+
+def get_collider_params(mesh_or_collider):
+    """指定 collider の thickness/pushOut 等を dict で返す。
+    mesh_or_collider は元 mesh 名 or `jb_collider_<mesh>` transform 名。"""
+    coll = mesh_or_collider
+    if not coll.startswith("jb_collider_"):
+        coll = _collider_name(mesh_or_collider)
+    if not cmds.objExists(coll):
+        return {}
+    shapes = cmds.listRelatives(coll, s=True, type="nRigid") or []
+    if not shapes:
+        return {}
+    sh = shapes[0]
+    out = {}
+    for a in _COLLIDER_ATTRS:
+        try:
+            out[a] = cmds.getAttr(f"{sh}.{a}")
+        except Exception:
+            pass
+    return out
+
+
+def set_collider_params(mesh_or_collider, **params):
+    """指定 collider の nRigid attr を上書き。"""
+    coll = mesh_or_collider
+    if not coll.startswith("jb_collider_"):
+        coll = _collider_name(mesh_or_collider)
+    if not cmds.objExists(coll):
+        cmds.warning(f"[jiggle_bones] collider not found: {coll}")
+        return
+    shapes = cmds.listRelatives(coll, s=True, type="nRigid") or []
+    if not shapes:
+        return
+    sh = shapes[0]
+    for a, v in params.items():
+        try:
+            cmds.setAttr(f"{sh}.{a}", v)
+        except Exception as exc:
+            cmds.warning(f"[jiggle_bones] {sh}.{a}={v} failed: {exc}")
+
+
+def diagnose_collision():
+    """collision setup の状態を console に dump (貫通するときのデバッグ用)。"""
+    print("=" * 70)
+    print("[jiggle_bones] COLLISION DIAGNOSIS")
+    print("=" * 70)
+    # nucleus
+    if not cmds.objExists(NUCLEUS_NAME):
+        print("  [MISSING] nucleus (jb_nucleus)")
+        return
+    print(f"  nucleus: {NUCLEUS_NAME}")
+    for a in ("enable", "spaceScale", "subSteps", "maxCollisionIterations",
+              "gravity", "startFrame"):
+        try:
+            print(f"    .{a} = {cmds.getAttr(f'{NUCLEUS_NAME}.{a}')}")
+        except Exception:
+            pass
+    # hairSystems
+    hs_list = cmds.ls("jb_hairSystem_*", type="transform") or []
+    if not hs_list:
+        print("  [MISSING] no jb_hairSystem_*")
+    for hs_xf in hs_list:
+        shapes = cmds.listRelatives(hs_xf, s=True, type="hairSystem") or []
+        if not shapes:
+            continue
+        sh = shapes[0]
+        print(f"  hairSystem: {hs_xf}")
+        for a in ("collide", "selfCollide", "collideStrength",
+                  "collideOverSample", "collideWidthOffset",
+                  "iterations", "stiffness", "damp", "mass"):
+            try:
+                print(f"    .{a} = {cmds.getAttr(f'{sh}.{a}')}")
+            except Exception:
+                pass
+        # follicle 経由 nucleus 接続確認
+        conns = cmds.listConnections(sh + ".currentState",
+                                       d=True, s=False,
+                                       type="nucleus") or []
+        print(f"    → nucleus: {conns}")
+    # nRigid colliders
+    coll_list = cmds.ls("jb_collider_*", type="transform") or []
+    if not coll_list:
+        print("  [MISSING] no jb_collider_*")
+    for coll_xf in coll_list:
+        shapes = cmds.listRelatives(coll_xf, s=True, type="nRigid") or []
+        if not shapes:
+            continue
+        sh = shapes[0]
+        print(f"  collider: {coll_xf}")
+        for a in ("thickness", "pushOut", "pushOutRadius",
+                  "friction", "bounce", "collisionFlag"):
+            try:
+                print(f"    .{a} = {cmds.getAttr(f'{sh}.{a}')}")
+            except Exception:
+                pass
+        conns = cmds.listConnections(sh + ".currentState",
+                                       d=True, s=False,
+                                       type="nucleus") or []
+        print(f"    → nucleus: {conns}")
+        # input mesh source
+        mesh_src = cmds.listConnections(sh + ".inputMesh",
+                                          s=True, d=False, sh=True) or []
+        print(f"    input mesh: {mesh_src}")
+    # follicles
+    foll_list = cmds.ls("jb_foll_*", type="transform") or []
+    for foll_xf in foll_list[:3]:  # 最初 3 個だけ dump
+        shapes = cmds.listRelatives(foll_xf, s=True, type="follicle") or []
+        if shapes:
+            sh = shapes[0]
+            print(f"  follicle: {foll_xf}")
+            for a in ("simulationMethod", "pointLock", "restPose"):
+                try:
+                    print(f"    .{a} = {cmds.getAttr(f'{sh}.{a}')}")
+                except Exception:
+                    pass
+    print("=" * 70)
 
 
 def list_colliders():
@@ -1091,6 +1240,8 @@ def set_category_params(category, **params):
 
 _UI_COLLIDER_LIST = "jbColliderList"
 _UI_ADD_CATEGORY_MENU = "jbAddCategoryMenu"
+_UI_NUCLEUS_FIELDS = {}      # {attr: fieldGrp}
+_UI_COLLIDER_FIELDS = {}     # {attr: fieldGrp}
 _UI_CAT_PREFIX = "jbCatSection"
 _UI_CHAIN_PREFIX = "jbChainRow"
 
@@ -1145,6 +1296,43 @@ def _ui_apply_category_params(category, *_):
     if params:
         set_category_params(category, **params)
         print(f"[jiggle_bones] {category} params updated: {params}")
+
+
+def _ui_apply_nucleus_params(*_):
+    """UI の nucleus fields を jb_nucleus に反映。"""
+    if not cmds.objExists(NUCLEUS_NAME):
+        cmds.warning("[jiggle_bones] jb_nucleus が未生成 (Setup を先に)")
+        return
+    params = {}
+    for attr, fld in _UI_NUCLEUS_FIELDS.items():
+        if not fld or not (cmds.floatFieldGrp(fld, ex=True)
+                            or cmds.intFieldGrp(fld, ex=True)):
+            continue
+        if cmds.intFieldGrp(fld, ex=True):
+            v = cmds.intFieldGrp(fld, q=True, value1=True)
+        else:
+            v = cmds.floatFieldGrp(fld, q=True, value1=True)
+        params[attr] = v
+    set_nucleus_params(**params)
+    print(f"[jiggle_bones] nucleus params: {params}")
+
+
+def _ui_apply_collider_params(*_):
+    """UI の collider fields をリスト選択中の collider(s) に反映。"""
+    items = cmds.textScrollList(_UI_COLLIDER_LIST, q=True, si=True) or []
+    if not items:
+        cmds.warning("collider リストで対象を選択してください")
+        return
+    params = {}
+    for attr, fld in _UI_COLLIDER_FIELDS.items():
+        if fld and cmds.floatFieldGrp(fld, ex=True):
+            params[attr] = cmds.floatFieldGrp(fld, q=True, value1=True)
+    # pushOutRadius は pushOut の 8x を目安に自動追従
+    if "pushOut" in params:
+        params["pushOutRadius"] = params["pushOut"] * 8.0
+    for mesh in items:
+        set_collider_params(mesh, **params)
+    print(f"[jiggle_bones] applied to {len(items)} collider(s): {params}")
 
 
 def _ui_setup_chain(category, chain, *_):
@@ -1304,14 +1492,69 @@ def show_ui():
 
     # v0.4.1: 既存 setup (v0.4.0 以前) で hairSystem.collide=0 のままの
     # ケース用に collide 強制有効化ボタンを露出
-    coll_fix_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
-    cmds.button(l="全 hairSystem の衝突判定を強制 ON (貫通する時に押す)",
-                h=22, p=coll_fix_row, bgc=(0.55, 0.55, 0.30),
+    coll_fix_row = cmds.rowLayout(nc=2, adj=1, p=body_col,
+                                    cw2=(280, 200),
+                                    ct2=("both", "both"), co2=(2, 2))
+    cmds.button(l="全 hairSystem の衝突判定を強制 ON", h=22, p=coll_fix_row,
+                bgc=(0.55, 0.55, 0.30),
                 c=lambda *_: enable_collision_on_all_hair_systems(),
-                ann="Maya の hairSystem.collide default が OFF なので、"
-                     "v0.4.0 以前の setup では衝突判定が効いていないことが"
-                     "あります。このボタンで全 hairSystem に collide=1 を"
-                     "強制セットします")
+                ann="v0.4.0 以前の setup で貫通する時に押す")
+    cmds.button(l="🩺 collision 診断 (script editor に出力)",
+                h=22, p=coll_fix_row, bgc=(0.35, 0.55, 0.75),
+                c=lambda *_: diagnose_collision(),
+                ann="nucleus / hairSystem / nRigid / follicle の現在値を"
+                     "console に dump。貫通の原因調査用。")
+
+    # v0.4.3: nucleus + collider tuning UI
+    cmds.separator(h=6, style="in", p=body_col)
+    cmds.text(l="⚙ nucleus (全 chain 共通の物理 solver 設定)",
+              al="left", fn="boldLabelFont", p=body_col)
+    nuc = get_nucleus_params()
+    _UI_NUCLEUS_FIELDS.clear()
+    _UI_NUCLEUS_FIELDS["spaceScale"] = cmds.floatFieldGrp(
+        numberOfFields=1, label="Space Scale :", cw2=(120, 80),
+        value1=nuc.get("spaceScale", 1.0), p=body_col,
+        ann="キャラの単位系。1 unit = 1m 想定なので MMD (1 unit ≒ 0.08m) は "
+             "0.05〜0.1 に。default 1.0")
+    _UI_NUCLEUS_FIELDS["subSteps"] = cmds.intFieldGrp(
+        numberOfFields=1, label="Sub Steps :", cw2=(120, 80),
+        value1=int(nuc.get("subSteps", 6)), p=body_col,
+        ann="frame 間の計算刻み。高速動作で貫通するなら 10〜20 に上げる。"
+             "default 6 (v0.4.2 で強化)")
+    _UI_NUCLEUS_FIELDS["maxCollisionIterations"] = cmds.intFieldGrp(
+        numberOfFields=1, label="Max Collision Iter :", cw2=(120, 80),
+        value1=int(nuc.get("maxCollisionIterations", 8)), p=body_col,
+        ann="衝突ペアの反復回数。default 8。多い chain + collider 時は上げる")
+    _UI_NUCLEUS_FIELDS["gravity"] = cmds.floatFieldGrp(
+        numberOfFields=1, label="Gravity :", cw2=(120, 80),
+        value1=nuc.get("gravity", 9.8), p=body_col,
+        ann="重力の大きさ。default 9.8 (m/s^2 想定)。0 で無重力")
+    cmds.button(l="nucleus パラメータを反映", h=22, p=body_col,
+                c=_ui_apply_nucleus_params, bgc=(0.30, 0.45, 0.55))
+
+    # collider tuning (選択中 collider に対して)
+    cmds.separator(h=4, style="none", p=body_col)
+    cmds.text(l="⚙ 選択中 collider の tuning (上のリストで選択)",
+              al="left", fn="smallBoldLabelFont", p=body_col)
+    _UI_COLLIDER_FIELDS.clear()
+    _UI_COLLIDER_FIELDS["thickness"] = cmds.floatFieldGrp(
+        numberOfFields=1, label="Thickness :", cw2=(120, 80),
+        value1=0.5, p=body_col,
+        ann="collider の厚み。薄すぎると貫通、厚すぎると mesh 表面から浮く")
+    _UI_COLLIDER_FIELDS["pushOut"] = cmds.floatFieldGrp(
+        numberOfFields=1, label="Push Out :", cw2=(120, 80),
+        value1=0.25, p=body_col,
+        ann="衝突時の分離力。thickness の半分くらいが目安")
+    _UI_COLLIDER_FIELDS["friction"] = cmds.floatFieldGrp(
+        numberOfFields=1, label="Friction :", cw2=(120, 80),
+        value1=0.2, p=body_col,
+        ann="摩擦係数 0..1。高いと hair が張り付く")
+    _UI_COLLIDER_FIELDS["bounce"] = cmds.floatFieldGrp(
+        numberOfFields=1, label="Bounce :", cw2=(120, 80),
+        value1=0.0, p=body_col,
+        ann="反発係数 0..1。0 で沈み込む、1 で跳ね返る")
+    cmds.button(l="選択 collider にパラメータを反映", h=22, p=body_col,
+                c=_ui_apply_collider_params, bgc=(0.30, 0.45, 0.55))
 
     cmds.separator(h=8, style="in", p=body_col)
     cmds.text(l="② chain 登録 (選択ピック方式)", al="left",
