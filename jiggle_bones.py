@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -635,23 +635,60 @@ def _create_rest_curve_from_chain(chain):
 
 
 def _add_follicle_to_hair_system(rest_curve, hs_shape, chain):
-    """rest_curve を follicle 経由で hairSystem に接続し、output dynamic curve を返す。"""
+    """rest_curve を follicle 経由で hairSystem に接続し、output dynamic curve を返す。
+
+    v0.4.5: Maya 標準 `makeCurvesDynamic` MEL の実際の接続 dump 結果に合わせて
+    リファクタ。rebuildCurve node を rest_curve と follicle の間に挿入して
+    CV 密度を標準化 (nHair sim の collision 精度が joint 数依存にならなくなる)。
+    v0.4.4 で追加した follicle self-connect (outTranslate → translate) は
+    MCD には無く cycle の原因になり得るため撤回。
+    """
     _ensure_jb_group()
     rest_shape = cmds.listRelatives(rest_curve, s=True, type="nurbsCurve") or []
     if not rest_shape:
         raise RuntimeError(f"rest curve {rest_curve} に nurbsCurve shape が無い")
     rest_shape = rest_shape[0]
 
+    # ---- rebuildCurve で 密度を標準化 (MCD 準拠) ----
+    # spans = joint 数 × 5 (最低 20)、degree = 3。uniform param。
+    orig_span_count = cmds.getAttr(rest_shape + ".spans")
+    target_spans = max(20, (orig_span_count + 1) * 5)
+    rebuild_node = cmds.createNode("rebuildCurve",
+                                    n=_rest_curve_name(chain) + "_rebuild")
+    cmds.setAttr(rebuild_node + ".spans", target_spans)
+    cmds.setAttr(rebuild_node + ".degree", 3)
+    cmds.setAttr(rebuild_node + ".rebuildType", 0)   # 0 = uniform
+    cmds.setAttr(rebuild_node + ".keepRange", 1)     # 0..1 parameterization
+    cmds.setAttr(rebuild_node + ".keepEndPoints", True)
+    cmds.setAttr(rebuild_node + ".keepTangents", True)
+    cmds.connectAttr(rest_shape + ".worldSpace[0]",
+                      rebuild_node + ".inputCurve", f=True)
+
+    # rebuilt curve shape を作って rebuild の output を受ける
+    rebuilt_shape_name = _rest_curve_name(chain) + "_rebuiltShape"
+    rebuilt_shape = cmds.createNode("nurbsCurve", n=rebuilt_shape_name,
+                                     p=rest_curve)
+    cmds.connectAttr(rebuild_node + ".outputCurve",
+                      rebuilt_shape + ".create", f=True)
+    # 描画上は元 shape だけ見せる (rebuilt は intermediate)
+    try:
+        cmds.setAttr(rebuilt_shape + ".intermediateObject", 1)
+    except Exception:
+        pass
+
+    # ---- follicle 生成 ----
     foll_shape = cmds.createNode("follicle", n=_follicle_name(chain) + "Shape")
     foll_xform = cmds.listRelatives(foll_shape, p=True)[0]
     foll_xform = cmds.rename(foll_xform, _follicle_name(chain))
     foll_shape = cmds.listRelatives(foll_xform, s=True)[0]
 
-    # curve → follicle 接続 (start position)
+    # curve → follicle 接続 (MCD 準拠):
+    #   .startPosition ← rebuiltCurve.local  (密度標準化された CV)
+    #   .startPositionMatrix ← rest_curve.worldMatrix (元 curve の world 変換)
+    cmds.connectAttr(rebuilt_shape + ".local",
+                      foll_shape + ".startPosition", f=True)
     cmds.connectAttr(rest_shape + ".worldMatrix[0]",
                       foll_shape + ".startPositionMatrix", f=True)
-    cmds.connectAttr(rest_shape + ".local",
-                      foll_shape + ".startPosition", f=True)
 
     # follicle を hairSystem に登録
     idx = _next_multi_index(hs_shape, "inputHair")
@@ -665,32 +702,22 @@ def _add_follicle_to_hair_system(rest_curve, hs_shape, chain):
     dyn_shape = cmds.createNode("nurbsCurve", n=dyn_shape_name + "Shape",
                                  p=foll_xform)
     cmds.connectAttr(foll_shape + ".outCurve", dyn_shape + ".create", f=True)
-    # dyn curve は follicle の transform 下に居るが、UI 上判別しやすいよう
-    # 独立 transform 化 (parent hair system group 下に飛ばす)
-    dyn_xform = cmds.rename(foll_xform, foll_xform)  # keep
 
-    # follicle の default 設定: dynamic + hair sim
-    try:
-        cmds.setAttr(foll_shape + ".simulationMethod", 2)   # 0=static 1=static+collide 2=dynamic
-        cmds.setAttr(foll_shape + ".pointLock", 1)          # 0=nothing 1=base (根元固定)
-        cmds.setAttr(foll_shape + ".restPose", 1)           # 1=start curve
-    except Exception:
-        pass
+    # follicle の default 設定
+    for a, v in (("simulationMethod", 2),   # dynamic
+                  ("pointLock", 1),          # base = root fixed
+                  ("restPose", 1),           # 1 = start curve
+                  ("startDirection", 0),     # U=0 start
+                  ("collide", 1)):
+        try:
+            cmds.setAttr(f"{foll_shape}.{a}", v)
+        except Exception:
+            pass
 
-    # 先に reparent (translate connect 後だと absolute 保持で conflict する)
     _parent_to_jb(foll_xform)
-
-    # v0.4.4 collision 修正: follicle transform を hair root 位置に driven させる
-    # (Maya 標準 makeCurvesDynamic と同じ接続)。これが無いと follicle が
-    # 常に origin に居続け、simulation の hair CV 座標系と collider mesh の
-    # world 座標系がズレて衝突判定が起きない。
-    try:
-        cmds.connectAttr(foll_shape + ".outTranslate",
-                          foll_xform + ".translate", f=True)
-        cmds.connectAttr(foll_shape + ".outRotate",
-                          foll_xform + ".rotate", f=True)
-    except Exception as exc:
-        cmds.warning(f"[jiggle_bones] follicle self-connect failed: {exc}")
+    # v0.4.4 の outTranslate/outRotate 自己接続は MCD には無く、
+    # cycle 誘発するため v0.4.5 で撤回。follicle は origin のまま。
+    # simulation は startPositionMatrix (world 変換) を通じて world 座標系で走る。
 
     return dyn_shape
 
@@ -860,7 +887,12 @@ def remove_jiggle_for_chain(chain):
         try: cmds.delete(ikh)
         except Exception: pass
 
-    # 4. follicle + dyn curve + rest curve + clusters
+    # 4. follicle + dyn curve + rest curve + clusters + rebuildCurve node
+    #    rebuild node は rest curve と別 node なので個別 delete
+    rebuild_node = _rest_curve_name(chain) + "_rebuild"
+    if cmds.objExists(rebuild_node):
+        try: cmds.delete(rebuild_node)
+        except Exception: pass
     for nm in (_dyn_curve_name(chain), _follicle_name(chain),
                _rest_curve_name(chain)):
         if cmds.objExists(nm):
