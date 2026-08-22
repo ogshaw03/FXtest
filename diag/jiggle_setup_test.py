@@ -99,16 +99,6 @@ try:
     report("dynamics_tip_moved", delta > 0.3,
            f"dynamics on + sway → tip Δ={delta:.3f}")
 
-    # ---- v0.3.1: snap_ctls_to_sim ----
-    # dynBlend=1 のまま、DYN chain の rotate を FK ctl に immediate copy
-    n_snap = jiggle_bones.snap_ctls_to_sim(chain=chain)
-    report("snap_ctls_to_sim_updated", n_snap == len(chain),
-           f"updated {n_snap} joint(s)")
-    # snap 後、mid ctl の rotate が非ゼロになっている (DYN が sway した後)
-    mid_ctl_rotZ = cmds.getAttr(f"{fk_ctls[2]}.rotateZ")
-    report("snap_result_nonzero", abs(mid_ctl_rotZ) > 0.01,
-           f"mid ctl rotZ = {mid_ctl_rotZ:.3f}")
-
     # ---- Collider add / remove ----
     cmds.currentTime(1)
     ground = cmds.polyPlane(w=20, h=20, sx=2, sy=2, n="ground_geo")[0]

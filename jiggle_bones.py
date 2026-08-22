@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.3.1"
+__version__ = "0.3.0"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -634,15 +634,8 @@ def create_jiggle_for_chain(chain, category=None):
         except Exception as exc:
             cmds.warning(f"[jiggle_bones] root translate constraint failed: {exc}")
 
-    # v0.3.1: setup 時に sim-follow scriptJob を auto-enable (mayapy standalone
-    # では scriptJob 使えないので try/except で無害化)
-    try:
-        enable_sim_follow()
-    except Exception:
-        pass
-
     print(f"[jiggle_bones] setup {_chain_id(chain)} → category={category}, "
-          f"joints={len(chain)}, root ctl={root_ctl} (dynBlend attr on this)")
+          f"joints={len(chain)}, root ctl={root_ctl} (dynamics attr on this)")
     return {
         "chain":         chain,
         "category":      category,
@@ -717,170 +710,6 @@ def is_chain_active(chain):
     """v0.3.0: root FK ctl があれば active とみなす (spline IK も併存)。"""
     return cmds.objExists(_fk_ctl_name(chain[0])) \
         or cmds.objExists(_ik_handle_name(chain))
-
-
-# =========================================================================
-# Simulation follow (v0.3.1) — sim ON 時に FK ctl も揺れて見えるよう追随
-# =========================================================================
-#
-# 課題: v0.3.0 では dynBlend=1 で joint は simulation で動くが、FK ctl は
-# user の入力位置に居るので viewport 上で骨と ctl が乖離する。
-# 解決: scriptJob (timeChanged) で毎フレーム DYN chain の rotate を
-# FK ctl の rotate に copy する。
-#
-# cycle 回避: scriptJob callback は DG evaluation の後にワンショットで
-# 実行される。setAttr は当フレームの再評価を trigger しないため、
-# feedback は次フレームに 1-frame 遅延で反映される (Maya の autoUpdate
-# の性質)。この遅延は視覚的に問題にならず、hairSystem の simulation
-# 破壊 (rest curve == dynamic curve で無揺れ化) も防げる。
-#
-# scope: dynBlend > 0.01 の chain の rotate 3 軸のみ。animCurve が接続
-# された attr や lock 済み attr はスキップ (user の手 key を尊重)。
-
-_SIM_FOLLOW_JOB = None   # scriptJob ID (module global)
-
-
-def _sim_follow_callback():
-    """timeChanged callback: DYN chain の rotate を FK ctl に copy。"""
-    if cmds is None:
-        return
-    root_ctls = cmds.ls("*_jbCtl", type="transform", long=False) or []
-    for root_ctl in root_ctls:
-        # root FK ctl は dynBlend attr を持つ
-        if not cmds.attributeQuery("dynBlend", node=root_ctl, exists=True):
-            continue
-        try:
-            blend = cmds.getAttr(root_ctl + ".dynBlend")
-        except Exception:
-            continue
-        if blend < 0.01:
-            continue
-        # root_ctl = "H1_jbCtl" → orig root joint = "H1"
-        orig_root = root_ctl[:-len("_jbCtl")]
-        dyn_root = orig_root + "_jbDYN"
-        if not cmds.objExists(dyn_root):
-            continue
-        # DYN chain を DFS で辿る (H1_jbDYN → H2_jbDYN → ...)
-        dyn_chain = _walk_jbdyn_chain(dyn_root)
-        for dynj in dyn_chain:
-            if not dynj.endswith("_jbDYN"):
-                continue
-            orig = dynj[:-len("_jbDYN")]
-            ctl = orig + "_jbCtl"
-            if not cmds.objExists(ctl):
-                continue
-            try:
-                rvec = cmds.getAttr(dynj + ".rotate")[0]
-            except Exception:
-                continue
-            for a, v in zip(("rotateX", "rotateY", "rotateZ"), rvec):
-                plug = f"{ctl}.{a}"
-                # 手 key されている / lock されている attr はスキップ
-                try:
-                    if cmds.getAttr(plug, l=True):
-                        continue
-                    conns = cmds.listConnections(plug, s=True, d=False) or []
-                    if any(cmds.nodeType(c).startswith("animCurve")
-                            for c in conns):
-                        continue
-                    cmds.setAttr(plug, v)
-                except Exception:
-                    pass
-
-
-def _walk_jbdyn_chain(root_dyn_joint):
-    """DYN chain の joint list を DFS で返す (親→末端)。"""
-    out = [root_dyn_joint]
-    kids = cmds.listRelatives(root_dyn_joint, c=True, type="joint") or []
-    for k in kids:
-        if k.endswith("_jbDYN"):
-            out.extend(_walk_jbdyn_chain(k))
-    return out
-
-
-def enable_sim_follow():
-    """scriptJob を登録して sim → FK ctl の追随を有効化。既に有効なら no-op。"""
-    global _SIM_FOLLOW_JOB
-    if _SIM_FOLLOW_JOB is not None and cmds.scriptJob(ex=_SIM_FOLLOW_JOB):
-        return _SIM_FOLLOW_JOB
-    _SIM_FOLLOW_JOB = cmds.scriptJob(
-        e=("timeChanged", _sim_follow_callback),
-        killWithScene=True,
-        cu=False,   # do NOT compile until first use
-    )
-    print(f"[jiggle_bones] sim follow enabled (scriptJob #{_SIM_FOLLOW_JOB})")
-    return _SIM_FOLLOW_JOB
-
-
-def disable_sim_follow():
-    """scriptJob を kill して sim → FK ctl 追随を停止。"""
-    global _SIM_FOLLOW_JOB
-    if _SIM_FOLLOW_JOB is None:
-        return
-    try:
-        if cmds.scriptJob(ex=_SIM_FOLLOW_JOB):
-            cmds.scriptJob(kill=_SIM_FOLLOW_JOB, force=True)
-    except Exception:
-        pass
-    _SIM_FOLLOW_JOB = None
-    print("[jiggle_bones] sim follow disabled")
-
-
-def is_sim_follow_enabled():
-    """scriptJob が有効か。"""
-    if _SIM_FOLLOW_JOB is None:
-        return False
-    try:
-        return bool(cmds.scriptJob(ex=_SIM_FOLLOW_JOB))
-    except Exception:
-        return False
-
-
-def snap_ctls_to_sim(chain=None):
-    """chain の DYN 現在値を即 FK ctl に copy (scriptJob 使わず即時実行)。
-    chain=None なら scene 内の全 active chain。"""
-    if cmds is None:
-        return 0
-    n = 0
-    if chain is None:
-        # 全 root ctl を検索
-        for root_ctl in cmds.ls("*_jbCtl", type="transform") or []:
-            if not cmds.attributeQuery("dynBlend", node=root_ctl, exists=True):
-                continue
-            orig = root_ctl[:-len("_jbCtl")]
-            n += _snap_single_root(orig)
-    else:
-        n += _snap_single_root(_short(chain[0]))
-    print(f"[jiggle_bones] snap: {n} joint(s) updated")
-    return n
-
-
-def _snap_single_root(orig_root_name):
-    """1 chain 分の DYN → FK ctl コピーを即実行。"""
-    dyn_root = orig_root_name + "_jbDYN"
-    if not cmds.objExists(dyn_root):
-        return 0
-    dyn_chain = _walk_jbdyn_chain(dyn_root)
-    n = 0
-    for dynj in dyn_chain:
-        orig = dynj[:-len("_jbDYN")]
-        ctl = orig + "_jbCtl"
-        if not cmds.objExists(ctl):
-            continue
-        try:
-            rvec = cmds.getAttr(dynj + ".rotate")[0]
-        except Exception:
-            continue
-        for a, v in zip(("rotateX", "rotateY", "rotateZ"), rvec):
-            plug = f"{ctl}.{a}"
-            try:
-                if cmds.getAttr(plug, l=True):
-                    continue
-                cmds.setAttr(plug, v)
-            except Exception:
-                pass
-        n += 1
-    return n
 
 
 # =========================================================================
@@ -1096,23 +925,6 @@ def _ui_setup_all_enabled(*_):
     print(f"[jiggle_bones] Setup {n} enabled chain(s)")
 
 
-def _ui_toggle_sim_follow(*_):
-    if is_sim_follow_enabled():
-        disable_sim_follow()
-    else:
-        enable_sim_follow()
-    # ボタン label / 色を更新
-    state = "ON" if is_sim_follow_enabled() else "OFF"
-    bg = (0.30, 0.60, 0.30) if is_sim_follow_enabled() else (0.55, 0.55, 0.55)
-    if cmds.button("jbSimFollowBtn", ex=True):
-        cmds.button("jbSimFollowBtn", e=True,
-                    l=f"Sim → Ctl Follow: {state}", bgc=bg)
-
-
-def _ui_snap_ctls_to_sim(*_):
-    snap_ctls_to_sim(chain=None)
-
-
 def _ui_remove_all(*_):
     for cat_chain_list in find_jiggle_chains().values():
         for chain in cat_chain_list:
@@ -1154,27 +966,10 @@ def show_ui():
               w=520)
     cmds.separator(h=6, style="in", p=header)
 
-    # ---- FOOTER (常に見える action バー、2段) ----
+    # ---- FOOTER (常に見える action バー) ----
     footer = cmds.columnLayout("jbFooter", adj=True, rs=3,
                                 cat=("both", 10), p=form)
     cmds.separator(h=6, style="in", p=footer)
-
-    # 上段: sim ↔ FK ctl 追随の制御
-    sim_row = cmds.rowLayout(nc=2, adj=1, p=footer,
-                              cw2=(260, 200),
-                              ct2=("both", "both"), co2=(4, 4))
-    sim_state = "ON" if is_sim_follow_enabled() else "OFF"
-    sim_bg = (0.30, 0.60, 0.30) if is_sim_follow_enabled() else (0.55, 0.55, 0.55)
-    cmds.button("jbSimFollowBtn", l=f"Sim → Ctl Follow: {sim_state}",
-                h=28, c=_ui_toggle_sim_follow, bgc=sim_bg, p=sim_row,
-                ann="ON: dynBlend > 0 の chain で joint 動きを FK ctl にも "
-                     "毎フレーム転写 (viewport で ctl が joint と同時に揺れる)")
-    cmds.button(l="Snap Ctls to Sim (this frame)", h=28,
-                c=_ui_snap_ctls_to_sim, bgc=(0.35, 0.55, 0.75), p=sim_row,
-                ann="現フレームの DYN chain rotate を FK ctl に即コピー "
-                     "(scriptJob 未使用でも 1 回だけ揃える)")
-
-    # 下段: 全体 action
     footer_row = cmds.rowLayout(nc=3, adj=1, p=footer,
                                  cw3=(200, 130, 160),
                                  ct3=("both", "both", "both"),
