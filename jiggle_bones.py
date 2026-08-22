@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.3.4"
+__version__ = "0.4.0"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -152,6 +152,8 @@ def _walk_chain(root, tag):
 
 
 def find_jiggle_chains():
+    """v0.3.x までの命名 heuristic 検出 (v0.4.0 以降は主 flow から外れ、
+    「auto-detect して registry に追加」ボタン用の補助関数として残置)。"""
     if cmds is None:
         raise RuntimeError("Must run inside Maya.")
     all_joints = cmds.ls(type="joint") or []
@@ -170,6 +172,120 @@ def find_jiggle_chains():
         if len(chain) >= 2:
             result[tag].append(chain)
     return {tag: chains for tag, chains in result.items() if chains}
+
+
+# =========================================================================
+# Chain registry (v0.4.0) — user が pick で追加した chain を scene に永続化
+# =========================================================================
+#
+# `jiggle_bones_grp.chainRegistry` に JSON で保存:
+#   [
+#     {"category": "hair",  "chain": ["hair1","hair2",...]},
+#     {"category": "skirt", "chain": ["skirt_L_1",...]},
+#     ...
+#   ]
+#
+# 命名 heuristic (find_jiggle_chains) と切り離し、user が明示的に選択して
+# 登録した chain だけを扱う。
+
+REGISTRY_ATTR = "chainRegistry"
+
+
+def _read_registry():
+    import json
+    if not cmds.objExists(JB_GROUP):
+        return []
+    if not cmds.attributeQuery(REGISTRY_ATTR, node=JB_GROUP, exists=True):
+        return []
+    raw = cmds.getAttr(f"{JB_GROUP}.{REGISTRY_ATTR}") or ""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _write_registry(entries):
+    import json
+    _ensure_jb_group()
+    if not cmds.attributeQuery(REGISTRY_ATTR, node=JB_GROUP, exists=True):
+        cmds.addAttr(JB_GROUP, ln=REGISTRY_ATTR, dt="string")
+    cmds.setAttr(f"{JB_GROUP}.{REGISTRY_ATTR}",
+                  json.dumps(entries, ensure_ascii=False, indent=2),
+                  type="string")
+
+
+def get_registered_chains():
+    """{'hair': [chain, chain, ...], 'skirt': [...]}, category ごと分類。"""
+    entries = _read_registry()
+    out = {}
+    for e in entries:
+        cat = e.get("category") or "hair"
+        chain = e.get("chain") or []
+        if len(chain) >= 2:
+            out.setdefault(cat, []).append(chain)
+    return out
+
+
+def add_registered_chain(chain, category=None):
+    """chain を registry に追加 (chain[0] 名で重複除去)。
+    category=None なら _classify で自動判定 (無ければ "hair" fallback)。"""
+    if not chain or len(chain) < 2:
+        cmds.warning("[jiggle_bones] chain must have at least 2 joints")
+        return None
+    if category is None:
+        category = _classify(chain[0]) or "hair"
+    entries = [e for e in _read_registry()
+                if (e.get("chain") or [None])[0] != chain[0]]
+    entries.append({"category": category, "chain": list(chain)})
+    _write_registry(entries)
+    print(f"[jiggle_bones] registered chain: {chain[0]} ({len(chain)} 個) "
+          f"as '{category}'")
+    return {"category": category, "chain": list(chain)}
+
+
+def remove_registered_chain(chain_or_root):
+    """registry から chain を除去 (rig は tear down しない)。"""
+    root = chain_or_root[0] if isinstance(chain_or_root, list) \
+                              else chain_or_root
+    entries = [e for e in _read_registry()
+                if (e.get("chain") or [None])[0] != root]
+    _write_registry(entries)
+
+
+def build_chain_from_selection():
+    """現在の選択から chain を構築。
+    - 複数 joint 選択: そのまま順序を chain として使う (linear 前提)
+    - 単一 joint 選択: 子孫を DFS で辿って single-child chain を作る
+    Returns: joint 名 list (長さ ≥ 2) or None
+    """
+    sel = cmds.ls(sl=True, type="joint") \
+          or cmds.ls(sl=True, type="transform") or []
+    if not sel:
+        cmds.warning("Outliner / viewport で joint(s) を選択してください")
+        return None
+    if len(sel) >= 2:
+        return [s.split("|")[-1].split(":")[-1] for s in sel]
+    # 単一選択: 子を辿って chain 化 (最も深い branch を優先)
+    root = sel[0].split("|")[-1].split(":")[-1]
+    def _longest(node):
+        kids = cmds.listRelatives(node, c=True, type="joint") or []
+        if not kids:
+            return [node]
+        best = []
+        for k in kids:
+            sub = _longest(k)
+            if len(sub) > len(best):
+                best = sub
+        return [node] + best
+    chain = _longest(root)
+    if len(chain) < 2:
+        cmds.warning(f"[jiggle_bones] {root} に子 joint がありません "
+                     "(chain 化できません、複数選択で明示指定してください)")
+        return None
+    return chain
 
 
 # =========================================================================
@@ -861,6 +977,7 @@ def set_category_params(category, **params):
 # =========================================================================
 
 _UI_COLLIDER_LIST = "jbColliderList"
+_UI_ADD_CATEGORY_MENU = "jbAddCategoryMenu"
 _UI_CAT_PREFIX = "jbCatSection"
 _UI_CHAIN_PREFIX = "jbChainRow"
 
@@ -923,18 +1040,14 @@ def _ui_setup_chain(category, chain, *_):
     _ui_apply_category_params(category)
 
 
-def _ui_remove_chain(chain, *_):
-    remove_jiggle_for_chain(chain)
-
-
 def _ui_setup_all_enabled(*_):
+    """v0.4.0: registry から chain を取得して checked のみセットアップ。"""
     n = 0
+    detected = get_registered_chains()
     for (category, chain_id), cb in _UI_CHAIN_CHECKS.items():
         if not cmds.checkBox(cb, q=True, v=True):
             continue
-        # chain データは button に annotation で埋め込んだ id → chains dict 再検索
-        chains = find_jiggle_chains().get(category, [])
-        for chain in chains:
+        for chain in detected.get(category, []):
             if _chain_id(chain) == chain_id:
                 create_jiggle_for_chain(chain, category=category)
                 n += 1
@@ -944,11 +1057,62 @@ def _ui_setup_all_enabled(*_):
 
 
 def _ui_remove_all(*_):
-    for cat_chain_list in find_jiggle_chains().values():
+    """v0.4.0: registry の全 chain を tear down + registry も空に。"""
+    n = 0
+    for cat_chain_list in get_registered_chains().values():
         for chain in cat_chain_list:
             if is_chain_active(chain):
                 remove_jiggle_for_chain(chain)
-    print(f"[jiggle_bones] Removed all jiggle setups")
+                n += 1
+    _write_registry([])
+    print(f"[jiggle_bones] Removed {n} active setup(s) + cleared registry")
+
+
+def _ui_remove_chain(chain, *_):
+    """v0.4.0: rig tear down + registry からも除去。"""
+    remove_jiggle_for_chain(chain)
+    remove_registered_chain(chain)
+
+
+def _ui_add_from_selection(*_):
+    """選択 joint から chain を構築 → registry に追加 → UI 再構築。"""
+    chain = build_chain_from_selection()
+    if not chain:
+        return
+    # カテゴリ dropdown 選択値を取得
+    cat_choice = None
+    if cmds.optionMenu(_UI_ADD_CATEGORY_MENU, ex=True):
+        raw = cmds.optionMenu(_UI_ADD_CATEGORY_MENU, q=True, value=True)
+        # "auto (自動判定)" → None、"hair (髪)" → "hair"
+        if raw and not raw.startswith("auto"):
+            cat_choice = raw.split()[0]
+    add_registered_chain(chain, category=cat_choice)
+    show_ui()   # rebuild UI with new registry entry
+
+
+def _select_bones_from_list(bone_list_name, chain, *_):
+    """textScrollList で選ばれた bone (無ければ chain 全体) を scene 側で選択。"""
+    items = cmds.textScrollList(bone_list_name, q=True, si=True) or []
+    if items:
+        # 表示は "  ✓  hair1" → 末尾の joint 名だけ抽出
+        joints = [i.strip().split()[-1] for i in items]
+    else:
+        joints = list(chain)
+    joints = [j for j in joints if cmds.objExists(j)]
+    if joints:
+        cmds.select(joints, r=True)
+
+
+def _ui_populate_registry_from_names(*_):
+    """命名 heuristic で自動検出した chain を registry に追加 (補助機能)。"""
+    detected = find_jiggle_chains()
+    n_added = 0
+    for cat, chain_list in detected.items():
+        for chain in chain_list:
+            add_registered_chain(chain, category=cat)
+            n_added += 1
+    print(f"[jiggle_bones] auto-detect: {n_added} chain(s) registered")
+    show_ui()
 
 
 def show_ui():
@@ -977,12 +1141,12 @@ def show_ui():
     cmds.text(l=f"Jiggle Bones  v{__version__}  —  FK コントローラー + "
                  "hairSystem オーバーレイ",
               al="left", fn="boldLabelFont", p=header)
-    cmds.text(l="使い方:  ①コライダー mesh を追加  ②各カテゴリで"
-                "シミュレーションパラメータを調整  ③chain ごとに「セット"
-                "アップ」→ 全 joint に FK cube ctl が生成される (root ctl は"
-                "移動+回転可、子 ctl は回転のみ)。 ④root ctl の "
-                "dynBlend アトリビュートで FK(0) ↔ dynamics(1) をブレンド。"
-                " ⑤タイムラインを再生してシミュレーション確認",
+    cmds.text(l="使い方:  ①コライダー mesh を追加  "
+                "②scene で joint を選択 → 「選択から chain 追加」 "
+                "③カテゴリごとにパラメータ調整 → 「セットアップ」で rig 構築 "
+                "(FK cube ctl 生成、root=移動+回転可・子=回転のみ) "
+                "④root ctl.dynBlend で FK(0) ↔ dynamics(1) ブレンド "
+                "⑤タイムライン再生で確認",
               al="left", fn="smallObliqueLabelFont", ww=True, p=header,
               w=520)
     cmds.separator(h=6, style="in", p=header)
@@ -997,9 +1161,9 @@ def show_ui():
                                  co3=(4, 4, 4))
     cmds.button(l="⚡ チェック済 chain を一括セットアップ", h=34,
                 c=_ui_setup_all_enabled, bgc=(0.90, 0.55, 0.10), p=footer_row)
-    cmds.button(l="すべて削除", h=34, c=_ui_remove_all,
+    cmds.button(l="すべて削除 (rig + 登録)", h=34, c=_ui_remove_all,
                 bgc=(0.55, 0.30, 0.30), p=footer_row)
-    cmds.button(l="chain 再検出", h=34, c=lambda *_: show_ui(),
+    cmds.button(l="UI 更新", h=34, c=lambda *_: show_ui(),
                 bgc=(0.35, 0.55, 0.75), p=footer_row)
 
     # ---- BODY (scroll 領域: collider + カテゴリ) ----
@@ -1026,24 +1190,50 @@ def show_ui():
                 c=_ui_collider_remove_sel, bgc=(0.55, 0.30, 0.30))
 
     cmds.separator(h=8, style="in", p=body_col)
-    cmds.text(l="②/③ カテゴリ別 chain — シミュレーションパラメータは各枠内、"
-                "セットアップ/削除は右列のボタン",
+    cmds.text(l="② chain 登録 (選択ピック方式)", al="left",
+              fn="boldLabelFont", p=body_col)
+    cmds.text(l="Outliner か viewport で joint を選んで「選択から chain 追加」。"
+                "1 個選択なら子孫を DFS で辿って自動 chain 化、"
+                "複数選択ならその順序を chain として使う。",
+              al="left", fn="smallObliqueLabelFont", ww=True, p=body_col,
+              w=490)
+
+    add_row = cmds.rowLayout(nc=3, adj=2, p=body_col,
+                              cw3=(70, 220, 180),
+                              ct3=("left", "left", "both"),
+                              co3=(4, 4, 2))
+    cmds.text(l="カテゴリ:", al="right", p=add_row)
+    cmds.optionMenu(_UI_ADD_CATEGORY_MENU, p=add_row)
+    cmds.menuItem(l="auto (命名から自動判定)")
+    for cat_key in _JIGGLE_TOKENS.keys():
+        jp = _CATEGORY_JP.get(cat_key, cat_key)
+        cmds.menuItem(l=f"{cat_key} ({jp})")
+    cmds.button(l="選択から chain 追加", h=24, p=add_row,
+                c=_ui_add_from_selection, bgc=(0.30, 0.55, 0.30),
+                ann="選択 joint から chain を組み立てて registry に追加。"
+                     "追加後、下のリストの「セットアップ」で rig を構築")
+
+    # 補助: 命名 heuristic で一括登録
+    aux_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
+    cmds.button(l="(補助) 命名 heuristic で自動検出して一括登録",
+                h=22, c=_ui_populate_registry_from_names,
+                bgc=(0.35, 0.45, 0.55), p=aux_row,
+                ann="hair/skirt/tail/coat/ear 等の名前を持つ joint chain を "
+                     "自動検出して registry に追加 (旧 v0.3.x の挙動)")
+
+    cmds.separator(h=6, style="in", p=body_col)
+    cmds.text(l="③ 登録済み chain (カテゴリ別グループ + パラメータ + bone リスト)",
               al="left", fn="boldLabelFont", p=body_col)
 
-    try:
-        detected = find_jiggle_chains()
-    except Exception as exc:
-        cmds.warning(f"[jiggle_bones] detection failed: {exc}")
-        detected = {}
+    registered = get_registered_chains()
 
-    if not detected:
-        cmds.text(l="(揺れもの chain が検出されませんでした。"
-                     "scene に hair_*/skirt_*/tail_*/coat_*/ear_* 等の "
-                     "joint がありますか?)",
+    if not registered:
+        cmds.text(l="(まだ chain が登録されていません。上の「選択から chain "
+                     "追加」で chain を登録してください)",
                   al="left", fn="smallObliqueLabelFont", ww=True,
                   p=body_col, w=490)
     else:
-        for category, chain_list in sorted(detected.items()):
+        for category, chain_list in sorted(registered.items()):
             _build_category_section(category, chain_list, parent=body_col)
 
     # ---- formLayout で header / body / footer を配置 ----
@@ -1107,26 +1297,53 @@ def _build_category_section(category, chain_list, parent=None):
                 ann=f"上記の値を既存の hairSystem ({category}) に上書き適用")
     cmds.separator(h=6, style="none", p=inner)
 
-    # chain rows
+    # chain rows: 各 chain に対して 見出し行 + bone リスト行 の 2 段構造
     for chain in chain_list:
         cid = _chain_id(chain)
         active = is_chain_active(chain)
-        row = cmds.rowLayout(nc=4, adj=2, p=inner,
-                              cw4=(28, 260, 90, 70),
-                              ct4=("both", "left", "both", "both"),
-                              co4=(2, 4, 2, 2))
-        cb = cmds.checkBox(l="", v=not active, p=row,
+
+        # 見出し行 (checkbox + 名前 + セットアップ/削除)
+        head_row = cmds.rowLayout(nc=4, adj=2, p=inner,
+                                    cw4=(28, 260, 90, 70),
+                                    ct4=("both", "left", "both", "both"),
+                                    co4=(2, 4, 2, 2))
+        cb = cmds.checkBox(l="", v=not active, p=head_row,
                             ann="チェックを入れると「一括セットアップ」の対象")
         _UI_CHAIN_CHECKS[(category, cid)] = cb
         status = "  [適用中]" if active else ""
-        cmds.text(l=f"{cid}  ({len(chain)} 個 → {_short(chain[-1])}){status}",
-                   al="left", fn="smallPlainLabelFont", p=row)
-        cmds.button(l="セットアップ", h=22, p=row,
+        cmds.text(l=f"{cid}  ({len(chain)} 個){status}",
+                   al="left", fn="smallPlainLabelFont", p=head_row)
+        cmds.button(l="セットアップ", h=22, p=head_row,
                     c=lambda _x=None, _c=category, _ch=chain:
                         _ui_setup_chain(_c, _ch),
                     bgc=(0.30, 0.55, 0.30),
                     ann="この chain に FK ctl + hairSystem dynamics を構築")
-        cmds.button(l="削除", h=22, p=row,
+        cmds.button(l="削除", h=22, p=head_row,
                     c=lambda _x=None, _ch=chain: _ui_remove_chain(_ch),
                     bgc=(0.55, 0.30, 0.30),
-                    ann="この chain の jiggle 関連 node を全削除")
+                    ann="この chain の jiggle 関連 node を全削除 + registry から除去")
+
+        # bone リスト行 (chain 内の joint 名を全表示、scene で選択できるように)
+        bone_list_name = f"jbBones_{category}_{cid}"
+        # 既存があれば削除 (rebuild 対策)
+        if cmds.textScrollList(bone_list_name, ex=True):
+            cmds.deleteUI(bone_list_name)
+        list_row = cmds.rowLayout(nc=2, adj=1, p=inner,
+                                    cw2=(320, 130),
+                                    ct2=("left", "left"), co2=(30, 4))
+        cmds.textScrollList(bone_list_name, numberOfRows=min(len(chain), 6),
+                             h=min(len(chain), 6) * 18 + 4,
+                             allowMultiSelection=True,
+                             p=list_row)
+        for j in chain:
+            marker = "✓" if cmds.objExists(j) else "✗"
+            cmds.textScrollList(bone_list_name, e=True,
+                                 append=f"  {marker}  {j}")
+        cmds.button(l="scene 側を選択", h=22, p=list_row,
+                    c=lambda _x=None, _bn=bone_list_name, _ch=chain:
+                        _select_bones_from_list(_bn, _ch),
+                    bgc=(0.35, 0.45, 0.55),
+                    ann="上のリストで選んだ bone を scene 側で選択する "
+                         "(なにも選ばなければ chain 全体)")
+
+        cmds.separator(h=4, style="in", p=inner)
