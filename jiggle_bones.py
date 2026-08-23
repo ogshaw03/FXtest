@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -97,21 +97,25 @@ _JIGGLE_TOKENS = {
 
 # カテゴリ別 default params (経験則の初期値、UI で dial 可)
 DEFAULT_PARAMS_BY_CATEGORY = {
-    "hair":    {"stiffness": 0.15, "damp": 0.30, "startCurveAttract": 0.10,
+    # v0.5.1: damp を Maya default (0.05) 寄りに落とす。 v0.4.x の値は
+    # collision が効かない状態で挙動安定化を狙って高めに振ってあったが、
+    # collision 修正後は damp 過大で「衝突後の戻りが遅い」原因になっていた。
+    # stiffness をやや上げて代わりに springy な戻りを担保。
+    "hair":    {"stiffness": 0.20, "damp": 0.08, "startCurveAttract": 0.10,
                 "mass": 1.0},
-    "skirt":   {"stiffness": 0.10, "damp": 0.15, "startCurveAttract": 0.05,
+    "skirt":   {"stiffness": 0.15, "damp": 0.06, "startCurveAttract": 0.05,
                 "mass": 1.5},
-    "ribbon":  {"stiffness": 0.05, "damp": 0.10, "startCurveAttract": 0.15,
+    "ribbon":  {"stiffness": 0.10, "damp": 0.05, "startCurveAttract": 0.15,
                 "mass": 0.4},
-    "sleeve":  {"stiffness": 0.10, "damp": 0.20, "startCurveAttract": 0.10,
+    "sleeve":  {"stiffness": 0.15, "damp": 0.06, "startCurveAttract": 0.10,
                 "mass": 0.8},
-    "necktie": {"stiffness": 0.20, "damp": 0.25, "startCurveAttract": 0.15,
+    "necktie": {"stiffness": 0.25, "damp": 0.08, "startCurveAttract": 0.15,
                 "mass": 0.5},
-    "coat":    {"stiffness": 0.20, "damp": 0.25, "startCurveAttract": 0.10,
+    "coat":    {"stiffness": 0.25, "damp": 0.08, "startCurveAttract": 0.10,
                 "mass": 1.5},
-    "ear":     {"stiffness": 0.40, "damp": 0.30, "startCurveAttract": 0.20,
+    "ear":     {"stiffness": 0.45, "damp": 0.10, "startCurveAttract": 0.20,
                 "mass": 0.5},
-    "tail":    {"stiffness": 0.10, "damp": 0.15, "startCurveAttract": 0.05,
+    "tail":    {"stiffness": 0.15, "damp": 0.06, "startCurveAttract": 0.05,
                 "mass": 1.0},
 }
 
@@ -417,7 +421,13 @@ def _get_or_create_hair_system(category, chain=None):
     #   collideWidthOffset は「値を上げる」ことで初めて衝突判定が有効化する。
     #   default 0 は実質 collision OFF。1.0 前後を明示。solverDisplay=1 で
     #   Collision Thickness を viewport に可視化 (デバッグ用)。
-    for coll_attr, val in (("collide", 1),
+    # v0.5.1 犯人発見: hairSystem.active default が False → sim 全体休眠 →
+    #   nucleus/hair/nRigid の connection が全部正しくても collision 評価
+    #   されない。実 scene dump で `.active = False` 確認 → 手動 setAttr で
+    #   collide 確認済。makeCurvesDynamic / createNode 経由でも default OFF
+    #   なので明示的に True にする。
+    for coll_attr, val in (("active", 1),
+                            ("collide", 1),
                             ("collideStrength", 1.0),
                             ("iterations", 3),
                             ("collideOverSample", 4),
