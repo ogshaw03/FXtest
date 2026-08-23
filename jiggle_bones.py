@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -369,6 +369,13 @@ def _get_or_create_hair_system(category, chain=None):
         hs_xform = f"jb_hairSystem_{category}"
     hs_shape = hs_xform + "Shape"
     if cmds.objExists(hs_shape):
+        # v0.5.2: 既存 HS を返す時も active=1 を再保証。
+        # 何かの副作用 (makeCurvesDynamic 実行時 / connect 時) で
+        # False に戻される事があるため。
+        try:
+            cmds.setAttr(hs_shape + ".active", 1)
+        except Exception:
+            pass
         return hs_xform, hs_shape
 
     # hairSystem shape を作る
@@ -912,6 +919,15 @@ def create_jiggle_for_chain(chain, category=None):
                           f"{hs_shape}.startCurveAttract", f=True)
     except Exception as exc:
         cmds.warning(f"[jiggle_bones] startCurveAttract 接続失敗: {exc}")
+
+    # ---- 6b. active=1 を再保証 (v0.5.2) ----
+    #    makeCurvesDynamic 実行や inputHair connect の副作用で hairSystem.active
+    #    が False に戻る事例あり (実 scene dump で確認)。setup の最終段で
+    #    改めて 1 に。
+    try:
+        cmds.setAttr(hs_shape + ".active", 1)
+    except Exception:
+        pass
 
     # ---- 7. root joint translate (world-parented chain のみ、SplineIK は rotate 制御) ----
     parent_j = cmds.listRelatives(chain[0], p=True, type="joint") or []
