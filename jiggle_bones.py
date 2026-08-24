@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.18"
+__version__ = "0.5.19"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1273,31 +1273,23 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                 if any(abs(v) > 1e-6 for v in r_vals):
                     _freeze_rotate_to_jointOrient(j)
 
-        # v0.5.18: 5. root 含む全 joint に対して 個別に orient を実行。
-        # 以前は cmds.joint(root, ch=True) 一発だったが、Maya の仕様で
-        # root の jointOrient が更新されない事例あり → root も含めて
-        # per-joint に明示 oj を叩く。失敗した joint は API で 手動計算。
+        # v0.5.19: root 含む全 joint を manual API 直接で orient。
+        # cmds.joint(oj=...) は root (parent が joint でない場合) や特定
+        # 条件下で silent skip する事があり、root の jointOrient が更新
+        # されない bug が発生。 manual API を primary パスにすれば確実。
+        # 順序: 親 → 子 の 順に処理 (親を先に orient すると 子の world 位置
+        # は変わらない、jointOrient 更新で 子の parent 空間の aim が正しく
+        # 再計算される)。
         for r in roots:
             if not cmds.objExists(r):
                 continue
-            chain_joints = _collect_chain_from_root(r)
+            chain_joints = _collect_chain_from_root(r)   # 親 → 子 の順で返る
             print(f"[jiggle_bones] orient chain root={r}, {len(chain_joints)} joints")
             for j in chain_joints:
                 has_child = bool(cmds.listRelatives(j, c=True, type="joint"))
                 jo_before = cmds.getAttr(j + ".jointOrient")[0]
                 if has_child:
-                    ok = False
-                    try:
-                        cmds.select(j, r=True)
-                        cmds.joint(j, e=True, oj=aim,
-                                    secondaryAxisOrient=sao,
-                                    ch=False, zso=True)
-                        ok = True
-                    except Exception as exc:
-                        cmds.warning(f"[jiggle_bones] cmds.joint oj failed on "
-                                      f"{j}: {exc}, fallback to API")
-                    if not ok:
-                        _manual_orient_joint_to_child(j, aim=aim)
+                    _manual_orient_joint_to_child(j, aim=aim)
                 else:
                     # 末端 joint: jointOrient=0
                     try:
@@ -1307,7 +1299,7 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                 jo_after = cmds.getAttr(j + ".jointOrient")[0]
                 changed = any(abs(jo_before[i] - jo_after[i]) > 0.001
                               for i in range(3))
-                mark = " ★" if changed else ""
+                mark = " ★" if changed else " (unchanged)"
                 print(f"    {j}: jo {[round(x,1) for x in jo_before]}"
                       f" → {[round(x,1) for x in jo_after]}{mark}")
 
