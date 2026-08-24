@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.37"
+__version__ = "0.9.38"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2704,6 +2704,64 @@ def setup_twist_wiring(transfer_weights=False):
           f"{n_created} newly created, {n_transferred_total} vertex weights "
           f"transferred (existing model _twist_ bones untouched)")
     return n_wired
+
+
+def fix_stretch_cycles():
+    """v0.9.38: 既存 scene の stretch_dist ノードで、inMatrix1 が
+    *_ik.worldMatrix に繋がっている cycle 状態を patch。
+
+    v0.9.37 以降の setup ではそもそも cycle が起きないが、それ以前で
+    作った rig には残っている。この関数を叩けば以下を実行:
+      1. jb_group / attach_ctrls_grp 直下の *_stretch_dist を全部拾う
+      2. inMatrix1 の source が *_ik.worldMatrix なら
+         orig_parent.worldMatrix + arm_ik.localTranslate による pointMatrixMult
+         経路に差し替える
+      3. 差替後 cycle は解消 (arm_ik.rotate 経由の feedback loop が切れる)
+
+    Returns: 修正した stretch_dist ノード数。"""
+    fixed = 0
+    for db in cmds.ls("*_stretch_dist", type="distanceBetween") or []:
+        src = cmds.listConnections(db + ".inMatrix1", s=True, d=False,
+                                    plugs=True) or []
+        if not src:
+            continue
+        src_plug = src[0]
+        src_node = src_plug.split(".")[0]
+        if not src_node.endswith("_ik"):
+            continue
+        # src_node は arm_ik (start joint of clean IK chain)
+        # 対応する 元 joint = src_node から "_ik" suffix 除去
+        arm_ik = src_node
+        orig_start = arm_ik[:-3]   # RightUpLeg_ik → RightUpLeg
+        if not cmds.objExists(orig_start):
+            continue
+        orig_parent_list = cmds.listRelatives(orig_start, p=True, type="joint") \
+                            or []
+        orig_parent = orig_parent_list[0] if orig_parent_list else None
+        arm_ik_local_t = cmds.getAttr(arm_ik + ".translate")[0]
+        # 既存接続を切断
+        try:
+            cmds.disconnectAttr(src_plug, db + ".inMatrix1")
+        except Exception:
+            pass
+        # 新しい 経路を張る
+        if orig_parent and cmds.objExists(orig_parent):
+            label = db[:-len("_stretch_dist")]
+            pmm_name = label + "_stretch_start_pmm"
+            if cmds.objExists(pmm_name):
+                cmds.delete(pmm_name)
+            pmm = cmds.createNode("pointMatrixMult", n=pmm_name)
+            cmds.setAttr(pmm + ".inPoint", *arm_ik_local_t, type="double3")
+            cmds.connectAttr(orig_parent + ".worldMatrix[0]",
+                              pmm + ".inMatrix", f=True)
+            cmds.connectAttr(pmm + ".output", db + ".point1", f=True)
+        else:
+            arm_ik_ws = cmds.xform(arm_ik, q=True, ws=True, t=True)
+            cmds.setAttr(db + ".point1", *arm_ik_ws, type="double3")
+        fixed += 1
+        print(f"[{_PACKAGE}] fixed cycle on {db}  (was ← {src_plug})")
+    print(f"[{_PACKAGE}] fix_stretch_cycles: {fixed} node(s) patched")
+    return fixed
 
 
 def setup_all_ik_fk(mapping=None):
