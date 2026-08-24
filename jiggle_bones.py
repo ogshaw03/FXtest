@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.14"
+__version__ = "0.5.15"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1048,6 +1048,188 @@ def set_current_aim_axis(axis):
         _current_setup_aim_axis = None
 
 
+# =========================================================================
+# Joint orient tool (v0.5.15) — weight を保ったまま jointOrient を直す
+# =========================================================================
+
+# aim/up の組合せ → Maya `joint -oj` 引数
+_ORIENT_MAPPING = {
+    "X+ (Y up)": "xyz",   # Maya default
+    "Y+ (Z up)": "yzx",   # MMD 系
+    "Z+ (X up)": "zxy",
+    "X- (Y up)": "xyz",   # 反転は sao で対応、簡易実装は xyz と同じ
+    "Y- (Z up)": "yzx",
+    "Z- (X up)": "zxy",
+}
+
+
+def _collect_chain_from_root(root):
+    """root から下 の 全 joint を DFS で 返す (root 含む、末端まで)。"""
+    out = [root]
+    for k in cmds.listRelatives(root, c=True, type="joint") or []:
+        out.extend(_collect_chain_from_root(k))
+    return out
+
+
+def _find_skin_clusters_for_joints(joints):
+    """joints のいずれかに 影響されている skinCluster を全部集める。"""
+    skins = set()
+    for j in joints:
+        for plug in (".worldMatrix[0]", ".worldMatrix"):
+            for c in (cmds.listConnections(j + plug, s=False, d=True,
+                                              type="skinCluster") or []):
+                skins.add(c)
+    return skins
+
+
+def _joint_index_in_skin(sc, joint):
+    """skinCluster sc の .matrix[N] の どれが joint に繋がってるか index を返す。"""
+    conns = cmds.listConnections(sc + ".matrix", s=True, d=False,
+                                   plugs=True, c=True) or []
+    for i in range(0, len(conns), 2):
+        dst_plug = conns[i]
+        src_plug = conns[i + 1]
+        src_node = src_plug.split(".")[0]
+        if src_node == joint:
+            try:
+                return int(dst_plug.split("[")[1].rstrip("]"))
+            except Exception:
+                pass
+    return None
+
+
+def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
+    """v0.5.15: root joint list を渡すと、各 chain を joint orient し直し、
+    かつ skinCluster の bindPreMatrix を新 WM に合わせて更新 → weight 維持。
+
+    Args:
+        roots: root joint 名 list (各々を chain の root として扱う)
+        aim:   Maya `joint -oj` 引数 ("xyz" / "yzx" / "zxy" 等)。
+               "yzx" は Y 軸を子方向に (MMD 系典型)
+        sao:   secondaryAxisOrient ("xup"/"yup"/"zup"/... と対応する down)
+
+    Returns:
+        oriented joint 数
+    """
+    if isinstance(roots, str):
+        roots = [roots]
+
+    # 1. chain 展開
+    all_joints = []
+    for r in roots:
+        if not cmds.objExists(r):
+            cmds.warning(f"[jiggle_bones] orient skip: {r} 存在しない")
+            continue
+        all_joints.extend(_collect_chain_from_root(r))
+    if not all_joints:
+        return 0
+
+    # 2. 影響 skinCluster 集める + joint→index map 保存
+    skins = _find_skin_clusters_for_joints(all_joints)
+    joint_indices = {}   # sc -> {joint: idx}
+    for sc in skins:
+        m = {}
+        for j in all_joints:
+            idx = _joint_index_in_skin(sc, j)
+            if idx is not None:
+                m[j] = idx
+        if m:
+            joint_indices[sc] = m
+    print(f"[jiggle_bones] orient: {len(all_joints)} joint(s), "
+          f"{len(skins)} skinCluster(s) 影響")
+
+    # 3. envelope 一時 OFF (視覚 flicker 防止)
+    saved_env = {}
+    for sc in skins:
+        try:
+            saved_env[sc] = cmds.getAttr(sc + ".envelope")
+            cmds.setAttr(sc + ".envelope", 0)
+        except Exception:
+            pass
+
+    try:
+        # 4. root ごとに joint orient を実行
+        for r in roots:
+            if not cmds.objExists(r):
+                continue
+            try:
+                cmds.select(r, r=True)
+                cmds.joint(r, e=True, oj=aim, secondaryAxisOrient=sao,
+                            ch=True, zso=True)
+            except Exception as exc:
+                cmds.warning(f"[jiggle_bones] joint orient failed on {r}: {exc}")
+                continue
+            # 末端 joint (子無し) は oj=none で jointOrient=0 に
+            for j in _collect_chain_from_root(r):
+                if not cmds.listRelatives(j, c=True, type="joint"):
+                    try:
+                        cmds.joint(j, e=True, oj="none",
+                                    zso=True, ch=False)
+                    except Exception:
+                        pass
+
+        # 5. bindPreMatrix を 新 WM.inverse で更新 → skinning は 見た目維持
+        n_updated = 0
+        for sc, ji in joint_indices.items():
+            for j, idx in ji.items():
+                try:
+                    wm_inv = cmds.getAttr(j + ".worldInverseMatrix[0]")
+                    cmds.setAttr(f"{sc}.bindPreMatrix[{idx}]", wm_inv,
+                                  type="matrix")
+                    n_updated += 1
+                except Exception as exc:
+                    cmds.warning(f"[jiggle_bones] bindPreMatrix update "
+                                  f"{sc}[{idx}] {j}: {exc}")
+        print(f"[jiggle_bones] orient: bindPreMatrix updated {n_updated} slot(s)")
+
+        # 6. bindPose update (bindPose ノードも新 pose 記録)
+        bp_nodes = cmds.ls(type="dagPose") or []
+        for bp in bp_nodes:
+            try:
+                cmds.dagPose(all_joints, reset=True, name=bp)
+            except Exception:
+                pass
+
+    finally:
+        # 7. envelope 復元
+        for sc, env in saved_env.items():
+            try:
+                cmds.setAttr(sc + ".envelope", env)
+            except Exception:
+                pass
+
+    return len(all_joints)
+
+
+def _ui_run_orient(*_):
+    """UI ボタン: 選択 root(s) を対象に joint orient を実行 (weight 保護)。"""
+    sel = cmds.ls(sl=True, type="joint") or []
+    if not sel:
+        cmds.warning("Outliner / viewport で root joint(s) を選択してください")
+        return
+    # aim 選択 dropdown から
+    aim = "yzx"   # default: MMD 用
+    if cmds.optionMenu(_UI_ORIENT_AIM_MENU, ex=True):
+        raw = cmds.optionMenu(_UI_ORIENT_AIM_MENU, q=True, v=True)
+        if raw and "(" in raw:
+            axis_key = raw.split("(")[0].strip().rstrip("+-")
+            aim_map = {"X": "xyz", "Y": "yzx", "Z": "zxy"}
+            aim = aim_map.get(axis_key, "yzx")
+    result = cmds.confirmDialog(
+        t="Joint Orient (weight 保護)",
+        m=f"選択 {len(sel)} root chain に対して joint orient を実行します。\n"
+          f"aim = {aim}  ({['xyz','yzx','zxy'].index(aim)+1}番目)\n\n"
+          f"影響 skinCluster の bindPreMatrix を更新するので\n"
+          f"weight/見た目は保持されます (envelope は一時 OFF)。\n\n"
+          f"元に戻せません (Undo 可)。実行しますか?",
+        b=["実行", "Cancel"], defaultButton="Cancel",
+        cancelButton="Cancel", dismissString="Cancel")
+    if result != "実行":
+        return
+    n = orient_joints_preserving_weights(sel, aim=aim)
+    print(f"[jiggle_bones] orient 完了: {n} joint(s)")
+
+
 def set_aim_axis_all(axis):
     """v0.5.14: 既存の全 jb SplineIK の dForwardAxis を一括変更。
     setup し直さずに 子方向軸を修正できる。"""
@@ -1701,6 +1883,7 @@ def set_category_params(category, **params):
 _UI_COLLIDER_LIST = "jbColliderList"
 _UI_ADD_CATEGORY_MENU = "jbAddCategoryMenu"
 _UI_AIM_AXIS_MENU = "jbAimAxisMenu"   # v0.5.14
+_UI_ORIENT_AIM_MENU = "jbOrientAimMenu"   # v0.5.15
 _UI_NUCLEUS_FIELDS = {}      # {attr: fieldGrp}
 _UI_COLLIDER_FIELDS = {}     # {attr: fieldGrp}
 _UI_CAT_PREFIX = "jbCatSection"
@@ -2144,6 +2327,28 @@ def _show_ui_impl():
         pass
     cmds.text(l="MMD 系は Y+、Maya default は X+  (裏返る時に変更)",
               al="left", fn="smallObliqueLabelFont", p=axis_row)
+
+    # v0.5.15: joint orient tool (setup 前に model を整える)
+    cmds.separator(h=4, style="none", p=body_col)
+    orient_row = cmds.rowLayout(nc=3, adj=3, p=body_col,
+                                 cw3=(150, 120, 220),
+                                 ct3=("left", "left", "left"),
+                                 co3=(4, 4, 4))
+    cmds.text(l="orient aim:", al="right", p=orient_row)
+    cmds.optionMenu(_UI_ORIENT_AIM_MENU, p=orient_row)
+    for label in ("X+ (Y up)", "Y+ (Z up)", "Z+ (X up)"):
+        cmds.menuItem(l=label)
+    try:
+        cmds.optionMenu(_UI_ORIENT_AIM_MENU, e=True, v="Y+ (Z up)")
+    except Exception:
+        pass
+    cmds.button(l="🔧 選択 root(s) に joint orient (weight 保持)",
+                h=24, p=orient_row, c=_ui_run_orient,
+                bgc=(0.55, 0.40, 0.60),
+                ann="v0.5.15: root joint(s) 選択後、下位 chain を joint orient し直す。"
+                     " skinCluster.bindPreMatrix を新 WM.inverse で更新するので "
+                     "見た目 (weight 反映) は完全に維持される。setup 前に この tool で"
+                     " model の 軸を整えるのが推奨フロー。")
 
     # 補助: 命名 heuristic で一括登録
     aux_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
