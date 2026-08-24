@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.16"
+__version__ = "0.5.17"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1099,12 +1099,42 @@ def _joint_index_in_skin(sc, joint):
 
 
 def _freeze_rotate_to_jointOrient(joint):
-    """v0.5.16: joint.rotate を jointOrient に吸収させて rotate=0 に。
-    world rotation は 変わらない (makeIdentity r=True の joint 特殊挙動)。
-    `joint -oj` は rotate ≠ 0 だと skip するので、事前 freeze 必須。"""
+    """v0.5.17: joint.rotate を jointOrient に吸収させて rotate=0 に。
+    world rotation は 維持 (quaternion 合成)。
+
+    makeIdentity (v0.5.16) は skin 付き joint を "Freeze Transform was not
+    applied because node has skin attached" で弾く。この関数は skinCluster
+    に触らず attr の setAttr だけで freeze する ので skin 付きでも動く。
+
+    数学:
+      local_rotation = jointOrient * rotate  (Maya joint composition)
+      freeze 後は rotate=0 なので new_jointOrient を上式全体で埋める必要あり。
+      new_jointOrient = jointOrient * rotate  (quaternion multiplication)
+    """
     try:
-        cmds.makeIdentity(joint, apply=True, r=True, s=False, t=False,
-                           n=False, pn=True)
+        import maya.api.OpenMaya as om
+        import math
+        r_vals = cmds.getAttr(joint + ".rotate")[0]
+        jo_vals = cmds.getAttr(joint + ".jointOrient")[0]
+        ro = cmds.getAttr(joint + ".rotateOrder")   # int 0-5
+        q_r = om.MEulerRotation(math.radians(r_vals[0]),
+                                 math.radians(r_vals[1]),
+                                 math.radians(r_vals[2]),
+                                 ro).asQuaternion()
+        # jointOrient は 常に XYZ order
+        q_jo = om.MEulerRotation(math.radians(jo_vals[0]),
+                                  math.radians(jo_vals[1]),
+                                  math.radians(jo_vals[2]),
+                                  0).asQuaternion()
+        # Maya joint: local_rot = jointOrient * rotate (matrix、rotate が先に適用)
+        # om.MQuaternion multiply: q1 * q2 は q2 が先に適用 なので同じ順で
+        q_combined = q_jo * q_r
+        e_combined = q_combined.asEulerRotation()   # returns XYZ
+        cmds.setAttr(joint + ".jointOrient",
+                      math.degrees(e_combined.x),
+                      math.degrees(e_combined.y),
+                      math.degrees(e_combined.z))
+        cmds.setAttr(joint + ".rotate", 0, 0, 0)
         return True
     except Exception as exc:
         cmds.warning(f"[jiggle_bones] freeze rotate failed on {joint}: {exc}")
