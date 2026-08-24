@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.5"
+__version__ = "0.5.6"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -108,33 +108,35 @@ DEFAULT_PARAMS_BY_CATEGORY = {
     # attractionDamp=0 だが setup 時にリセットされない事があるので明示)。
     # drag は 空気抵抗、motionDrag は 動作抵抗、attractionDamp は 復元力の
     # 減衰。この 3 つを下げると 衝突後 数回 振動してから停止する自然挙動に。
-    # v0.5.5: startCurveAttract を non-zero に (rest curve への引き戻し力を確保)。
-    # v0.5.4 まで attract=0.05 だったが reverse 網で 0 に強制されていたので
-    # 効いていなかった。網廃止した今、0.15 前後で "自然な swing back" が出る。
-    "hair":    {"stiffness": 0.35, "damp": 0.03, "startCurveAttract": 0.15,
+    # v0.5.6: 「root 動作 → hair が overshoot する」 過反発対策。
+    # attractionDamp を 0.0 → 0.15 前後に上げる。これは attract 力による
+    # 復元が生む振動を "critical damp" で抑える attr。 damp より overshoot
+    # を狙って殺せる (damp は 全体の速度に効くので上げすぎると mushy に)。
+    # damp も僅かに上げて root-follow 時の 慣性余韻を短縮。
+    "hair":    {"stiffness": 0.35, "damp": 0.05, "startCurveAttract": 0.15,
                 "mass": 1.0, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.0, "bendResistance": 0.1},
-    "skirt":   {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.10,
+                "attractionDamp": 0.15, "bendResistance": 0.1},
+    "skirt":   {"stiffness": 0.20, "damp": 0.04, "startCurveAttract": 0.10,
                 "mass": 1.5, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.0, "bendResistance": 0.1},
-    "ribbon":  {"stiffness": 0.15, "damp": 0.02, "startCurveAttract": 0.20,
+                "attractionDamp": 0.10, "bendResistance": 0.1},
+    "ribbon":  {"stiffness": 0.15, "damp": 0.03, "startCurveAttract": 0.20,
                 "mass": 0.4, "drag": 0.02, "motionDrag": 0.0,
-                "attractionDamp": 0.0, "bendResistance": 0.05},
-    "sleeve":  {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.15,
+                "attractionDamp": 0.15, "bendResistance": 0.05},
+    "sleeve":  {"stiffness": 0.20, "damp": 0.04, "startCurveAttract": 0.15,
                 "mass": 0.8, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.0, "bendResistance": 0.1},
-    "necktie": {"stiffness": 0.30, "damp": 0.04, "startCurveAttract": 0.20,
+                "attractionDamp": 0.12, "bendResistance": 0.1},
+    "necktie": {"stiffness": 0.30, "damp": 0.05, "startCurveAttract": 0.20,
                 "mass": 0.5, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.0, "bendResistance": 0.1},
-    "coat":    {"stiffness": 0.30, "damp": 0.04, "startCurveAttract": 0.15,
+                "attractionDamp": 0.15, "bendResistance": 0.1},
+    "coat":    {"stiffness": 0.30, "damp": 0.05, "startCurveAttract": 0.15,
                 "mass": 1.5, "drag": 0.08, "motionDrag": 0.0,
-                "attractionDamp": 0.0, "bendResistance": 0.15},
-    "ear":     {"stiffness": 0.50, "damp": 0.05, "startCurveAttract": 0.30,
+                "attractionDamp": 0.15, "bendResistance": 0.15},
+    "ear":     {"stiffness": 0.50, "damp": 0.06, "startCurveAttract": 0.30,
                 "mass": 0.5, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.0, "bendResistance": 0.15},
-    "tail":    {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.10,
+                "attractionDamp": 0.20, "bendResistance": 0.15},
+    "tail":    {"stiffness": 0.20, "damp": 0.04, "startCurveAttract": 0.10,
                 "mass": 1.0, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.0, "bendResistance": 0.1},
+                "attractionDamp": 0.10, "bendResistance": 0.1},
 }
 
 
