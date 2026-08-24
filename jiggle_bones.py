@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.9"
+__version__ = "0.5.10"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -1649,7 +1649,11 @@ def _ui_remove_chain(chain, *_):
 
 
 def _ui_add_from_selection(*_):
-    """選択 joint から chain を構築 → registry に追加 → UI 再構築。"""
+    """選択 joint から chain を構築 → registry に追加 → 即セットアップ
+    → UI 再構築。 v0.5.10: 1-click 化 (以前は登録のみ、setup 別ボタン)。
+
+    エラーは try で包む: 中で例外が起きても show_ui() が確実に走らない
+    と window が消えたまま残る (delete → 再生成の間で失敗すると空)。"""
     chain = build_chain_from_selection()
     if not chain:
         return
@@ -1660,8 +1664,20 @@ def _ui_add_from_selection(*_):
         # "auto (自動判定)" → None、"hair (髪)" → "hair"
         if raw and not raw.startswith("auto"):
             cat_choice = raw.split()[0]
-    add_registered_chain(chain, category=cat_choice)
-    show_ui()   # rebuild UI with new registry entry
+    try:
+        add_registered_chain(chain, category=cat_choice)
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] registry 追加失敗: {exc}")
+    # v0.5.10: 追加と同時に setup も走らせる
+    try:
+        create_jiggle_for_chain(chain, category=cat_choice)
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] setup 失敗 (chain は registry に登録済): {exc}")
+    # 最後に UI 再構築 (エラー時も window は残す)
+    try:
+        show_ui()
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] UI 再構築失敗: {exc}")
 
 
 def _select_bones_from_list(bone_list_name, chain, *_):
@@ -1689,7 +1705,45 @@ def _ui_populate_registry_from_names(*_):
     show_ui()
 
 
+def _show_error_ui(msg):
+    """UI 構築失敗時のフォールバック — 最小 window に Reload ボタンだけ出す。
+    v0.5.10: show_ui() 途中で例外が出ると window が消えたまま残る症状の対策。"""
+    if cmds.window(WINDOW, exists=True):
+        try:
+            cmds.deleteUI(WINDOW)
+        except Exception:
+            pass
+    win = cmds.window(WINDOW, t=f"Jiggle Bones v{__version__} [ERROR]",
+                      w=500, h=200)
+    cmds.columnLayout(adj=True, rs=6, cat=("both", 10))
+    cmds.text(l="UI 構築失敗", fn="boldLabelFont", al="left")
+    cmds.text(l=str(msg), ww=True, w=480, al="left")
+    cmds.separator(h=8, style="in")
+    cmds.button(l="🔄 Reload UI", h=32,
+                c=lambda *_: show_ui(), bgc=(0.35, 0.55, 0.35))
+    cmds.text(l="上を押しても駄目なら Script Editor に traceback が出ています。",
+              fn="smallObliqueLabelFont", al="left", ww=True, w=480)
+    cmds.showWindow(win)
+
+
 def show_ui():
+    """v0.5.10: try/except で包み、エラー時は _show_error_ui() でフォールバック。
+    途中で失敗しても window が完全に消えたままになる事は無い。"""
+    if cmds is None:
+        raise RuntimeError("show_ui() must be called inside Maya.")
+    try:
+        _show_ui_impl()
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        cmds.warning(f"[jiggle_bones] UI 構築失敗: {exc}")
+        try:
+            _show_error_ui(exc)
+        except Exception:
+            pass
+
+
+def _show_ui_impl():
     """揺れもの dynamics UI (v0.2.1 header/body/footer レイアウト)。
 
     formLayout で:
@@ -1698,8 +1752,6 @@ def show_ui():
       - body (collider + カテゴリ) を残り領域に scrollLayout で配置
     こうすると window resize しても footer の action ボタンが常に見える。
     """
-    if cmds is None:
-        raise RuntimeError("show_ui() must be called inside Maya.")
     if cmds.window(WINDOW, exists=True):
         cmds.deleteUI(WINDOW)
     _ui_reset_state()
@@ -1717,10 +1769,9 @@ def show_ui():
               al="left", fn="boldLabelFont", p=header)
     cmds.text(l="使い方:  ①コライダー mesh を追加  "
                 "②scene で joint を選択 → 「選択から chain 追加」 "
-                "③カテゴリごとにパラメータ調整 → 「セットアップ」で rig 構築 "
-                "(FK cube ctl 生成、root=移動+回転可・子=回転のみ) "
-                "④root ctl.dynBlend で FK(0) ↔ dynamics(1) ブレンド "
-                "⑤タイムライン再生で確認",
+                "(v0.5.10: 追加と同時に自動セットアップ、FK cube ctl 生成) "
+                "③カテゴリごとにパラメータ slider で調整 → 「反映」ボタン "
+                "④タイムライン再生で確認",
               al="left", fn="smallObliqueLabelFont", ww=True, p=header,
               w=520)
     cmds.separator(h=6, style="in", p=header)
@@ -1848,10 +1899,11 @@ def show_ui():
     for cat_key in _JIGGLE_TOKENS.keys():
         jp = _CATEGORY_JP.get(cat_key, cat_key)
         cmds.menuItem(l=f"{cat_key} ({jp})")
-    cmds.button(l="選択から chain 追加", h=24, p=add_row,
-                c=_ui_add_from_selection, bgc=(0.30, 0.55, 0.30),
-                ann="選択 joint から chain を組み立てて registry に追加。"
-                     "追加後、下のリストの「セットアップ」で rig を構築")
+    cmds.button(l="⚡ 選択から chain 追加 + 自動セットアップ", h=26, p=add_row,
+                c=_ui_add_from_selection, bgc=(0.30, 0.60, 0.30),
+                ann="v0.5.10: 選択 joint から chain を組み立てて registry 登録 "
+                     "→ create_jiggle_for_chain まで 1 クリックで実行。"
+                     "エラー時も UI は残る (フォールバック)")
 
     # 補助: 命名 heuristic で一括登録
     aux_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
