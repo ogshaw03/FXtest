@@ -57,7 +57,37 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.11"
+__version__ = "0.5.12"
+
+
+def cleanup_mcd_junk():
+    """v0.5.12: 既存 scene に散らかった MCD 副産物を掃除。
+
+    対象: root 直下 (assemblies) の transform で
+      - 名前が hairSystem*OutputCurves / transform<n>
+      - 子が無い (空 group)
+      - jb_ prefix ではない
+
+    Returns: 削除した node 数。"""
+    n = 0
+    for t in cmds.ls(assemblies=True) or []:
+        if not cmds.objExists(t):
+            continue
+        if t.startswith("jb_"):
+            continue
+        if not (t.startswith("hairSystem") or
+                (t.startswith("transform") and t[9:].isdigit())):
+            continue
+        kids = cmds.listRelatives(t, c=True) or []
+        if kids:
+            continue
+        try:
+            cmds.delete(t)
+            n += 1
+        except Exception:
+            pass
+    print(f"[jiggle_bones] cleanup_mcd_junk: {n} node(s) deleted")
+    return n
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -776,6 +806,8 @@ def _add_follicle_to_hair_system(rest_curve, hs_shape, chain):
     foll_before = set(cmds.ls(type="follicle"))
     curves_before = set(cmds.ls(type="nurbsCurve"))
     nuc_before = set(cmds.ls(type="nucleus"))
+    # v0.5.12: MCD が root に散らかす副産物 transform も差分検出
+    transforms_before = set(cmds.ls(assemblies=True))
 
     # 現在 nucleus を我々のものに (makeCurvesDynamic はこの nucleus を使う)
     try:
@@ -884,6 +916,33 @@ def _add_follicle_to_hair_system(rest_curve, hs_shape, chain):
         dyn_xf = cmds.listRelatives(dyn_shape, p=True)
         if dyn_xf:
             _parent_to_jb(dyn_xf[0])
+
+    # v0.5.12: MCD が root に散らかす副産物 (hairSystemNOutputCurves 空 group、
+    # transform1/2/3 の 中身抽出済み空 transform) を片付ける。
+    # 差分で見つかった 新規 root 直下 transform のうち、
+    #   ・子が無い (empty group)
+    #   ・shape も無い
+    #   ・name が hairSystem*OutputCurves か transform<n>
+    # を対象に削除。 jb_bones_grp や 明示 rename 済み jb_* 名は除外。
+    transforms_after = set(cmds.ls(assemblies=True))
+    new_root_transforms = transforms_after - transforms_before
+    _mcd_junk_patterns = ("hairSystem", "transform")
+    for t in new_root_transforms:
+        if not cmds.objExists(t):
+            continue
+        if t.startswith("jb_"):
+            continue
+        # 名前パターン確認
+        if not any(t.startswith(p) for p in _mcd_junk_patterns):
+            continue
+        # 中身確認: 子 transform も shape も無ければ削除、または 子が全部
+        # 別階層へ移動済で empty なら削除
+        kids = cmds.listRelatives(t, c=True) or []
+        if not kids:
+            try:
+                cmds.delete(t)
+            except Exception:
+                pass
 
     return dyn_shape
 
