@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.17"
+__version__ = "0.5.18"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1098,6 +1098,79 @@ def _joint_index_in_skin(sc, joint):
     return None
 
 
+def _manual_orient_joint_to_child(joint, aim="yzx"):
+    """v0.5.18: cmds.joint(oj=...) が effect なかった時の fallback。
+    joint の 最初の 子 に aim 軸を向けるように jointOrient を計算。
+
+    aim: "xyz"/"yzx"/"zxy" のいずれか (Maya `-oj` 形式)。
+         最初文字が aim 軸 (X/Y/Z)、次が up 軸候補。
+    """
+    child_list = cmds.listRelatives(joint, c=True, type="joint") or []
+    if not child_list:
+        try: cmds.setAttr(joint + ".jointOrient", 0, 0, 0)
+        except: pass
+        return
+    try:
+        import maya.api.OpenMaya as om
+        import math
+        child = child_list[0]
+        # world 位置
+        j_ws = cmds.xform(joint, q=True, ws=True, t=True)
+        c_ws = cmds.xform(child, q=True, ws=True, t=True)
+        # 親の worldMatrix (jointOrient は parent 空間で解釈される)
+        parent_list = cmds.listRelatives(joint, p=True) or []
+        if parent_list:
+            pm = cmds.getAttr(parent_list[0] + ".worldMatrix[0]")
+            p_wim = om.MMatrix(pm).inverse()
+        else:
+            p_wim = om.MMatrix()   # identity
+        # aim vec in world
+        aim_world = om.MVector(c_ws[0]-j_ws[0], c_ws[1]-j_ws[1], c_ws[2]-j_ws[2])
+        if aim_world.length() < 1e-8:
+            return
+        # parent 空間へ変換
+        aim_local = (om.MPoint(aim_world.x, aim_world.y, aim_world.z, 0.0)
+                     * p_wim)
+        aim_vec = om.MVector(aim_local.x, aim_local.y, aim_local.z).normalize()
+        # up world = 世界の Y+ (共通 up)
+        up_world = om.MVector(0, 1, 0)
+        up_local = (om.MPoint(up_world.x, up_world.y, up_world.z, 0.0) * p_wim)
+        up_vec = om.MVector(up_local.x, up_local.y, up_local.z)
+        # aim と up が近い時 (垂直骨) は up を Z に切替
+        if abs(aim_vec * up_vec) > 0.95:
+            up_world = om.MVector(0, 0, 1)
+            up_local = (om.MPoint(0, 0, 1, 0.0) * p_wim)
+            up_vec = om.MVector(up_local.x, up_local.y, up_local.z)
+        # 直交化
+        aim_axis = aim_vec.normalize()
+        side_axis = (aim_axis ^ up_vec).normalize()   # cross
+        up_axis = (side_axis ^ aim_axis).normalize()
+        # aim 文字 (aim[0]) が何番目軸か決めて行列を組む
+        # M rows = local axes in parent space
+        # xyz → row0=X=aim, row1=Y=up, row2=Z=side
+        # yzx → row0=X=side, row1=Y=aim, row2=Z=up
+        # zxy → row0=X=up, row1=Y=side, row2=Z=aim
+        axes_map = {
+            "xyz": (aim_axis, up_axis, side_axis),
+            "yzx": (side_axis, aim_axis, up_axis),
+            "zxy": (up_axis, side_axis, aim_axis),
+        }
+        rows = axes_map.get(aim, axes_map["yzx"])
+        m = om.MMatrix((
+            rows[0].x, rows[0].y, rows[0].z, 0.0,
+            rows[1].x, rows[1].y, rows[1].z, 0.0,
+            rows[2].x, rows[2].y, rows[2].z, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ))
+        e = om.MTransformationMatrix(m).rotation(asQuaternion=False)
+        cmds.setAttr(joint + ".jointOrient",
+                      math.degrees(e.x),
+                      math.degrees(e.y),
+                      math.degrees(e.z))
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] manual orient failed on {joint}: {exc}")
+
+
 def _freeze_rotate_to_jointOrient(joint):
     """v0.5.17: joint.rotate を jointOrient に吸収させて rotate=0 に。
     world rotation は 維持 (quaternion 合成)。
@@ -1192,7 +1265,6 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
 
     try:
         # v0.5.16: 4. 各 root chain の rotate を jointOrient に freeze
-        #        (Maya `joint -oj` は rotate=0 でないと skip する仕様)
         for r in roots:
             if not cmds.objExists(r):
                 continue
@@ -1201,25 +1273,43 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                 if any(abs(v) > 1e-6 for v in r_vals):
                     _freeze_rotate_to_jointOrient(j)
 
-        # 5. root ごとに joint orient を実行
+        # v0.5.18: 5. root 含む全 joint に対して 個別に orient を実行。
+        # 以前は cmds.joint(root, ch=True) 一発だったが、Maya の仕様で
+        # root の jointOrient が更新されない事例あり → root も含めて
+        # per-joint に明示 oj を叩く。失敗した joint は API で 手動計算。
         for r in roots:
             if not cmds.objExists(r):
                 continue
-            try:
-                cmds.select(r, r=True)
-                cmds.joint(r, e=True, oj=aim, secondaryAxisOrient=sao,
-                            ch=True, zso=True)
-            except Exception as exc:
-                cmds.warning(f"[jiggle_bones] joint orient failed on {r}: {exc}")
-                continue
-            # 末端 joint (子無し) は oj=none で jointOrient=0 に
-            for j in _collect_chain_from_root(r):
-                if not cmds.listRelatives(j, c=True, type="joint"):
+            chain_joints = _collect_chain_from_root(r)
+            print(f"[jiggle_bones] orient chain root={r}, {len(chain_joints)} joints")
+            for j in chain_joints:
+                has_child = bool(cmds.listRelatives(j, c=True, type="joint"))
+                jo_before = cmds.getAttr(j + ".jointOrient")[0]
+                if has_child:
+                    ok = False
                     try:
-                        cmds.joint(j, e=True, oj="none",
-                                    zso=True, ch=False)
+                        cmds.select(j, r=True)
+                        cmds.joint(j, e=True, oj=aim,
+                                    secondaryAxisOrient=sao,
+                                    ch=False, zso=True)
+                        ok = True
+                    except Exception as exc:
+                        cmds.warning(f"[jiggle_bones] cmds.joint oj failed on "
+                                      f"{j}: {exc}, fallback to API")
+                    if not ok:
+                        _manual_orient_joint_to_child(j, aim=aim)
+                else:
+                    # 末端 joint: jointOrient=0
+                    try:
+                        cmds.setAttr(j + ".jointOrient", 0, 0, 0)
                     except Exception:
                         pass
+                jo_after = cmds.getAttr(j + ".jointOrient")[0]
+                changed = any(abs(jo_before[i] - jo_after[i]) > 0.001
+                              for i in range(3))
+                mark = " ★" if changed else ""
+                print(f"    {j}: jo {[round(x,1) for x in jo_before]}"
+                      f" → {[round(x,1) for x in jo_after]}{mark}")
 
         # 5. bindPreMatrix を 新 WM.inverse で更新 → skinning は 見た目維持
         n_updated = 0
