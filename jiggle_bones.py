@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.8"
+__version__ = "0.5.9"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -84,6 +84,8 @@ _PARAM_LABEL_JP = {
     "motionDrag":        "運動抵抗 (motionDrag)",
     "attractionDamp":    "復元減衰 (attractionDamp)",
     "bendResistance":    "曲げ抵抗 (bendResistance)",
+    # v0.5.9: 当たり判定の見た目広さ調整 (mesh 表面から N unit 外側まで)
+    "collideWidthOffset": "衝突厚み (collideWidthOffset)",
 }
 
 # =========================================================================
@@ -117,30 +119,39 @@ DEFAULT_PARAMS_BY_CATEGORY = {
     #   attractionDamp を 1.0 に上げて overshoot を完全に殺し、
     #   mass を 0.2 に下げて 慣性遅れを最小化、
     #   stiffness を 0.1 まで下げて 引き戻し速度を穏やかに。
+    # v0.5.9: collideWidthOffset を param 化 (0.05 mesh すれすれ default)。
     "hair":    {"stiffness": 0.10, "damp": 0.02, "startCurveAttract": 0.15,
                 "mass": 0.2, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 1.0, "bendResistance": 0.1089},
+                "attractionDamp": 1.0, "bendResistance": 0.1089,
+                "collideWidthOffset": 0.05},
     "skirt":   {"stiffness": 0.20, "damp": 0.04, "startCurveAttract": 0.10,
                 "mass": 1.5, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.10, "bendResistance": 0.1},
+                "attractionDamp": 0.10, "bendResistance": 0.1,
+                "collideWidthOffset": 0.05},
     "ribbon":  {"stiffness": 0.15, "damp": 0.03, "startCurveAttract": 0.20,
                 "mass": 0.4, "drag": 0.02, "motionDrag": 0.0,
-                "attractionDamp": 0.15, "bendResistance": 0.05},
+                "attractionDamp": 0.15, "bendResistance": 0.05,
+                "collideWidthOffset": 0.05},
     "sleeve":  {"stiffness": 0.20, "damp": 0.04, "startCurveAttract": 0.15,
                 "mass": 0.8, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.12, "bendResistance": 0.1},
+                "attractionDamp": 0.12, "bendResistance": 0.1,
+                "collideWidthOffset": 0.05},
     "necktie": {"stiffness": 0.30, "damp": 0.05, "startCurveAttract": 0.20,
                 "mass": 0.5, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.15, "bendResistance": 0.1},
+                "attractionDamp": 0.15, "bendResistance": 0.1,
+                "collideWidthOffset": 0.05},
     "coat":    {"stiffness": 0.30, "damp": 0.05, "startCurveAttract": 0.15,
                 "mass": 1.5, "drag": 0.08, "motionDrag": 0.0,
-                "attractionDamp": 0.15, "bendResistance": 0.15},
+                "attractionDamp": 0.15, "bendResistance": 0.15,
+                "collideWidthOffset": 0.05},
     "ear":     {"stiffness": 0.50, "damp": 0.06, "startCurveAttract": 0.30,
                 "mass": 0.5, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.20, "bendResistance": 0.15},
+                "attractionDamp": 0.20, "bendResistance": 0.15,
+                "collideWidthOffset": 0.05},
     "tail":    {"stiffness": 0.20, "damp": 0.04, "startCurveAttract": 0.10,
                 "mass": 1.0, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.10, "bendResistance": 0.1},
+                "attractionDamp": 0.10, "bendResistance": 0.1,
+                "collideWidthOffset": 0.05},
 }
 
 
@@ -1418,7 +1429,10 @@ def list_colliders():
 
 _PARAM_ATTRS = ("stiffness", "damp", "startCurveAttract", "mass",
                 # v0.5.4: 過減衰対策 (「1 回で止まる」を「自然に振動する」に)
-                "drag", "motionDrag", "attractionDamp", "bendResistance")
+                "drag", "motionDrag", "attractionDamp", "bendResistance",
+                # v0.5.9: 当たり判定の張り出し幅 (小さいと mesh ぴったり、
+                #         大きいと遠くから collision)
+                "collideWidthOffset")
 
 
 def _hair_systems_for_category(category):
@@ -1920,8 +1934,11 @@ def _build_category_section(category, chain_list, parent=None):
         # v0.5.4: 過減衰対策 4 param
         "drag":              (0.0, 1.0, 0.0, 0.3),   # 空気抵抗
         "motionDrag":        (0.0, 1.0, 0.0, 0.3),   # 動作抵抗
-        "attractionDamp":    (0.0, 1.0, 0.0, 0.5),   # 復元力の減衰
+        "attractionDamp":    (0.0, 1.0, 0.0, 1.0),   # 復元力の減衰
         "bendResistance":    (0.0, 5.0, 0.0, 1.0),   # 曲げ抵抗
+        # v0.5.9: 当たり判定の張り出し幅
+        # 0 なら mesh 表面すれすれ、0.5 で MMD scale の 4cm ぶん外側
+        "collideWidthOffset": (0.0, 5.0, 0.0, 0.5),
     }
     for attr in _PARAM_ATTRS:
         v = src.get(attr, defaults.get(attr, 0.0))
