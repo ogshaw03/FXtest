@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -1487,12 +1487,19 @@ def _ui_collider_remove_sel(*_):
 
 
 def _ui_apply_category_params(category, *_):
-    """UI の param field 値を hairSystem に反映。"""
+    """UI の param field 値を hairSystem に反映。
+    v0.5.3: floatSliderGrp と (旧) floatFieldGrp の両方を受ける。"""
     params = {}
     for attr in _PARAM_ATTRS:
         fld = _UI_CATEGORY_FIELDS.get((category, attr))
-        if fld and cmds.floatFieldGrp(fld, ex=True):
+        if not fld:
+            continue
+        v = None
+        if cmds.floatSliderGrp(fld, ex=True):
+            v = cmds.floatSliderGrp(fld, q=True, value=True)
+        elif cmds.floatFieldGrp(fld, ex=True):
             v = cmds.floatFieldGrp(fld, q=True, value1=True)
+        if v is not None:
             params[attr] = v
     if params:
         set_category_params(category, **params)
@@ -1851,12 +1858,26 @@ def _build_category_section(category, chain_list, parent=None):
 
     # シミュレーションパラメータ (per-category)
     # 表示値の優先順位: 既存 hairSystem の live 値 > default 経験則
+    # v0.5.3: floatSliderGrp に切替 (0.01 単位のスライダー + 精度 4 桁の
+    #        数値入力 field)。微調整が直感的にできる。
     src = live_values if live_values is not None else defaults
+    _param_range = {
+        "stiffness":         (0.0, 1.0, 0.0, 1.0),   # (fmin, fmax, smin, smax)
+        "damp":              (0.0, 1.0, 0.0, 0.5),
+        "startCurveAttract": (0.0, 1.0, 0.0, 1.0),
+        "mass":              (0.01, 20.0, 0.1, 5.0),
+    }
     for attr in _PARAM_ATTRS:
         v = src.get(attr, defaults.get(attr, 0.0))
         label_jp = _PARAM_LABEL_JP.get(attr, attr) + " :"
-        fld = cmds.floatFieldGrp(numberOfFields=1, label=label_jp,
-                                   value1=v, cw2=(180, 80), p=inner)
+        fmin, fmax, smin, smax = _param_range.get(attr, (0.0, 10.0, 0.0, 1.0))
+        fld = cmds.floatSliderGrp(
+            label=label_jp, field=True, value=v,
+            precision=4, cw3=(140, 70, 100),
+            fieldMinValue=fmin, fieldMaxValue=fmax,
+            minValue=smin, maxValue=smax,
+            step=0.001, sliderStep=0.01,
+            p=inner)
         _UI_CATEGORY_FIELDS[(category, attr)] = fld
 
     cmds.button(l=f"{cat_jp} のパラメータを反映",
