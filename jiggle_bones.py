@@ -57,7 +57,37 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.12"
+__version__ = "0.5.13"
+
+
+def _cleanup_mcd_junk_inline():
+    """v0.5.13: setup 途中で呼ぶ内部版 (print 抑制、失敗も静か)。"""
+    n = 0
+    for t in cmds.ls(assemblies=True) or []:
+        if not cmds.objExists(t):
+            continue
+        if t.startswith("jb_"):
+            continue
+        # 名前パターン: hairSystemNOutputCurves 系 / transformN 系 /
+        # nucleusN 系 (自動生成された余計 nucleus) / follicleN 系 (empty)
+        looks_junk = (
+            t.startswith("hairSystem") or
+            (t.startswith("transform") and t[9:].isdigit()) or
+            (t.startswith("nucleus") and t[7:].isdigit()) or
+            (t.startswith("follicle") and t[8:].isdigit())
+        )
+        if not looks_junk:
+            continue
+        # 中身: 空 or shape も transform 子も無い場合のみ削除
+        kids = cmds.listRelatives(t, c=True) or []
+        if kids:
+            continue
+        try:
+            cmds.delete(t)
+            n += 1
+        except Exception:
+            pass
+    return n
 
 
 def cleanup_mcd_junk():
@@ -1074,6 +1104,15 @@ def create_jiggle_for_chain(chain, category=None):
                                     n=_root_pc_name(chain))
         except Exception as exc:
             cmds.warning(f"[jiggle_bones] root translate constraint failed: {exc}")
+
+    # v0.5.13: chain setup 完了時に scene 全体で MCD 副産物掃除。
+    # v0.5.12 の差分検出だけでは 拾えない empty root transform
+    # (parent 済み / rename 済み 抽出後に empty になった元 group 等) を
+    # 網羅的に削除。副作用防止のため named 前提 (jb_*, 実 mesh 等はスキップ)。
+    try:
+        _cleanup_mcd_junk_inline()
+    except Exception:
+        pass
 
     print(f"[jiggle_bones] v0.5.0 setup {_chain_id(chain)} → "
           f"category={category}, joints={len(chain)}, "
