@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.23"
+__version__ = "0.5.24"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1098,12 +1098,12 @@ def _joint_index_in_skin(sc, joint):
     return None
 
 
-def _manual_orient_joint_to_child(joint, aim="yzx"):
-    """v0.5.18: cmds.joint(oj=...) が effect なかった時の fallback。
-    joint の 最初の 子 に aim 軸を向けるように jointOrient を計算。
+def _manual_orient_joint_to_child(joint, aim="yzx", verbose=False):
+    """v0.5.24: joint の 最初の 子 に aim 軸を向けるように jointOrient を計算。
+    Verbose ON で 詳細計算経過を print (デバッグ用)。
 
     aim: "xyz"/"yzx"/"zxy" のいずれか (Maya `-oj` 形式)。
-         最初文字が aim 軸 (X/Y/Z)、次が up 軸候補。
+         最初文字が aim 軸 (X/Y/Z)。
     """
     child_list = cmds.listRelatives(joint, c=True, type="joint") or []
     if not child_list:
@@ -1114,42 +1114,31 @@ def _manual_orient_joint_to_child(joint, aim="yzx"):
         import maya.api.OpenMaya as om
         import math
         child = child_list[0]
-        # world 位置
         j_ws = cmds.xform(joint, q=True, ws=True, t=True)
         c_ws = cmds.xform(child, q=True, ws=True, t=True)
-        # 親の worldMatrix (jointOrient は parent 空間で解釈される)
         parent_list = cmds.listRelatives(joint, p=True) or []
         if parent_list:
             pm = cmds.getAttr(parent_list[0] + ".worldMatrix[0]")
             p_wim = om.MMatrix(pm).inverse()
         else:
-            p_wim = om.MMatrix()   # identity
-        # aim vec in world
+            p_wim = om.MMatrix()
         aim_world = om.MVector(c_ws[0]-j_ws[0], c_ws[1]-j_ws[1], c_ws[2]-j_ws[2])
         if aim_world.length() < 1e-8:
+            if verbose: print(f"    manual({joint}): 子と同位置、skip")
             return
-        # parent 空間へ変換
-        aim_local = (om.MPoint(aim_world.x, aim_world.y, aim_world.z, 0.0)
-                     * p_wim)
-        aim_vec = om.MVector(aim_local.x, aim_local.y, aim_local.z).normalize()
-        # up world = 世界の Y+ (共通 up)
-        up_world = om.MVector(0, 1, 0)
-        up_local = (om.MPoint(up_world.x, up_world.y, up_world.z, 0.0) * p_wim)
-        up_vec = om.MVector(up_local.x, up_local.y, up_local.z)
-        # aim と up が近い時 (垂直骨) は up を Z に切替
+        # v0.5.24: direction 変換は MMatrix.setToProduct ではなく
+        # MVector * MMatrix を使う (row-vector 慣習)。 direction なので
+        # translate 成分は無視される (MVector 自体が w=0 相当)。
+        aim_vec = (aim_world * p_wim).normalize()
+        up_world_1 = om.MVector(0, 1, 0)
+        up_vec = (up_world_1 * p_wim).normalize()
         if abs(aim_vec * up_vec) > 0.95:
-            up_world = om.MVector(0, 0, 1)
-            up_local = (om.MPoint(0, 0, 1, 0.0) * p_wim)
-            up_vec = om.MVector(up_local.x, up_local.y, up_local.z)
-        # 直交化
-        aim_axis = aim_vec.normalize()
-        side_axis = (aim_axis ^ up_vec).normalize()   # cross
-        up_axis = (side_axis ^ aim_axis).normalize()
-        # aim 文字 (aim[0]) が何番目軸か決めて行列を組む
-        # M rows = local axes in parent space
-        # xyz → row0=X=aim, row1=Y=up, row2=Z=side
-        # yzx → row0=X=side, row1=Y=aim, row2=Z=up
-        # zxy → row0=X=up, row1=Y=side, row2=Z=aim
+            up_world_2 = om.MVector(0, 0, 1)
+            up_vec = (up_world_2 * p_wim).normalize()
+        side_axis = (aim_vec ^ up_vec).normalize()
+        up_axis = (side_axis ^ aim_vec).normalize()
+        aim_axis = aim_vec
+
         axes_map = {
             "xyz": (aim_axis, up_axis, side_axis),
             "yzx": (side_axis, aim_axis, up_axis),
@@ -1163,12 +1152,21 @@ def _manual_orient_joint_to_child(joint, aim="yzx"):
             0.0, 0.0, 0.0, 1.0,
         ))
         e = om.MTransformationMatrix(m).rotation(asQuaternion=False)
-        cmds.setAttr(joint + ".jointOrient",
-                      math.degrees(e.x),
-                      math.degrees(e.y),
-                      math.degrees(e.z))
+        new_jo = (math.degrees(e.x), math.degrees(e.y), math.degrees(e.z))
+        if verbose:
+            print(f"    manual({joint}):")
+            print(f"      child={child}")
+            print(f"      j.WS={[round(x,2) for x in j_ws]}")
+            print(f"      c.WS={[round(x,2) for x in c_ws]}")
+            print(f"      aim_world={[round(aim_world[i],3) for i in range(3)]} (len={aim_world.length():.3f})")
+            print(f"      aim_local (parent space)={[round(aim_vec[i],3) for i in range(3)]}")
+            print(f"      side_axis={[round(side_axis[i],3) for i in range(3)]}")
+            print(f"      up_axis={[round(up_axis[i],3) for i in range(3)]}")
+            print(f"      → jointOrient = {[round(x,2) for x in new_jo]}")
+        cmds.setAttr(joint + ".jointOrient", new_jo[0], new_jo[1], new_jo[2])
     except Exception as exc:
         cmds.warning(f"[jiggle_bones] manual orient failed on {joint}: {exc}")
+        import traceback; traceback.print_exc()
 
 
 def _freeze_rotate_to_jointOrient(joint):
@@ -1304,7 +1302,7 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                 jo_before = cmds.getAttr(j + ".jointOrient")[0]
 
                 if has_child:
-                    _manual_orient_joint_to_child(j, aim=aim)
+                    _manual_orient_joint_to_child(j, aim=aim, verbose=True)
                 else:
                     try:
                         cmds.setAttr(j + ".jointOrient", 0, 0, 0)
