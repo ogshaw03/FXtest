@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.24"
+__version__ = "0.5.25"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1098,6 +1098,22 @@ def _joint_index_in_skin(sc, joint):
     return None
 
 
+def _force_dg_eval_recursive(node):
+    """v0.5.25: node と 全 descendant の worldMatrix を getAttr で 強制評価。
+    setAttr 後に stale cache が残るのを防ぐ (Maya parallel eval の遅延対策)。"""
+    try:
+        cmds.getAttr(node + ".worldMatrix[0]")
+        cmds.getAttr(node + ".worldInverseMatrix[0]")
+        for d in cmds.listRelatives(node, ad=True, type="transform") or []:
+            try:
+                cmds.getAttr(d + ".worldMatrix[0]")
+                cmds.getAttr(d + ".worldInverseMatrix[0]")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _manual_orient_joint_to_child(joint, aim="yzx", verbose=False):
     """v0.5.24: joint の 最初の 子 に aim 軸を向けるように jointOrient を計算。
     Verbose ON で 詳細計算経過を print (デバッグ用)。
@@ -1309,8 +1325,12 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                     except Exception:
                         pass
 
+                # v0.5.25: setAttr 後に DG を 強制再評価 → 次の 子処理で
+                # stale な parent.worldMatrix を読まないように。
+                # (これが無いと 複数回実行して初めて収束するタイプの bug)
+                _force_dg_eval_recursive(j)
+
                 # v0.5.21: この joint の 全 descendant の WS を snapshot 値に復元
-                # (自分自身は復元しない - jointOrient は位置に影響しないので不要)
                 descendants = cmds.listRelatives(j, ad=True,
                                                    type="transform") or []
                 for d in descendants:
@@ -1319,6 +1339,8 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                             cmds.xform(d, ws=True, t=all_ws_snapshot[d])
                         except Exception:
                             pass
+                # v0.5.25: 復元後も DG 強制 (descendants の translate 変化後)
+                _force_dg_eval_recursive(j)
 
                 jo_after = cmds.getAttr(j + ".jointOrient")[0]
                 changed = any(abs(jo_before[i] - jo_after[i]) > 0.001
