@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.22"
+__version__ = "0.5.23"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1172,41 +1172,35 @@ def _manual_orient_joint_to_child(joint, aim="yzx"):
 
 
 def _freeze_rotate_to_jointOrient(joint):
-    """v0.5.17: joint.rotate を jointOrient に吸収させて rotate=0 に。
-    world rotation は 維持 (quaternion 合成)。
+    """v0.5.23: joint.rotate を jointOrient に吸収させて rotate=0 に。
+    world rotation は 完全維持。 matrix decomposition ベース。
 
-    makeIdentity (v0.5.16) は skin 付き joint を "Freeze Transform was not
-    applied because node has skin attached" で弾く。この関数は skinCluster
-    に触らず attr の setAttr だけで freeze する ので skin 付きでも動く。
+    やり方:
+      1. joint の 現在 worldMatrix WM を採取 (rotate 反映済)
+      2. parent の worldMatrix PM を採取
+      3. local = WM * PM.inverse  (row-vector convention)
+      4. local から rotation 部分を euler で抽出
+      5. これを jointOrient に set、rotate=0 に
 
-    数学:
-      local_rotation = jointOrient * rotate  (Maya joint composition)
-      freeze 後は rotate=0 なので new_jointOrient を上式全体で埋める必要あり。
-      new_jointOrient = jointOrient * rotate  (quaternion multiplication)
-    """
+    利点: quaternion order の 仮定不要、Maya の 実 world matrix と 一致。"""
     try:
         import maya.api.OpenMaya as om
         import math
-        r_vals = cmds.getAttr(joint + ".rotate")[0]
-        jo_vals = cmds.getAttr(joint + ".jointOrient")[0]
-        ro = cmds.getAttr(joint + ".rotateOrder")   # int 0-5
-        q_r = om.MEulerRotation(math.radians(r_vals[0]),
-                                 math.radians(r_vals[1]),
-                                 math.radians(r_vals[2]),
-                                 ro).asQuaternion()
-        # jointOrient は 常に XYZ order
-        q_jo = om.MEulerRotation(math.radians(jo_vals[0]),
-                                  math.radians(jo_vals[1]),
-                                  math.radians(jo_vals[2]),
-                                  0).asQuaternion()
-        # Maya joint: local_rot = jointOrient * rotate (matrix、rotate が先に適用)
-        # om.MQuaternion multiply: q1 * q2 は q2 が先に適用 なので同じ順で
-        q_combined = q_jo * q_r
-        e_combined = q_combined.asEulerRotation()   # returns XYZ
+        wm = om.MMatrix(cmds.getAttr(joint + ".worldMatrix[0]"))
+        parent_list = cmds.listRelatives(joint, p=True) or []
+        if parent_list:
+            pm_inv = om.MMatrix(cmds.getAttr(parent_list[0]
+                                               + ".worldMatrix[0]")).inverse()
+        else:
+            pm_inv = om.MMatrix()   # identity
+        # row-vector: local = wm * pm_inv
+        local = wm * pm_inv
+        # rotate 部分だけ抽出 (translate は無視 — jointOrient に translate 成分は無い)
+        e = om.MTransformationMatrix(local).rotation(asQuaternion=False)
         cmds.setAttr(joint + ".jointOrient",
-                      math.degrees(e_combined.x),
-                      math.degrees(e_combined.y),
-                      math.degrees(e_combined.z))
+                      math.degrees(e.x),
+                      math.degrees(e.y),
+                      math.degrees(e.z))
         cmds.setAttr(joint + ".rotate", 0, 0, 0)
         return True
     except Exception as exc:
@@ -1264,18 +1258,11 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
             pass
 
     try:
-        # v0.5.16: 4. 各 root chain の rotate を jointOrient に freeze
-        for r in roots:
-            if not cmds.objExists(r):
-                continue
-            for j in _collect_chain_from_root(r):
-                r_vals = cmds.getAttr(j + ".rotate")[0]
-                if any(abs(v) > 1e-6 for v in r_vals):
-                    _freeze_rotate_to_jointOrient(j)
-
-        # v0.5.21: 全 descendant WS を最初に snapshot、各 orient 更新後に全部復元。
-        # v0.5.22 追加: 各 joint の WM_before と bindPreMatrix_before も snapshot
-        # (後段で delta-based bindPreMatrix update に使う)。
+        # v0.5.23: snapshot は 最初、freeze も orient も 何もする前 に採取。
+        # (v0.5.22 まで freeze 後に WM snapshot → freeze による WM 変化が
+        # delta 計算に含まれず bindPreMatrix 補正が不完全だった。 実際には
+        # 数学的に freeze 前後で world matrix は同じはずだが、浮動小数点や
+        # 実装の副作用で微妙にズレる可能性。 最も安全な起点で snapshot する)
         all_ws_snapshot = {}
         all_wm_before = {}
         for r in roots:
@@ -1287,8 +1274,7 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                     all_wm_before[j] = cmds.getAttr(j + ".worldMatrix[0]")
                 except Exception:
                     pass
-        # bindPreMatrix_before snapshot (skinCluster ごと per-joint)
-        all_bpm_before = {}   # (sc, joint) -> 16-float matrix
+        all_bpm_before = {}
         for sc, ji in joint_indices.items():
             for j, idx in ji.items():
                 try:
@@ -1296,6 +1282,17 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                         f"{sc}.bindPreMatrix[{idx}]")
                 except Exception:
                     pass
+
+        # v0.5.16: 4. 各 root chain の rotate を jointOrient に freeze
+        # v0.5.23: freeze は WM snapshot の後に実行 (snapshot が freeze 影響を
+        #          受けないよう)
+        for r in roots:
+            if not cmds.objExists(r):
+                continue
+            for j in _collect_chain_from_root(r):
+                r_vals = cmds.getAttr(j + ".rotate")[0]
+                if any(abs(v) > 1e-6 for v in r_vals):
+                    _freeze_rotate_to_jointOrient(j)
 
         for r in roots:
             if not cmds.objExists(r):
