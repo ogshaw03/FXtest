@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.6"
+__version__ = "0.5.7"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -113,9 +113,13 @@ DEFAULT_PARAMS_BY_CATEGORY = {
     # 復元が生む振動を "critical damp" で抑える attr。 damp より overshoot
     # を狙って殺せる (damp は 全体の速度に効くので上げすぎると mushy に)。
     # damp も僅かに上げて root-follow 時の 慣性余韻を短縮。
-    "hair":    {"stiffness": 0.35, "damp": 0.05, "startCurveAttract": 0.15,
-                "mass": 1.0, "drag": 0.05, "motionDrag": 0.0,
-                "attractionDamp": 0.15, "bendResistance": 0.1},
+    # v0.5.7: user 調整結果を default 化 (screenshot 準拠)。
+    #   attractionDamp を 1.0 に上げて overshoot を完全に殺し、
+    #   mass を 0.2 に下げて 慣性遅れを最小化、
+    #   stiffness を 0.1 まで下げて 引き戻し速度を穏やかに。
+    "hair":    {"stiffness": 0.10, "damp": 0.02, "startCurveAttract": 0.15,
+                "mass": 0.2, "drag": 0.05, "motionDrag": 0.0,
+                "attractionDamp": 1.0, "bendResistance": 0.1089},
     "skirt":   {"stiffness": 0.20, "damp": 0.04, "startCurveAttract": 0.10,
                 "mass": 1.5, "drag": 0.05, "motionDrag": 0.0,
                 "attractionDamp": 0.10, "bendResistance": 0.1},
