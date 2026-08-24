@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.25"
+__version__ = "0.5.26"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1308,46 +1308,60 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                 if any(abs(v) > 1e-6 for v in r_vals):
                     _freeze_rotate_to_jointOrient(j)
 
-        for r in roots:
-            if not cmds.objExists(r):
-                continue
-            chain_joints = _collect_chain_from_root(r)   # 親 → 子 の順で返る
-            print(f"[jiggle_bones] orient chain root={r}, {len(chain_joints)} joints")
-            for j in chain_joints:
-                has_child = bool(cmds.listRelatives(j, c=True, type="joint"))
-                jo_before = cmds.getAttr(j + ".jointOrient")[0]
+        # v0.5.26: 内部反復 (最大 5 pass、変化無くなったら早期終了)。
+        # v0.5.25 の DG eval 強化でもまだ 3-4 回実行が必要な症状があった。
+        # snapshot は最初に 1 回のみ (元 world 形状を維持する ground truth)、
+        # orient loop を multi-pass で回して収束させる。
+        MAX_ORIENT_PASSES = 5
+        CONVERGE_EPS = 0.01   # jointOrient 変化 (degrees) 閾値
+        for pass_i in range(MAX_ORIENT_PASSES):
+            any_changed = False
+            for r in roots:
+                if not cmds.objExists(r):
+                    continue
+                chain_joints = _collect_chain_from_root(r)
+                if pass_i == 0:
+                    print(f"[jiggle_bones] orient chain root={r}, "
+                          f"{len(chain_joints)} joints")
+                for j in chain_joints:
+                    has_child = bool(cmds.listRelatives(j, c=True, type="joint"))
+                    jo_before = cmds.getAttr(j + ".jointOrient")[0]
 
-                if has_child:
-                    _manual_orient_joint_to_child(j, aim=aim, verbose=True)
-                else:
-                    try:
-                        cmds.setAttr(j + ".jointOrient", 0, 0, 0)
-                    except Exception:
-                        pass
-
-                # v0.5.25: setAttr 後に DG を 強制再評価 → 次の 子処理で
-                # stale な parent.worldMatrix を読まないように。
-                # (これが無いと 複数回実行して初めて収束するタイプの bug)
-                _force_dg_eval_recursive(j)
-
-                # v0.5.21: この joint の 全 descendant の WS を snapshot 値に復元
-                descendants = cmds.listRelatives(j, ad=True,
-                                                   type="transform") or []
-                for d in descendants:
-                    if d in all_ws_snapshot:
+                    if has_child:
+                        # pass 1 だけ verbose (2 回目以降うるさいので)
+                        _manual_orient_joint_to_child(j, aim=aim,
+                                                       verbose=(pass_i == 0))
+                    else:
                         try:
-                            cmds.xform(d, ws=True, t=all_ws_snapshot[d])
+                            cmds.setAttr(j + ".jointOrient", 0, 0, 0)
                         except Exception:
                             pass
-                # v0.5.25: 復元後も DG 強制 (descendants の translate 変化後)
-                _force_dg_eval_recursive(j)
+                    _force_dg_eval_recursive(j)
 
-                jo_after = cmds.getAttr(j + ".jointOrient")[0]
-                changed = any(abs(jo_before[i] - jo_after[i]) > 0.001
-                              for i in range(3))
-                mark = " ★" if changed else " (unchanged)"
-                print(f"    {j}: jo {[round(x,1) for x in jo_before]}"
-                      f" → {[round(x,1) for x in jo_after]}{mark}")
+                    # descendants の WS を最初の snapshot に復元
+                    descendants = cmds.listRelatives(j, ad=True,
+                                                       type="transform") or []
+                    for d in descendants:
+                        if d in all_ws_snapshot:
+                            try:
+                                cmds.xform(d, ws=True, t=all_ws_snapshot[d])
+                            except Exception:
+                                pass
+                    _force_dg_eval_recursive(j)
+
+                    jo_after = cmds.getAttr(j + ".jointOrient")[0]
+                    joint_changed = any(abs(jo_before[i] - jo_after[i]) > CONVERGE_EPS
+                                        for i in range(3))
+                    if joint_changed:
+                        any_changed = True
+                    if pass_i == 0:
+                        mark = " ★" if joint_changed else " (unchanged)"
+                        print(f"    {j}: jo {[round(x,1) for x in jo_before]}"
+                              f" → {[round(x,1) for x in jo_after]}{mark}")
+            print(f"[jiggle_bones] orient pass {pass_i+1}: "
+                  f"{'変化あり (continue)' if any_changed else '収束 (break)'}")
+            if not any_changed:
+                break
 
         # v0.5.22: bindPreMatrix を delta-based で更新。
         # 従来 (v0.5.15-v0.5.21) は BPM_new = WM_new.inverse として
