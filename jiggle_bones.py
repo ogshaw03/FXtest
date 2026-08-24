@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.15"
+__version__ = "0.5.16"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1098,6 +1098,19 @@ def _joint_index_in_skin(sc, joint):
     return None
 
 
+def _freeze_rotate_to_jointOrient(joint):
+    """v0.5.16: joint.rotate を jointOrient に吸収させて rotate=0 に。
+    world rotation は 変わらない (makeIdentity r=True の joint 特殊挙動)。
+    `joint -oj` は rotate ≠ 0 だと skip するので、事前 freeze 必須。"""
+    try:
+        cmds.makeIdentity(joint, apply=True, r=True, s=False, t=False,
+                           n=False, pn=True)
+        return True
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] freeze rotate failed on {joint}: {exc}")
+        return False
+
+
 def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
     """v0.5.15: root joint list を渡すと、各 chain を joint orient し直し、
     かつ skinCluster の bindPreMatrix を新 WM に合わせて更新 → weight 維持。
@@ -1148,7 +1161,17 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
             pass
 
     try:
-        # 4. root ごとに joint orient を実行
+        # v0.5.16: 4. 各 root chain の rotate を jointOrient に freeze
+        #        (Maya `joint -oj` は rotate=0 でないと skip する仕様)
+        for r in roots:
+            if not cmds.objExists(r):
+                continue
+            for j in _collect_chain_from_root(r):
+                r_vals = cmds.getAttr(j + ".rotate")[0]
+                if any(abs(v) > 1e-6 for v in r_vals):
+                    _freeze_rotate_to_jointOrient(j)
+
+        # 5. root ごとに joint orient を実行
         for r in roots:
             if not cmds.objExists(r):
                 continue
@@ -1182,13 +1205,27 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                                   f"{sc}[{idx}] {j}: {exc}")
         print(f"[jiggle_bones] orient: bindPreMatrix updated {n_updated} slot(s)")
 
-        # 6. bindPose update (bindPose ノードも新 pose 記録)
+        # v0.5.16: 7. bindPose reset は 元 pose に joint が居ない場合
+        # "not in the pose" エラーが大量に出るので、影響 joint を bindPose
+        # の member に含んでるやつだけ狙って reset。
         bp_nodes = cmds.ls(type="dagPose") or []
+        joint_set = set(all_joints)
         for bp in bp_nodes:
             try:
-                cmds.dagPose(all_joints, reset=True, name=bp)
+                members = cmds.dagPose(bp, q=True, members=True) or []
             except Exception:
-                pass
+                members = []
+            members_short = set(m.split("|")[-1].split(":")[-1]
+                                 for m in members)
+            relevant = [j for j in all_joints
+                        if j.split("|")[-1].split(":")[-1] in members_short]
+            if not relevant:
+                continue
+            for j in relevant:
+                try:
+                    cmds.dagPose(j, reset=True, name=bp)
+                except Exception:
+                    pass
 
     finally:
         # 7. envelope 復元
@@ -1202,32 +1239,49 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
 
 
 def _ui_run_orient(*_):
-    """UI ボタン: 選択 root(s) を対象に joint orient を実行 (weight 保護)。"""
-    sel = cmds.ls(sl=True, type="joint") or []
+    """UI ボタン: 選択 root(s) を対象に joint orient を実行 (weight 保護)。
+    v0.5.16: 各ステップに verbose 出力を追加、silent 失敗の原因追跡用。"""
+    print(f"[jiggle_bones] _ui_run_orient called")
+    # joint type だけでなく transform も受ける (joint 判定ゆるく)
+    sel_all = cmds.ls(sl=True) or []
+    sel = []
+    for s in sel_all:
+        if cmds.nodeType(s) == "joint" or cmds.objectType(s, isa="joint"):
+            sel.append(s)
+    print(f"[jiggle_bones] selection: {sel_all}  (joints: {sel})")
     if not sel:
-        cmds.warning("Outliner / viewport で root joint(s) を選択してください")
+        cmds.warning("Outliner / viewport で root joint(s) を選択してください "
+                     "(joint type であること)")
         return
-    # aim 選択 dropdown から
-    aim = "yzx"   # default: MMD 用
+    aim = "yzx"
     if cmds.optionMenu(_UI_ORIENT_AIM_MENU, ex=True):
         raw = cmds.optionMenu(_UI_ORIENT_AIM_MENU, q=True, v=True)
+        print(f"[jiggle_bones] orient aim UI value: {raw!r}")
         if raw and "(" in raw:
-            axis_key = raw.split("(")[0].strip().rstrip("+-")
+            axis_key = raw.split("(")[0].strip().rstrip("+-").strip()
             aim_map = {"X": "xyz", "Y": "yzx", "Z": "zxy"}
             aim = aim_map.get(axis_key, "yzx")
+    print(f"[jiggle_bones] resolved aim = {aim}")
     result = cmds.confirmDialog(
         t="Joint Orient (weight 保護)",
         m=f"選択 {len(sel)} root chain に対して joint orient を実行します。\n"
-          f"aim = {aim}  ({['xyz','yzx','zxy'].index(aim)+1}番目)\n\n"
+          f"aim = {aim}\n\n"
           f"影響 skinCluster の bindPreMatrix を更新するので\n"
           f"weight/見た目は保持されます (envelope は一時 OFF)。\n\n"
           f"元に戻せません (Undo 可)。実行しますか?",
-        b=["実行", "Cancel"], defaultButton="Cancel",
+        b=["実行", "Cancel"], defaultButton="実行",
         cancelButton="Cancel", dismissString="Cancel")
+    print(f"[jiggle_bones] confirmDialog result: {result!r}")
     if result != "実行":
+        print(f"[jiggle_bones] cancelled by user")
         return
-    n = orient_joints_preserving_weights(sel, aim=aim)
-    print(f"[jiggle_bones] orient 完了: {n} joint(s)")
+    try:
+        n = orient_joints_preserving_weights(sel, aim=aim)
+        print(f"[jiggle_bones] orient 完了: {n} joint(s)")
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        cmds.warning(f"[jiggle_bones] orient エラー: {exc}")
 
 
 def set_aim_axis_all(axis):
