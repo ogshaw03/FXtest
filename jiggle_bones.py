@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.10"
+__version__ = "0.5.11"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -294,37 +294,73 @@ def remove_registered_chain(chain_or_root):
     _write_registry(entries)
 
 
-def build_chain_from_selection():
-    """現在の選択から chain を構築。
-    - 複数 joint 選択: そのまま順序を chain として使う (linear 前提)
-    - 単一 joint 選択: 子孫を DFS で辿って single-child chain を作る
-    Returns: joint 名 list (長さ ≥ 2) or None
+def _dfs_longest_chain(node):
+    """node から下 (子) へ single-child chain を最深方向に辿る。"""
+    kids = cmds.listRelatives(node, c=True, type="joint") or []
+    if not kids:
+        return [node]
+    best = []
+    for k in kids:
+        sub = _dfs_longest_chain(k)
+        if len(sub) > len(best):
+            best = sub
+    return [node] + best
+
+
+def build_chains_from_selection():
+    """v0.5.11: 選択から 複数 chain を構築 (multi-root 対応)。
+
+    ルール:
+      - 選択された joint のうち、"親も選択されている" ものは skip
+        (親が同 chain の先頭として処理される)
+      - 残った各 joint を root として DFS で単一 chain を作る
+      - つまり:
+        * 髪の 3 本 root を並列選択 → 3 chain 返す
+        * 1 本 chain の途中まで選択 → その top を root として 1 chain
+        * 1 joint 選択 → 1 chain (DFS)
+
+    Returns: [chain, chain, ...]  (各 chain は joint 名 list, 長さ ≥ 2)
+             選択なし / 有効 chain 0 → []
     """
     sel = cmds.ls(sl=True, type="joint") \
           or cmds.ls(sl=True, type="transform") or []
     if not sel:
         cmds.warning("Outliner / viewport で joint(s) を選択してください")
+        return []
+    # short name に統一
+    sel_short = [s.split("|")[-1].split(":")[-1] for s in sel]
+    sel_set = set(sel_short)
+    # 親が同じ選択集合内なら skip → 残ったのが root 候補
+    roots = []
+    for name in sel_short:
+        parent = cmds.listRelatives(name, p=True, type="joint") or []
+        parent_short = parent[0].split("|")[-1].split(":")[-1] if parent else None
+        if parent_short and parent_short in sel_set:
+            continue   # 親が選択されてる → chain の途中、skip
+        roots.append(name)
+    # 各 root から DFS で chain 作成
+    chains = []
+    for r in roots:
+        chain = _dfs_longest_chain(r)
+        if len(chain) >= 2:
+            chains.append(chain)
+        else:
+            cmds.warning(f"[jiggle_bones] {r} の子 joint が無い → skip")
+    return chains
+
+
+def build_chain_from_selection():
+    """v0.5.11: 後方互換 wrapper。build_chains_from_selection() の 最初 1 個を
+    返す (単一 chain を期待する古い呼び出し用)。
+
+    以前の「複数選択 = そのまま linear chain」用途は廃止。もし手で順序指定して
+    chain を作りたい場合は 1 joint 選択 → DFS で長い chain を建てるか、
+    直接 create_jiggle_for_chain(joint_list) を呼ぶ。
+    """
+    chains = build_chains_from_selection()
+    if not chains:
         return None
-    if len(sel) >= 2:
-        return [s.split("|")[-1].split(":")[-1] for s in sel]
-    # 単一選択: 子を辿って chain 化 (最も深い branch を優先)
-    root = sel[0].split("|")[-1].split(":")[-1]
-    def _longest(node):
-        kids = cmds.listRelatives(node, c=True, type="joint") or []
-        if not kids:
-            return [node]
-        best = []
-        for k in kids:
-            sub = _longest(k)
-            if len(sub) > len(best):
-                best = sub
-        return [node] + best
-    chain = _longest(root)
-    if len(chain) < 2:
-        cmds.warning(f"[jiggle_bones] {root} に子 joint がありません "
-                     "(chain 化できません、複数選択で明示指定してください)")
-        return None
-    return chain
+    return chains[0]
 
 
 # =========================================================================
@@ -1649,30 +1685,42 @@ def _ui_remove_chain(chain, *_):
 
 
 def _ui_add_from_selection(*_):
-    """選択 joint から chain を構築 → registry に追加 → 即セットアップ
-    → UI 再構築。 v0.5.10: 1-click 化 (以前は登録のみ、setup 別ボタン)。
+    """v0.5.11: 複数 root 選択 → 各 root から chain を独立に建てて 全部 setup。
 
-    エラーは try で包む: 中で例外が起きても show_ui() が確実に走らない
-    と window が消えたまま残る (delete → 再生成の間で失敗すると空)。"""
-    chain = build_chain_from_selection()
-    if not chain:
+    ルール (build_chains_from_selection):
+      - 選択 joint のうち 親も選択されてるのは skip (chain 途中)
+      - 残った root それぞれから DFS で 単一 chain を作る
+      - 各 chain を registry 登録 + create_jiggle_for_chain 実行
+
+    エラーは try で包む: 途中の chain が失敗しても他の chain は続行。
+    show_ui() は最後に 1 回だけ (rebuild を頻発させない)。"""
+    chains = build_chains_from_selection()
+    if not chains:
         return
     # カテゴリ dropdown 選択値を取得
     cat_choice = None
     if cmds.optionMenu(_UI_ADD_CATEGORY_MENU, ex=True):
         raw = cmds.optionMenu(_UI_ADD_CATEGORY_MENU, q=True, value=True)
-        # "auto (自動判定)" → None、"hair (髪)" → "hair"
         if raw and not raw.startswith("auto"):
             cat_choice = raw.split()[0]
-    try:
-        add_registered_chain(chain, category=cat_choice)
-    except Exception as exc:
-        cmds.warning(f"[jiggle_bones] registry 追加失敗: {exc}")
-    # v0.5.10: 追加と同時に setup も走らせる
-    try:
-        create_jiggle_for_chain(chain, category=cat_choice)
-    except Exception as exc:
-        cmds.warning(f"[jiggle_bones] setup 失敗 (chain は registry に登録済): {exc}")
+
+    n_ok = 0
+    n_fail = 0
+    print(f"[jiggle_bones] {len(chains)} chain(s) をセットアップします...")
+    for chain in chains:
+        try:
+            add_registered_chain(chain, category=cat_choice)
+        except Exception as exc:
+            cmds.warning(f"[jiggle_bones] registry 追加失敗 {chain[0]}: {exc}")
+        try:
+            create_jiggle_for_chain(chain, category=cat_choice)
+            n_ok += 1
+            print(f"  ✓ {chain[0]} → {len(chain)} joints")
+        except Exception as exc:
+            cmds.warning(f"[jiggle_bones] setup 失敗 {chain[0]}: {exc}")
+            n_fail += 1
+    print(f"[jiggle_bones] 完了: {n_ok} 成功 / {n_fail} 失敗 / 計 {len(chains)}")
+
     # 最後に UI 再構築 (エラー時も window は残す)
     try:
         show_ui()
@@ -1899,11 +1947,12 @@ def _show_ui_impl():
     for cat_key in _JIGGLE_TOKENS.keys():
         jp = _CATEGORY_JP.get(cat_key, cat_key)
         cmds.menuItem(l=f"{cat_key} ({jp})")
-    cmds.button(l="⚡ 選択から chain 追加 + 自動セットアップ", h=26, p=add_row,
+    cmds.button(l="⚡ 選択 root(s) から一括セットアップ", h=26, p=add_row,
                 c=_ui_add_from_selection, bgc=(0.30, 0.60, 0.30),
-                ann="v0.5.10: 選択 joint から chain を組み立てて registry 登録 "
-                     "→ create_jiggle_for_chain まで 1 クリックで実行。"
-                     "エラー時も UI は残る (フォールバック)")
+                ann="v0.5.11: 複数 root を選択すると 各々を chain の 起点として "
+                     "独立に setup。 例: 髪の 3 本 root を Shift+選択 → 3 chain "
+                     "作成。親が同時選択されてる場合は skip (chain 途中扱い)。"
+                     "1 joint 選択なら DFS で 単一 chain を作る従来動作。")
 
     # 補助: 命名 heuristic で一括登録
     aux_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
