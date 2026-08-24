@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.19"
+__version__ = "0.5.20"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1273,13 +1273,14 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                 if any(abs(v) > 1e-6 for v in r_vals):
                     _freeze_rotate_to_jointOrient(j)
 
-        # v0.5.19: root 含む全 joint を manual API 直接で orient。
-        # cmds.joint(oj=...) は root (parent が joint でない場合) や特定
-        # 条件下で silent skip する事があり、root の jointOrient が更新
-        # されない bug が発生。 manual API を primary パスにすれば確実。
-        # 順序: 親 → 子 の 順に処理 (親を先に orient すると 子の world 位置
-        # は変わらない、jointOrient 更新で 子の parent 空間の aim が正しく
-        # 再計算される)。
+        # v0.5.20: 子の world 位置維持型 orient。
+        # parent の jointOrient を変えると child.WM = parent.WM * child.local
+        # が変わって 子が world 空間で移動してしまう問題を解消。
+        # 各 parent 更新時:
+        #   1. 子の world 位置を先に snapshot
+        #   2. parent.jointOrient を更新
+        #   3. 子の local translate を xform(ws=True) で再計算 → world 位置維持
+        # これで chain 全体の world 形状は変わらない、jointOrient だけ更新。
         for r in roots:
             if not cmds.objExists(r):
                 continue
@@ -1288,12 +1289,26 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
             for j in chain_joints:
                 has_child = bool(cmds.listRelatives(j, c=True, type="joint"))
                 jo_before = cmds.getAttr(j + ".jointOrient")[0]
+                # 直接 children の world 位置を snapshot (jiggle 対象 joint に限らず全 transform)
+                direct_children = cmds.listRelatives(j, c=True,
+                                                       type="transform") or []
+                child_ws = {}
+                for c in direct_children:
+                    try:
+                        child_ws[c] = cmds.xform(c, q=True, ws=True, t=True)
+                    except Exception:
+                        pass
                 if has_child:
                     _manual_orient_joint_to_child(j, aim=aim)
                 else:
-                    # 末端 joint: jointOrient=0
                     try:
                         cmds.setAttr(j + ".jointOrient", 0, 0, 0)
+                    except Exception:
+                        pass
+                # v0.5.20: 子の world 位置を復元
+                for c, ws in child_ws.items():
+                    try:
+                        cmds.xform(c, ws=True, t=ws)
                     except Exception:
                         pass
                 jo_after = cmds.getAttr(j + ".jointOrient")[0]
