@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.20"
+__version__ = "0.5.22"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1273,14 +1273,30 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                 if any(abs(v) > 1e-6 for v in r_vals):
                     _freeze_rotate_to_jointOrient(j)
 
-        # v0.5.20: 子の world 位置維持型 orient。
-        # parent の jointOrient を変えると child.WM = parent.WM * child.local
-        # が変わって 子が world 空間で移動してしまう問題を解消。
-        # 各 parent 更新時:
-        #   1. 子の world 位置を先に snapshot
-        #   2. parent.jointOrient を更新
-        #   3. 子の local translate を xform(ws=True) で再計算 → world 位置維持
-        # これで chain 全体の world 形状は変わらない、jointOrient だけ更新。
+        # v0.5.21: 全 descendant WS を最初に snapshot、各 orient 更新後に全部復元。
+        # v0.5.22 追加: 各 joint の WM_before と bindPreMatrix_before も snapshot
+        # (後段で delta-based bindPreMatrix update に使う)。
+        all_ws_snapshot = {}
+        all_wm_before = {}
+        for r in roots:
+            if not cmds.objExists(r):
+                continue
+            for j in _collect_chain_from_root(r):
+                try:
+                    all_ws_snapshot[j] = cmds.xform(j, q=True, ws=True, t=True)
+                    all_wm_before[j] = cmds.getAttr(j + ".worldMatrix[0]")
+                except Exception:
+                    pass
+        # bindPreMatrix_before snapshot (skinCluster ごと per-joint)
+        all_bpm_before = {}   # (sc, joint) -> 16-float matrix
+        for sc, ji in joint_indices.items():
+            for j, idx in ji.items():
+                try:
+                    all_bpm_before[(sc, j)] = cmds.getAttr(
+                        f"{sc}.bindPreMatrix[{idx}]")
+                except Exception:
+                    pass
+
         for r in roots:
             if not cmds.objExists(r):
                 continue
@@ -1289,15 +1305,7 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
             for j in chain_joints:
                 has_child = bool(cmds.listRelatives(j, c=True, type="joint"))
                 jo_before = cmds.getAttr(j + ".jointOrient")[0]
-                # 直接 children の world 位置を snapshot (jiggle 対象 joint に限らず全 transform)
-                direct_children = cmds.listRelatives(j, c=True,
-                                                       type="transform") or []
-                child_ws = {}
-                for c in direct_children:
-                    try:
-                        child_ws[c] = cmds.xform(c, q=True, ws=True, t=True)
-                    except Exception:
-                        pass
+
                 if has_child:
                     _manual_orient_joint_to_child(j, aim=aim)
                 else:
@@ -1305,12 +1313,18 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                         cmds.setAttr(j + ".jointOrient", 0, 0, 0)
                     except Exception:
                         pass
-                # v0.5.20: 子の world 位置を復元
-                for c, ws in child_ws.items():
-                    try:
-                        cmds.xform(c, ws=True, t=ws)
-                    except Exception:
-                        pass
+
+                # v0.5.21: この joint の 全 descendant の WS を snapshot 値に復元
+                # (自分自身は復元しない - jointOrient は位置に影響しないので不要)
+                descendants = cmds.listRelatives(j, ad=True,
+                                                   type="transform") or []
+                for d in descendants:
+                    if d in all_ws_snapshot:
+                        try:
+                            cmds.xform(d, ws=True, t=all_ws_snapshot[d])
+                        except Exception:
+                            pass
+
                 jo_after = cmds.getAttr(j + ".jointOrient")[0]
                 changed = any(abs(jo_before[i] - jo_after[i]) > 0.001
                               for i in range(3))
@@ -1318,19 +1332,46 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
                 print(f"    {j}: jo {[round(x,1) for x in jo_before]}"
                       f" → {[round(x,1) for x in jo_after]}{mark}")
 
-        # 5. bindPreMatrix を 新 WM.inverse で更新 → skinning は 見た目維持
+        # v0.5.22: bindPreMatrix を delta-based で更新。
+        # 従来 (v0.5.15-v0.5.21) は BPM_new = WM_new.inverse として
+        # "bind pose を今にリセット" していたが、これは original BPM が
+        # 特殊値 (offset 込み) だと skinning が壊れる。
+        #
+        # 数式 (Maya row-vector 慣習):
+        #   skinning: output = input * BPM * WM
+        #   出力不変 (output = input * BPM_old * WM_old = input * BPM_new * WM_new)
+        #   → BPM_new = BPM_old * WM_old * WM_new.inverse
+        #
+        # これで original BPM の特殊値も 保存されつつ 新 WM に追従する。
+        try:
+            import maya.api.OpenMaya as om
+        except Exception:
+            om = None
         n_updated = 0
         for sc, ji in joint_indices.items():
             for j, idx in ji.items():
                 try:
-                    wm_inv = cmds.getAttr(j + ".worldInverseMatrix[0]")
-                    cmds.setAttr(f"{sc}.bindPreMatrix[{idx}]", wm_inv,
-                                  type="matrix")
+                    wm_new = cmds.getAttr(j + ".worldMatrix[0]")
+                    if om and (sc, j) in all_bpm_before and j in all_wm_before:
+                        m_bpm_old = om.MMatrix(all_bpm_before[(sc, j)])
+                        m_wm_old = om.MMatrix(all_wm_before[j])
+                        m_wm_new_inv = om.MMatrix(wm_new).inverse()
+                        m_bpm_new = m_bpm_old * m_wm_old * m_wm_new_inv
+                        bpm_flat = [m_bpm_new.getElement(r, c)
+                                     for r in range(4) for c in range(4)]
+                        cmds.setAttr(f"{sc}.bindPreMatrix[{idx}]", bpm_flat,
+                                      type="matrix")
+                    else:
+                        # fallback: 従来動作
+                        wm_inv = cmds.getAttr(j + ".worldInverseMatrix[0]")
+                        cmds.setAttr(f"{sc}.bindPreMatrix[{idx}]", wm_inv,
+                                      type="matrix")
                     n_updated += 1
                 except Exception as exc:
                     cmds.warning(f"[jiggle_bones] bindPreMatrix update "
                                   f"{sc}[{idx}] {j}: {exc}")
-        print(f"[jiggle_bones] orient: bindPreMatrix updated {n_updated} slot(s)")
+        print(f"[jiggle_bones] orient: bindPreMatrix updated {n_updated} slot(s) "
+              f"(delta-based)")
 
         # v0.5.16: 7. bindPose reset は 元 pose に joint が居ない場合
         # "not in the pose" エラーが大量に出るので、影響 joint を bindPose
