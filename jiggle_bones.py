@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -78,6 +78,12 @@ _PARAM_LABEL_JP = {
     "damp":              "減衰 (damp)",
     "startCurveAttract": "元形状復元 (attract)",
     "mass":              "質量 (mass)",
+    # v0.5.4: 過減衰対策で追加。「1 回で止まる」→ これらを下げると
+    # 自然な振動が復活する。
+    "drag":              "空気抵抗 (drag)",
+    "motionDrag":        "運動抵抗 (motionDrag)",
+    "attractionDamp":    "復元減衰 (attractionDamp)",
+    "bendResistance":    "曲げ抵抗 (bendResistance)",
 }
 
 # =========================================================================
@@ -97,26 +103,35 @@ _JIGGLE_TOKENS = {
 
 # カテゴリ別 default params (経験則の初期値、UI で dial 可)
 DEFAULT_PARAMS_BY_CATEGORY = {
-    # v0.5.1: damp を Maya default (0.05) 寄りに落とす。 v0.4.x の値は
-    # collision が効かない状態で挙動安定化を狙って高めに振ってあったが、
-    # collision 修正後は damp 過大で「衝突後の戻りが遅い」原因になっていた。
-    # stiffness をやや上げて代わりに springy な戻りを担保。
-    "hair":    {"stiffness": 0.20, "damp": 0.08, "startCurveAttract": 0.10,
-                "mass": 1.0},
-    "skirt":   {"stiffness": 0.15, "damp": 0.06, "startCurveAttract": 0.05,
-                "mass": 1.5},
-    "ribbon":  {"stiffness": 0.10, "damp": 0.05, "startCurveAttract": 0.15,
-                "mass": 0.4},
-    "sleeve":  {"stiffness": 0.15, "damp": 0.06, "startCurveAttract": 0.10,
-                "mass": 0.8},
-    "necktie": {"stiffness": 0.25, "damp": 0.08, "startCurveAttract": 0.15,
-                "mass": 0.5},
-    "coat":    {"stiffness": 0.25, "damp": 0.08, "startCurveAttract": 0.10,
-                "mass": 1.5},
-    "ear":     {"stiffness": 0.45, "damp": 0.10, "startCurveAttract": 0.20,
-                "mass": 0.5},
-    "tail":    {"stiffness": 0.15, "damp": 0.06, "startCurveAttract": 0.05,
-                "mass": 1.0},
+    # v0.5.4: 「1 回で止まる」= 過減衰 の対策で drag / motionDrag /
+    # attractionDamp を明示的に低めに設定 (Maya default では motionDrag=0.1、
+    # attractionDamp=0 だが setup 時にリセットされない事があるので明示)。
+    # drag は 空気抵抗、motionDrag は 動作抵抗、attractionDamp は 復元力の
+    # 減衰。この 3 つを下げると 衝突後 数回 振動してから停止する自然挙動に。
+    "hair":    {"stiffness": 0.30, "damp": 0.03, "startCurveAttract": 0.05,
+                "mass": 1.0, "drag": 0.05, "motionDrag": 0.0,
+                "attractionDamp": 0.0, "bendResistance": 0.1},
+    "skirt":   {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.05,
+                "mass": 1.5, "drag": 0.05, "motionDrag": 0.0,
+                "attractionDamp": 0.0, "bendResistance": 0.1},
+    "ribbon":  {"stiffness": 0.15, "damp": 0.02, "startCurveAttract": 0.10,
+                "mass": 0.4, "drag": 0.02, "motionDrag": 0.0,
+                "attractionDamp": 0.0, "bendResistance": 0.05},
+    "sleeve":  {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.05,
+                "mass": 0.8, "drag": 0.05, "motionDrag": 0.0,
+                "attractionDamp": 0.0, "bendResistance": 0.1},
+    "necktie": {"stiffness": 0.30, "damp": 0.04, "startCurveAttract": 0.10,
+                "mass": 0.5, "drag": 0.05, "motionDrag": 0.0,
+                "attractionDamp": 0.0, "bendResistance": 0.1},
+    "coat":    {"stiffness": 0.30, "damp": 0.04, "startCurveAttract": 0.05,
+                "mass": 1.5, "drag": 0.08, "motionDrag": 0.0,
+                "attractionDamp": 0.0, "bendResistance": 0.15},
+    "ear":     {"stiffness": 0.50, "damp": 0.05, "startCurveAttract": 0.15,
+                "mass": 0.5, "drag": 0.05, "motionDrag": 0.0,
+                "attractionDamp": 0.0, "bendResistance": 0.15},
+    "tail":    {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.05,
+                "mass": 1.0, "drag": 0.05, "motionDrag": 0.0,
+                "attractionDamp": 0.0, "bendResistance": 0.1},
 }
 
 
@@ -1385,7 +1400,9 @@ def list_colliders():
 # Category params
 # =========================================================================
 
-_PARAM_ATTRS = ("stiffness", "damp", "startCurveAttract", "mass")
+_PARAM_ATTRS = ("stiffness", "damp", "startCurveAttract", "mass",
+                # v0.5.4: 過減衰対策 (「1 回で止まる」を「自然に振動する」に)
+                "drag", "motionDrag", "attractionDamp", "bendResistance")
 
 
 def _hair_systems_for_category(category):
@@ -1866,6 +1883,11 @@ def _build_category_section(category, chain_list, parent=None):
         "damp":              (0.0, 1.0, 0.0, 0.5),
         "startCurveAttract": (0.0, 1.0, 0.0, 1.0),
         "mass":              (0.01, 20.0, 0.1, 5.0),
+        # v0.5.4: 過減衰対策 4 param
+        "drag":              (0.0, 1.0, 0.0, 0.3),   # 空気抵抗
+        "motionDrag":        (0.0, 1.0, 0.0, 0.3),   # 動作抵抗
+        "attractionDamp":    (0.0, 1.0, 0.0, 0.5),   # 復元力の減衰
+        "bendResistance":    (0.0, 5.0, 0.0, 1.0),   # 曲げ抵抗
     }
     for attr in _PARAM_ATTRS:
         v = src.get(attr, defaults.get(attr, 0.0))
