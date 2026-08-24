@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.13"
+__version__ = "0.5.14"
 
 
 def _cleanup_mcd_junk_inline():
@@ -133,6 +133,21 @@ _CATEGORY_JP = {
     "ear":     "耳",
     "tail":    "しっぽ",
 }
+# v0.5.14: SplineIK の 子方向軸 (dForwardAxis)
+# MMD 系は Y+、Maya default は X+、rig によっては Z+ など様々。
+# 合ってないと SplineIK が joint を 90/180 度 twist して skinning が
+# 裏返る現象 ("normal ひっくり返り") の原因になる。
+_AIM_AXIS_CHOICES = ("X+", "X-", "Y+", "Y-", "Z+", "Z-")
+_AIM_AXIS_TO_DFA = {"X+": 0, "Y+": 1, "Z+": 2, "X-": 3, "Y-": 4, "Z-": 5}
+_DEFAULT_AIM_AXIS = "X+"   # 従来動作 (Maya default)
+
+# 保存先: scene attribute (chain per-category に格納、なければ default)
+_AIM_AXIS_ATTR = "jbAimAxis"   # jiggle_bones_grp に string で保存
+
+# module-level cache: create_jiggle_for_chain 実行中に _create_spline_ik から
+# 読む。UI ボタン → set_current_aim_axis(...) → create_jiggle_for_chain の順。
+_current_setup_aim_axis = None
+
 _PARAM_LABEL_JP = {
     "stiffness":         "硬さ (stiffness)",
     "damp":              "減衰 (damp)",
@@ -996,6 +1011,17 @@ def _create_spline_ik(chain, dynamic_curve_shape):
     ikh = ret[0] if isinstance(ret, (list, tuple)) else ret
     _parent_to_jb(ikh)
 
+    # v0.5.14: 子方向軸 (aim_axis) を SplineIK に反映。
+    # 合ってないと joint が 90/180 度 twist して skinning 裏返り。
+    # 一旦 script global にキャッシュされた選択値を読む (create_jiggle_for_chain 側で set)。
+    aim = _current_setup_aim_axis or _DEFAULT_AIM_AXIS
+    dfa = _AIM_AXIS_TO_DFA.get(aim, 0)
+    try:
+        cmds.setAttr(ikh + ".dTwistControlEnable", 1)
+        cmds.setAttr(ikh + ".dForwardAxis", dfa)
+    except Exception as exc:
+        cmds.warning(f"[jiggle_bones] spline IK dForwardAxis set failed: {exc}")
+
     # v0.4.7: worldSpace[0] を明示接続 (記事準拠)
     try:
         # 既存 inCurve 接続を切って worldSpace[0] を張り直す
@@ -1012,7 +1038,37 @@ def _create_spline_ik(chain, dynamic_curve_shape):
     return ikh
 
 
-def create_jiggle_for_chain(chain, category=None):
+def set_current_aim_axis(axis):
+    """v0.5.14: 次の create_jiggle_for_chain で使う子方向軸をセット。
+    UI dropdown → set → create_jiggle_for_chain の流れで使う。"""
+    global _current_setup_aim_axis
+    if axis and axis in _AIM_AXIS_CHOICES:
+        _current_setup_aim_axis = axis
+    else:
+        _current_setup_aim_axis = None
+
+
+def set_aim_axis_all(axis):
+    """v0.5.14: 既存の全 jb SplineIK の dForwardAxis を一括変更。
+    setup し直さずに 子方向軸を修正できる。"""
+    if axis not in _AIM_AXIS_TO_DFA:
+        cmds.warning(f"[jiggle_bones] invalid axis {axis}, choose from {_AIM_AXIS_CHOICES}")
+        return 0
+    dfa = _AIM_AXIS_TO_DFA[axis]
+    n = 0
+    for ikh in cmds.ls("jb_ikh_*", type="ikHandle") or []:
+        try:
+            cmds.setAttr(ikh + ".dTwistControlEnable", 1)
+            cmds.setAttr(ikh + ".dForwardAxis", dfa)
+            n += 1
+        except Exception:
+            pass
+    set_current_aim_axis(axis)
+    print(f"[jiggle_bones] set_aim_axis_all: {n} ikHandle(s) → {axis} (dFA={dfa})")
+    return n
+
+
+def create_jiggle_for_chain(chain, category=None, aim_axis=None):
     """chain (親→末端 joint list) に FK ctls + hairSystem dynamics overlay を組む。
 
     ## v0.3.0 挙動 (通常セットアップ + dynamics overlay)
@@ -1037,6 +1093,10 @@ def create_jiggle_for_chain(chain, category=None):
         return None
     if category is None:
         category = _classify(chain[0]) or "hair"
+
+    # v0.5.14: 明示指定 aim_axis があれば cache に (無ければ module cache 維持)
+    if aim_axis is not None:
+        set_current_aim_axis(aim_axis)
 
     # 既存があれば先に remove (二重張り防止)
     if is_chain_active(chain):
@@ -1640,6 +1700,7 @@ def set_category_params(category, **params):
 
 _UI_COLLIDER_LIST = "jbColliderList"
 _UI_ADD_CATEGORY_MENU = "jbAddCategoryMenu"
+_UI_AIM_AXIS_MENU = "jbAimAxisMenu"   # v0.5.14
 _UI_NUCLEUS_FIELDS = {}      # {attr: fieldGrp}
 _UI_COLLIDER_FIELDS = {}     # {attr: fieldGrp}
 _UI_CAT_PREFIX = "jbCatSection"
@@ -1782,6 +1843,11 @@ def _ui_remove_chain(chain, *_):
     remove_registered_chain(chain)
 
 
+def _ui_on_aim_axis_change(new_val, *_):
+    """v0.5.14: UI dropdown 変更時に module cache へ反映。"""
+    set_current_aim_axis(new_val)
+
+
 def _ui_add_from_selection(*_):
     """v0.5.11: 複数 root 選択 → 各 root から chain を独立に建てて 全部 setup。
 
@@ -1801,6 +1867,14 @@ def _ui_add_from_selection(*_):
         raw = cmds.optionMenu(_UI_ADD_CATEGORY_MENU, q=True, value=True)
         if raw and not raw.startswith("auto"):
             cat_choice = raw.split()[0]
+
+    # v0.5.14: aim axis を dropdown から反映
+    if cmds.optionMenu(_UI_AIM_AXIS_MENU, ex=True):
+        try:
+            set_current_aim_axis(
+                cmds.optionMenu(_UI_AIM_AXIS_MENU, q=True, v=True))
+        except Exception:
+            pass
 
     n_ok = 0
     n_fail = 0
@@ -2051,6 +2125,25 @@ def _show_ui_impl():
                      "独立に setup。 例: 髪の 3 本 root を Shift+選択 → 3 chain "
                      "作成。親が同時選択されてる場合は skip (chain 途中扱い)。"
                      "1 joint 選択なら DFS で 単一 chain を作る従来動作。")
+
+    # v0.5.14: 子方向軸 (SplineIK dForwardAxis) 選択
+    axis_row = cmds.rowLayout(nc=3, adj=3, p=body_col,
+                               cw3=(150, 100, 240),
+                               ct3=("left", "left", "left"),
+                               co3=(4, 4, 4))
+    cmds.text(l="子を向いてる軸 (aim):", al="right", p=axis_row)
+    cmds.optionMenu(_UI_AIM_AXIS_MENU, p=axis_row,
+                     cc=_ui_on_aim_axis_change)
+    for ax in _AIM_AXIS_CHOICES:
+        cmds.menuItem(l=ax)
+    # default に合わせる
+    cur = _current_setup_aim_axis or _DEFAULT_AIM_AXIS
+    try:
+        cmds.optionMenu(_UI_AIM_AXIS_MENU, e=True, v=cur)
+    except Exception:
+        pass
+    cmds.text(l="MMD 系は Y+、Maya default は X+  (裏返る時に変更)",
+              al="left", fn="smallObliqueLabelFont", p=axis_row)
 
     # 補助: 命名 heuristic で一括登録
     aux_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
