@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.7"
+__version__ = "0.5.8"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -457,12 +457,17 @@ def _get_or_create_hair_system(category, chain=None):
     #   されない。実 scene dump で `.active = False` 確認 → 手動 setAttr で
     #   collide 確認済。makeCurvesDynamic / createNode 経由でも default OFF
     #   なので明示的に True にする。
+    # v0.5.8: collideWidthOffset を 1.0 → 0.05 に。
+    #   v0.4.7 で貫通対策のため大きめ 1.0 にしたが、これは "mesh 表面から
+    #   1 unit 外側まで衝突判定" の意味 → 見た目に「当たり判定が広い」隙間。
+    #   v0.5.x で他の貫通対策 (subSteps↑ / iterations↑ / active=1 fix / etc.)
+    #   が入って collideWidthOffset に頼らなくても貫通しなくなったので小さく。
     for coll_attr, val in (("active", 1),
                             ("collide", 1),
                             ("collideStrength", 1.0),
                             ("iterations", 3),
                             ("collideOverSample", 4),
-                            ("collideWidthOffset", 1.0),
+                            ("collideWidthOffset", 0.05),
                             ("selfCollide", 0),
                             ("displayColor", (1.0, 1.0, 0.5)),
                             ):
