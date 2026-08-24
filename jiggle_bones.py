@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.26"
+__version__ = "0.5.27"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1247,6 +1247,30 @@ def orient_joints_preserving_weights(roots, aim="yzx", sao="yup"):
         all_joints.extend(_collect_chain_from_root(r))
     if not all_joints:
         return 0
+
+    # v0.5.27: jiggle setup が active な chain で orient するのは NG。
+    # SplineIK / parentConstraint 経由で joint rotate が driven されており
+    # 静的 jointOrient を書いても solver に上書きされる → 見た目 mesh が
+    # 破綻する (実際 user 報告の "ノーマルおかしい" の原因)。
+    # jbCtl / SplineIK 存在チェックして warning → abort。
+    for r in roots:
+        for j in _collect_chain_from_root(r):
+            ctl_name = _short(j) + "_jbCtl"
+            fk_name = _short(j) + "_jbFK"
+            ikh_name = _ik_handle_name([j])
+            if (cmds.objExists(ctl_name) or cmds.objExists(fk_name)
+                    or cmds.objExists(ikh_name)):
+                msg = (f"[jiggle_bones] {r} に jiggle setup が active です。\n"
+                       f"orient を実行する前に:\n"
+                       f"  1. UI で 該当 chain の 「削除」ボタン、または \n"
+                       f"     「全 chain 削除」ボタンで jiggle setup を除去\n"
+                       f"  2. orient を実行\n"
+                       f"  3. 再度 jiggle setup\n"
+                       f"の順で行ってください (SplineIK 等が joint を driving 中は "
+                       f"orient が正しく反映されません)。")
+                cmds.confirmDialog(t="jiggle setup active", m=msg, b=["OK"])
+                cmds.warning(msg)
+                return 0
 
     # 2. 影響 skinCluster 集める + joint→index map 保存
     skins = _find_skin_clusters_for_joints(all_joints)
