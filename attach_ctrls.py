@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.34"
+__version__ = "0.9.35"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3818,15 +3818,21 @@ def _mapping_ui_reset_state():
 # ---- 人型 body-diagram slot 操作 ----
 
 def _slot_get_joint(btn):
-    """button の annotation に格納された joint 名を返す。空なら空文字。"""
+    """button の annotation に格納された joint 名を返す。空なら空文字。
+
+    v0.9.33 bug fix: annotation は "joint: LeftUpperArm\\nL Shoulder\\n(exists)\\n..."
+    の複数行形式。以前は strip() だけで内部改行を除去できず、joint 名として
+    第 2 行以降の説明文まで含まれた文字列を返していた → mapping 保存時に
+    存在しない joint 名 (改行込み) が入り、IK/FK setup が全 skip されていた。
+    1 行目 (joint: プレフィックス直後) だけ取り出す。"""
     try:
         ann = cmds.button(btn, q=True, ann=True) or ""
     except Exception:
         return ""
-    # annotation 冒頭に "joint: " を付けているので split で取り出す
-    if ann.startswith("joint: "):
-        return ann[len("joint: "):].strip()
-    return ""
+    if not ann.startswith("joint: "):
+        return ""
+    first_line = ann.split("\n", 1)[0]
+    return first_line[len("joint: "):].strip()
 
 
 def _slot_update_visual(btn, label, role_idx):
