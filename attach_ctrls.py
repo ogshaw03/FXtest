@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.35"
+__version__ = "0.9.36"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -1010,6 +1010,20 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None, label=None):
     # --- 2. IK handle on CLEAN chain ---
     # v0.9.0 の freeze_joint_rotations で rotate=0 になっているので RP solver
     # は bind pose を曖昧と判定せず chain を perturb しない (spa fix 不要)。
+    #
+    # v0.9.36: mid joint (knee/elbow) に preferredAngleZ=5.0 を明示。
+    #   freeze_joint_rotations 後 preferredAngle は 0 のまま = RP solver が
+    #   膝/肘の曲げ方向を決められず、ctl を動かしても直線のまま。
+    #   従来は neutralize_leg_bind_bend でセットしていたが、MMD 系命名で
+    #   auto-detect が失敗すると "leg chain 未検出 → skip" されて 0 のまま。
+    #   ここで各 chain の mid joint に必ず入れる。
+    for mid_ik in (elbow_ik,):   # 実 attr 名は同じ (mid)
+        try:
+            cmds.setAttr(mid_ik + ".preferredAngleX", 0.0)
+            cmds.setAttr(mid_ik + ".preferredAngleY", 0.0)
+            cmds.setAttr(mid_ik + ".preferredAngleZ", 5.0)
+        except Exception:
+            pass
     ik_handle = cmds.ikHandle(sj=arm_ik, ee=wrist_ik,
                               sol="ikRPsolver", n=label + "_ikh")[0]
     # IK handle は attach_ctrls_grp 下に (元 chain 内に置かないほうが管理しやすい)
