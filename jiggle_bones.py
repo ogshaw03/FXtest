@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
@@ -108,28 +108,31 @@ DEFAULT_PARAMS_BY_CATEGORY = {
     # attractionDamp=0 だが setup 時にリセットされない事があるので明示)。
     # drag は 空気抵抗、motionDrag は 動作抵抗、attractionDamp は 復元力の
     # 減衰。この 3 つを下げると 衝突後 数回 振動してから停止する自然挙動に。
-    "hair":    {"stiffness": 0.30, "damp": 0.03, "startCurveAttract": 0.05,
+    # v0.5.5: startCurveAttract を non-zero に (rest curve への引き戻し力を確保)。
+    # v0.5.4 まで attract=0.05 だったが reverse 網で 0 に強制されていたので
+    # 効いていなかった。網廃止した今、0.15 前後で "自然な swing back" が出る。
+    "hair":    {"stiffness": 0.35, "damp": 0.03, "startCurveAttract": 0.15,
                 "mass": 1.0, "drag": 0.05, "motionDrag": 0.0,
                 "attractionDamp": 0.0, "bendResistance": 0.1},
-    "skirt":   {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.05,
+    "skirt":   {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.10,
                 "mass": 1.5, "drag": 0.05, "motionDrag": 0.0,
                 "attractionDamp": 0.0, "bendResistance": 0.1},
-    "ribbon":  {"stiffness": 0.15, "damp": 0.02, "startCurveAttract": 0.10,
+    "ribbon":  {"stiffness": 0.15, "damp": 0.02, "startCurveAttract": 0.20,
                 "mass": 0.4, "drag": 0.02, "motionDrag": 0.0,
                 "attractionDamp": 0.0, "bendResistance": 0.05},
-    "sleeve":  {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.05,
+    "sleeve":  {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.15,
                 "mass": 0.8, "drag": 0.05, "motionDrag": 0.0,
                 "attractionDamp": 0.0, "bendResistance": 0.1},
-    "necktie": {"stiffness": 0.30, "damp": 0.04, "startCurveAttract": 0.10,
+    "necktie": {"stiffness": 0.30, "damp": 0.04, "startCurveAttract": 0.20,
                 "mass": 0.5, "drag": 0.05, "motionDrag": 0.0,
                 "attractionDamp": 0.0, "bendResistance": 0.1},
-    "coat":    {"stiffness": 0.30, "damp": 0.04, "startCurveAttract": 0.05,
+    "coat":    {"stiffness": 0.30, "damp": 0.04, "startCurveAttract": 0.15,
                 "mass": 1.5, "drag": 0.08, "motionDrag": 0.0,
                 "attractionDamp": 0.0, "bendResistance": 0.15},
-    "ear":     {"stiffness": 0.50, "damp": 0.05, "startCurveAttract": 0.15,
+    "ear":     {"stiffness": 0.50, "damp": 0.05, "startCurveAttract": 0.30,
                 "mass": 0.5, "drag": 0.05, "motionDrag": 0.0,
                 "attractionDamp": 0.0, "bendResistance": 0.15},
-    "tail":    {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.05,
+    "tail":    {"stiffness": 0.20, "damp": 0.03, "startCurveAttract": 0.10,
                 "mass": 1.0, "drag": 0.05, "motionDrag": 0.0,
                 "attractionDamp": 0.0, "bendResistance": 0.1},
 }
@@ -922,18 +925,20 @@ def create_jiggle_for_chain(chain, category=None):
     #    → collision force が減衰なく直接 ORIGINAL rotate を駆動
     ikh = _create_spline_ik(chain, dyn_shape)
 
-    # ---- 6. dynBlend attr → hairSystem.startCurveAttract (逆値、Maya native blend) ----
-    #    dynBlend=1 → attract=0 (完全 sim) / dynBlend=0 → attract=1 (FK ほぼ固定)
+    # ---- 6. dynBlend attr (legacy) + startCurveAttract を UI 直接制御に ----
+    #    v0.5.5: v0.5.0-v0.5.4 の `dynBlend → reverse → startCurveAttract`
+    #    ネットワークを廃止。理由:
+    #      - dynBlend=1 だと reverse.outputX = 0 = attract 0
+    #      - attract 0 は rest curve への引き戻し力ゼロ → hair は重力で漂う
+    #        だけになり、UI で damp / stiffness をどう弄っても "戻り" が
+    #        発生しない ("全体的に動きが遅い" 報告の根本原因)
+    #    v0.5.5:
+    #      - reverse ノード作らない、attract は UI slider から直接 setAttr
+    #      - dynBlend 属性は root_ctl に残す (旧 anim curve 互換のため) が、
+    #        新規 setup では 何にも接続されない (legacy 表示)
     if not cmds.attributeQuery("dynBlend", node=root_ctl, exists=True):
         cmds.addAttr(root_ctl, ln="dynBlend", at="float",
                       min=0.0, max=1.0, dv=1.0, k=True)
-    rev = cmds.createNode("reverse", n=_dynrev_name(chain))
-    cmds.connectAttr(f"{root_ctl}.dynBlend", rev + ".inputX", f=True)
-    try:
-        cmds.connectAttr(rev + ".outputX",
-                          f"{hs_shape}.startCurveAttract", f=True)
-    except Exception as exc:
-        cmds.warning(f"[jiggle_bones] startCurveAttract 接続失敗: {exc}")
 
     # ---- 6b. active=1 を再保証 (v0.5.2) ----
     #    makeCurvesDynamic 実行や inputHair connect の副作用で hairSystem.active
@@ -1433,8 +1438,22 @@ def get_category_params(category):
     return out
 
 
+def _disconnect_incoming(plug):
+    """plug に来ている全 incoming connection を切る (何も無ければ何もしない)。
+    v0.5.5: startCurveAttract を UI で直接制御するために、旧 scene に残ってる
+    reverse ノード等の 接続を setAttr 前に自動で外す。"""
+    srcs = cmds.listConnections(plug, s=True, d=False, plugs=True) or []
+    for s in srcs:
+        try:
+            cmds.disconnectAttr(s, plug)
+        except Exception:
+            pass
+
+
 def set_category_params(category, **params):
-    """category の 全 hairSystem に param を反映 (v0.5.0: per-chain 全部 loop)。"""
+    """category の 全 hairSystem に param を反映 (v0.5.0: per-chain 全部 loop)。
+    v0.5.5: startCurveAttract は setAttr 前に incoming connection を外す
+    (旧 scene の dynBlend→reverse 網を無効化して UI 値を反映させる)。"""
     hs_list = _hair_systems_for_category(category)
     n = 0
     for hs_xform in hs_list:
@@ -1443,8 +1462,12 @@ def set_category_params(category, **params):
             continue
         shape = shapes[0]
         for a, v in params.items():
+            plug = f"{shape}.{a}"
+            # v0.5.5: startCurveAttract は接続を先に切って直接 setAttr
+            if a == "startCurveAttract":
+                _disconnect_incoming(plug)
             try:
-                cmds.setAttr(f"{shape}.{a}", v)
+                cmds.setAttr(plug, v)
             except Exception as exc:
                 cmds.warning(f"[jiggle_bones] set {a}={v} on {shape} failed: {exc}")
         n += 1
