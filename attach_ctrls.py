@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.36"
+__version__ = "0.9.37"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -1321,7 +1321,24 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None, label=None):
         if rest_len > 1e-4:
             # 距離ノード: arm_ik root ↔ IK ctl
             db = cmds.createNode("distanceBetween", n=label + "_stretch_dist")
-            cmds.connectAttr(arm_ik + ".worldMatrix[0]", db + ".inMatrix1")
+            # v0.9.37 cycle 断ち: arm_ik.worldMatrix を使うと IK solver 出力
+            # (arm_ik.rotate) 経由で自己参照 → mid_ik.translate → wrist_ik →
+            # effector → IK solver → arm_ik.rotate の cycle 発生。
+            # 代わりに orig_parent.WM × arm_ik.localTranslate から static に
+            # start world position を計算する。arm_ik の local translate は
+            # bind pose (固定) なので IK 出力に依存しない → cycle 断ち。
+            if orig_parent and cmds.objExists(orig_parent):
+                arm_ik_local_t = cmds.getAttr(arm_ik + ".translate")[0]
+                pmm = cmds.createNode("pointMatrixMult",
+                                        n=label + "_stretch_start_pmm")
+                cmds.setAttr(pmm + ".inPoint", *arm_ik_local_t, type="double3")
+                cmds.connectAttr(orig_parent + ".worldMatrix[0]",
+                                  pmm + ".inMatrix")
+                cmds.connectAttr(pmm + ".output", db + ".point1", f=True)
+            else:
+                # orig_parent 無し (world-parented) → 現 arm_ik WS を 静的値に
+                arm_ik_ws = cmds.xform(arm_ik, q=True, ws=True, t=True)
+                cmds.setAttr(db + ".point1", *arm_ik_ws, type="double3")
             cmds.connectAttr(ik_ctl + ".worldMatrix[0]", db + ".inMatrix2")
             # v0.9.11: rest_len を world_ctl.sx で補正 (global scale 変えても
             # stretch trigger threshold が rig scale と一致するように)
