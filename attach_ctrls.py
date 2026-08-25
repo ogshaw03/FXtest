@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.38"
+__version__ = "0.9.39"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3668,6 +3668,16 @@ def _build_body() -> None:
                 bgc=(0.30, 0.55, 0.70))
     cmds.setParent("..")
 
+    # v0.9.39: カーブ差し替え (FK/IK/PV 全 ctl の shape 一括変更)
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
+    cmds.button(l="🎨 Ctl Curve 差し替え  (source → target 選択順)",
+                h=28, c=_ui_replace_ctl_curves,
+                bgc=(0.45, 0.55, 0.35),
+                ann="v0.9.39: 選択順 = source curve + target ctl(s)。"
+                     " target の shape だけ 差し替え (rig 構造 / color / anim は 保持)。"
+                     " FK ctl / IK ctl / PV ctl / 揺れ物 jbCtl 何でも対応。")
+    cmds.setParent("..")
+
     cmds.separator(h=10, style="in")
 
     # ============ Section 1: 個別ステップ (advanced) ============
@@ -3819,6 +3829,126 @@ def _ui_attach(*_):
 
 def _ui_delete(*_):
     delete_generated()
+
+
+def replace_ctl_curves(source, targets, preserve_color=True):
+    """v0.9.39: source curve の shape を targets 各々に コピー、既存 shape を
+    差し替える (rig 構造 / color / anim curve / constraint 保持、見た目 のみ変更)。
+
+    Args:
+        source:  shape コピー元 (curve transform 名)
+        targets: 差し替え対象 ctl transform list
+        preserve_color: True なら target の 既存 color を継承
+
+    Returns: 差し替え成功件数
+
+    処理:
+      1. target の 既存 nurbsCurve shape の color 情報 (overrideColor 等) を保存
+      2. 既存 shape delete
+      3. source を duplicate → shape だけ target 下に parent (s=True, r=True)
+      4. duplicate transform 掃除
+      5. color 復元 (target 側の 元 color を新 shape に適用)
+
+    使い方例:
+        replace_ctl_curves("myCustomCube",
+                            ["arm_L_IK_ctl", "arm_R_IK_ctl",
+                             "leg_L_IK_ctl", "leg_R_IK_ctl"])
+    """
+    if isinstance(targets, str):
+        targets = [targets]
+    if not (source and cmds.objExists(source)):
+        cmds.warning(f"[{_PACKAGE}] source curve 存在しない: {source}")
+        return 0
+    src_shapes = cmds.listRelatives(source, s=True, type="nurbsCurve") or []
+    if not src_shapes:
+        cmds.warning(f"[{_PACKAGE}] {source} に nurbsCurve shape が無い")
+        return 0
+
+    n_replaced = 0
+    for tgt in targets:
+        if not cmds.objExists(tgt):
+            cmds.warning(f"[{_PACKAGE}] target 存在しない: {tgt}")
+            continue
+        # 既存 color 保存
+        old_shapes = cmds.listRelatives(tgt, s=True, type="nurbsCurve") or []
+        saved_color = None
+        if preserve_color and old_shapes:
+            try:
+                if cmds.getAttr(old_shapes[0] + ".overrideEnabled"):
+                    saved_color = {
+                        "rgb": cmds.getAttr(old_shapes[0] + ".overrideRGBColors"),
+                        "colorIdx": cmds.getAttr(old_shapes[0] + ".overrideColor"),
+                        "colorR": cmds.getAttr(old_shapes[0] + ".overrideColorR"),
+                        "colorG": cmds.getAttr(old_shapes[0] + ".overrideColorG"),
+                        "colorB": cmds.getAttr(old_shapes[0] + ".overrideColorB"),
+                    }
+            except Exception:
+                pass
+        # 既存 shape delete
+        for s in old_shapes:
+            try: cmds.delete(s)
+            except Exception: pass
+        # source を duplicate → shape だけ target に move
+        dup = cmds.duplicate(source, rc=True)[0]
+        dup_shapes = cmds.listRelatives(dup, s=True, type="nurbsCurve") or []
+        for i, ds in enumerate(dup_shapes):
+            try:
+                new_name = f"{tgt}Shape" if i == 0 else f"{tgt}Shape{i}"
+                ds = cmds.rename(ds, new_name)
+                cmds.parent(ds, tgt, s=True, r=True)
+                # color 復元
+                if saved_color:
+                    try:
+                        cmds.setAttr(ds + ".overrideEnabled", 1)
+                        cmds.setAttr(ds + ".overrideRGBColors",
+                                      saved_color["rgb"])
+                        if saved_color["rgb"]:
+                            cmds.setAttr(ds + ".overrideColorR",
+                                          saved_color["colorR"])
+                            cmds.setAttr(ds + ".overrideColorG",
+                                          saved_color["colorG"])
+                            cmds.setAttr(ds + ".overrideColorB",
+                                          saved_color["colorB"])
+                        else:
+                            cmds.setAttr(ds + ".overrideColor",
+                                          saved_color["colorIdx"])
+                    except Exception:
+                        pass
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] shape parent {ds}→{tgt}: {exc}")
+        # duplicate transform 掃除
+        try: cmds.delete(dup)
+        except Exception: pass
+        n_replaced += 1
+        print(f"[{_PACKAGE}] replaced ctl shape: {tgt} ← {source}")
+    print(f"[{_PACKAGE}] replace_ctl_curves: {n_replaced}/{len(targets)} done")
+    return n_replaced
+
+
+def _ui_replace_ctl_curves(*_):
+    """UI: 選択の 1 番目 = source curve、2 番目以降 = target ctl(s)。"""
+    sel = cmds.ls(sl=True) or []
+    if len(sel) < 2:
+        cmds.warning("最初に source curve、続けて target ctl(s) を "
+                     "Shift+選択してください (計 2 個以上)")
+        return
+    source = sel[0]
+    targets = sel[1:]
+    preview = ', '.join(targets[:5])
+    if len(targets) > 5:
+        preview += '…'
+    result = cmds.confirmDialog(
+        t="Ctl 差し替え確認",
+        m=f"Source curve: {source}\n"
+          f"Target ctl(s): {len(targets)} 個\n  {preview}\n\n"
+          f"target の 既存 shape を削除 → source shape でコピー差し替え。\n"
+          f"color / rig 構造 / anim / constraint は 保持。 実行しますか?",
+        b=["実行", "Cancel"], defaultButton="実行",
+        cancelButton="Cancel", dismissString="Cancel")
+    if result != "実行":
+        return
+    n = replace_ctl_curves(source, targets)
+    print(f"[{_PACKAGE}] {n} ctl(s) 差し替え完了")
 
 
 def _ui_open_jiggle_bones(*_):
