@@ -24,7 +24,7 @@ fc.create_facial_ctls(head_position=(0, 15, 0), size=1.0)
 fc.link_bs_attr("eye_ctl", "faceBS", "eyeSmile")
 ```
 """
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __package__ = "facial_ctrls"
 
 try:
@@ -396,33 +396,44 @@ def _ui_remove_selected_ctl(*_):
 
 
 def _ui_link_selected_bs(*_):
-    """左 選択 ctl + Channel Box で選択中 の blendShape attr を紐付け。"""
+    """v0.1.3: 左 選択 ctl + Channel Box 選択中 blendShape attr を紐付け。
+    blendShape の attr は 通常 SHAPES / HISTORY (input) セクションに出るので
+    全 section (SMA/SSA/SHA/SOA) を 走査。"""
     left_sel = cmds.textScrollList(_UI_LEFT_LIST, q=True, si=True) or []
     if not left_sel:
         cmds.warning("先に左 list から ctl を 選択してください")
         return
     ctl = left_sel[0]
-    # Channel Box で 選択中 attr を取得
     cb = "mainChannelBox"
-    sel_attrs = cmds.channelBox(cb, q=True, sma=True) or []
-    if not sel_attrs:
-        cmds.warning("Channel Box で blendShape の attr を 選択してください")
-        return
-    # 選択中 node (Channel Box に映ってる)
-    cb_nodes = cmds.channelBox(cb, q=True, mol=True) or []
-    if not cb_nodes:
-        cmds.warning("Channel Box で blendShape node を 選択してください")
-        return
-    bs_node = None
-    for n in cb_nodes:
-        if cmds.objExists(n) and cmds.nodeType(n) == "blendShape":
-            bs_node = n
-            break
-    if not bs_node:
-        cmds.warning("選択中 に blendShape node が無い")
-        return
-    for attr in sel_attrs:
-        link_bs_attr(ctl, bs_node, attr)
+    # 全 section の 選択 attr + object list ペアで走査
+    sections = (
+        ("sma", "mol"),   # MAIN
+        ("ssa", "sol"),   # SHAPE
+        ("sha", "hol"),   # HISTORY (blendShape 通常 ここ)
+        ("soa", "ool"),   # OUTPUT
+    )
+    linked_count = 0
+    for attr_flag, obj_flag in sections:
+        try:
+            attrs = cmds.channelBox(cb, q=True, **{attr_flag: True}) or []
+            nodes = cmds.channelBox(cb, q=True, **{obj_flag: True}) or []
+        except Exception:
+            continue
+        if not attrs or not nodes:
+            continue
+        # blendShape node を pick
+        for n in nodes:
+            if cmds.objExists(n) and cmds.nodeType(n) == "blendShape":
+                for a in attrs:
+                    if link_bs_attr(ctl, n, a):
+                        linked_count += 1
+                break   # 1 blendShape / section 想定
+    if linked_count == 0:
+        cmds.warning("Channel Box で blendShape の attr を 選択してください "
+                     "(mesh 選択 → INPUTS セクション の blendShape 展開 → "
+                     "attr クリック)")
+    else:
+        print(f"[{__package__}] {linked_count} attr(s) linked to {ctl}")
     _ui_refresh_right()
 
 
