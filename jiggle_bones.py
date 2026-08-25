@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.28"
+__version__ = "0.5.29"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1534,6 +1534,118 @@ def _ui_run_orient(*_):
         cmds.warning(f"[jiggle_bones] orient エラー: {exc}")
 
 
+# =========================================================================
+# Ctl shape replacer (v0.5.29) — 選択カーブを他 ctl の shape に差し替え
+# =========================================================================
+
+def replace_ctl_curves(source, targets, preserve_color=True):
+    """v0.5.29: source curve の shape を targets 各々に コピー、既存 shape を
+    差し替える (rig 構造は 保持、見た目 のみ変える)。
+
+    Args:
+        source:  shape コピー元 (curve transform)
+        targets: 差し替え対象 の ctl transform list
+        preserve_color: True なら target の 既存 color 継承 (overrideColor 等)
+
+    使い方例:
+        replace_ctl_curves("myCustomCube", ["skirt_00_jbCtl", "skirt_01_jbCtl"])
+    """
+    if isinstance(targets, str):
+        targets = [targets]
+    if not (source and cmds.objExists(source)):
+        cmds.warning(f"[jiggle_bones] source curve 存在しない: {source}")
+        return 0
+    src_shapes = cmds.listRelatives(source, s=True, type="nurbsCurve") or []
+    if not src_shapes:
+        cmds.warning(f"[jiggle_bones] {source} に nurbsCurve shape が無い")
+        return 0
+
+    n_replaced = 0
+    for tgt in targets:
+        if not cmds.objExists(tgt):
+            cmds.warning(f"[jiggle_bones] target 存在しない: {tgt}")
+            continue
+        # 既存 color を保存
+        old_shapes = cmds.listRelatives(tgt, s=True, type="nurbsCurve") or []
+        saved_color = None
+        if preserve_color and old_shapes:
+            try:
+                if cmds.getAttr(old_shapes[0] + ".overrideEnabled"):
+                    saved_color = {
+                        "enabled": True,
+                        "rgb": cmds.getAttr(old_shapes[0] + ".overrideRGBColors"),
+                        "colorIdx": cmds.getAttr(old_shapes[0] + ".overrideColor"),
+                        "colorR": cmds.getAttr(old_shapes[0] + ".overrideColorR"),
+                        "colorG": cmds.getAttr(old_shapes[0] + ".overrideColorG"),
+                        "colorB": cmds.getAttr(old_shapes[0] + ".overrideColorB"),
+                    }
+            except Exception:
+                pass
+        # 既存 shape 削除
+        for s in old_shapes:
+            try: cmds.delete(s)
+            except Exception: pass
+        # source shape を duplicate → target に parent
+        dup = cmds.duplicate(source, rc=True)[0]
+        dup_shapes = cmds.listRelatives(dup, s=True, type="nurbsCurve") or []
+        for i, ds in enumerate(dup_shapes):
+            try:
+                new_name = f"{tgt}Shape" if i == 0 else f"{tgt}Shape{i}"
+                ds = cmds.rename(ds, new_name)
+                cmds.parent(ds, tgt, s=True, r=True)
+                # color 復元
+                if saved_color:
+                    try:
+                        cmds.setAttr(ds + ".overrideEnabled", 1)
+                        cmds.setAttr(ds + ".overrideRGBColors",
+                                      saved_color["rgb"])
+                        if saved_color["rgb"]:
+                            cmds.setAttr(ds + ".overrideColorR",
+                                          saved_color["colorR"])
+                            cmds.setAttr(ds + ".overrideColorG",
+                                          saved_color["colorG"])
+                            cmds.setAttr(ds + ".overrideColorB",
+                                          saved_color["colorB"])
+                        else:
+                            cmds.setAttr(ds + ".overrideColor",
+                                          saved_color["colorIdx"])
+                    except Exception:
+                        pass
+            except Exception as exc:
+                cmds.warning(f"[jiggle_bones] shape parent {ds}→{tgt}: {exc}")
+        # duplicate transform を掃除
+        try: cmds.delete(dup)
+        except Exception: pass
+        n_replaced += 1
+        print(f"[jiggle_bones] replaced ctl shape: {tgt} ← {source}")
+    print(f"[jiggle_bones] replace_ctl_curves: {n_replaced}/{len(targets)} done")
+    return n_replaced
+
+
+def _ui_replace_ctl_curves(*_):
+    """UI: 選択の 最初 = source curve、残り = target ctl(s)。"""
+    sel = cmds.ls(sl=True) or []
+    if len(sel) < 2:
+        cmds.warning("最初に source curve、その後に target ctl(s) を "
+                     "Shift+選択してください (計 2 個以上)")
+        return
+    source = sel[0]
+    targets = sel[1:]
+    result = cmds.confirmDialog(
+        t="Ctl 差し替え確認",
+        m=f"Source curve: {source}\n"
+          f"Target ctl(s): {len(targets)} 個\n  {', '.join(targets[:5])}"
+          f"{'…' if len(targets) > 5 else ''}\n\n"
+          f"target の 既存 shape を削除 → source shape でコピー差し替え。\n"
+          f"color / rig 構造 (parent/constraint) は 保持。 実行しますか?",
+        b=["実行", "Cancel"], defaultButton="実行",
+        cancelButton="Cancel", dismissString="Cancel")
+    if result != "実行":
+        return
+    n = replace_ctl_curves(source, targets)
+    print(f"[jiggle_bones] {n} ctl(s) 差し替え完了")
+
+
 def set_aim_axis_all(axis):
     """v0.5.14: 既存の全 jb SplineIK の dForwardAxis を一括変更。
     setup し直さずに 子方向軸を修正できる。"""
@@ -2677,6 +2789,18 @@ def _show_ui_impl():
                      " skinCluster.bindPreMatrix を新 WM.inverse で更新するので "
                      "見た目 (weight 反映) は完全に維持される。setup 前に この tool で"
                      " model の 軸を整えるのが推奨フロー。")
+
+    # v0.5.29: Ctl shape 差し替え
+    cmds.separator(h=4, style="none", p=body_col)
+    replace_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 500))
+    cmds.button(l="🎨 選択 curve → 残り ctl(s) の shape を差し替え",
+                h=24, p=replace_row, c=_ui_replace_ctl_curves,
+                bgc=(0.45, 0.55, 0.35),
+                ann="v0.5.29: 選択の 1 番目 = source curve、2 番目以降 = "
+                     "target ctl(s)。 target の 既存 shape を削除して source curve の "
+                     "shape でコピー差し替え。 color / rig 構造 は 保持。 "
+                     "使い方: 好みの curve shape を先に選択 → Shift+ で "
+                     "差し替えたい *_jbCtl を追加選択 → ボタンクリック")
 
     # 補助: 命名 heuristic で一括登録
     aux_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
