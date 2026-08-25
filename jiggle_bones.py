@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.31"
+__version__ = "0.5.32"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1655,39 +1655,68 @@ MASTER_CTL_NPO = "jb_master_ctl_npo"
 
 
 def _make_master_curve(name, size=1.0):
-    """v0.5.31: 歯車風 master shape (flat XZ、上から見える)。
-    2 段 波 (outer teeth + inner ring) + 短い 4 方向十字 で 設定っぽく。"""
-    import math
-    r_out = size
-    r_teeth = size * 1.15   # 歯先
-    r_in = size * 0.7       # 内側リング
-    seg = 24                # 歯数 (12) の 2 倍で 波
-    # ----- outer gear (teeth 波) -----
-    outer = []
-    for i in range(seg + 1):
-        a = 2 * math.pi * i / seg
-        r = r_teeth if i % 2 == 0 else r_out
-        outer.append((r * math.cos(a), 0, r * math.sin(a)))
-    outer_curve = cmds.curve(d=1, p=outer)
-    # ----- inner ring (円) -----
-    inner_seg = 32
-    inner = [(r_in * math.cos(2 * math.pi * i / inner_seg), 0,
-              r_in * math.sin(2 * math.pi * i / inner_seg))
-             for i in range(inner_seg + 1)]
-    inner_curve = cmds.curve(d=1, p=inner)
-    # ----- 4 方向 短十字 (center indicator) -----
-    cross_len = size * 0.35
-    cross_pts = [(cross_len, 0, 0), (-cross_len, 0, 0), (0, 0, 0),
-                 (0, 0, cross_len), (0, 0, -cross_len)]
-    cross_curve = cmds.curve(d=1, p=cross_pts)
-    # ----- shapes を outer transform 下に combine -----
-    for c in (inner_curve, cross_curve):
-        shapes = cmds.listRelatives(c, s=True, type="nurbsCurve") or []
+    """v0.5.32: "Jiggle" テキスト curve で master shape 生成。
+    Maya `textCurves` で "Jiggle" を各文字 nurbsCurve として生成 →
+    全 shape を 1 transform 下に combine。 XZ 平面 flat (Y=0)、上から
+    読める向き。 サイズは 全体 size で調整。"""
+    # 1. textCurves 生成 (default font)
+    try:
+        result = cmds.textCurves(f="Arial", t="Jiggle", ch=False)
+    except Exception:
+        # Font 指定 fail 時は default font へ fallback
+        result = cmds.textCurves(t="Jiggle", ch=False)
+    text_top = result[0]
+
+    # 2. 各文字 transform (curve shape を持つ) を集める
+    all_desc = cmds.listRelatives(text_top, ad=True, type="transform") or []
+    letter_xforms = [x for x in all_desc
+                     if cmds.listRelatives(x, s=True, type="nurbsCurve")]
+
+    # 3. 各文字 transform を world unparent → makeIdentity (freeze) →
+    #    CV が world 座標に固定 (親 translate 分が 焼き込まれる)
+    freed = []
+    for lx in letter_xforms:
+        try:
+            lx_w = cmds.parent(lx, world=True)[0]
+            cmds.makeIdentity(lx_w, apply=True, t=True, r=True, s=True)
+            freed.append(lx_w)
+        except Exception:
+            pass
+
+    # 4. 元 textCurves ツリー掃除
+    try: cmds.delete(text_top)
+    except Exception: pass
+
+    # 5. 新 master transform に 全 shape を combine
+    master = cmds.createNode("transform", n=name)
+    for lx in freed:
+        shapes = cmds.listRelatives(lx, s=True, type="nurbsCurve") or []
         for s in shapes:
-            cmds.parent(s, outer_curve, s=True, r=True)
-        cmds.delete(c)
-    outer_curve = cmds.rename(outer_curve, name)
-    return outer_curve
+            try:
+                cmds.parent(s, master, s=True, r=True)
+            except Exception:
+                pass
+        try: cmds.delete(lx)
+        except Exception: pass
+
+    # 6. rotate → freeze → scale → freeze → center → freeze
+    # (scale 前に centering しても pivot が原点で無いと scale で ずれるので
+    #  scale 完了後に 最終 bbox から center 算出。)
+    cmds.xform(master, ro=(-90, 0, 0))
+    cmds.makeIdentity(master, apply=True, r=True)
+    if size != 1.0:
+        # pivot を 原点 に明示
+        cmds.xform(master, sp=(0, 0, 0), rp=(0, 0, 0))
+        cmds.xform(master, s=(size, size, size))
+        cmds.makeIdentity(master, apply=True, s=True)
+    # 最終 bbox から center を原点に
+    bbox = cmds.exactWorldBoundingBox(master)
+    cx = (bbox[0] + bbox[3]) / 2.0
+    cy = (bbox[1] + bbox[4]) / 2.0
+    cz = (bbox[2] + bbox[5]) / 2.0
+    cmds.xform(master, t=(-cx, -cy, -cz))
+    cmds.makeIdentity(master, apply=True, t=True)
+    return master
 
 
 def create_or_get_master_ctl(position=None, size=None):
