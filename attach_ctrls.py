@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.56"
+__version__ = "0.9.57"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -704,6 +704,76 @@ def attach_custom_ctls(joints=None, source_curve=None, do_constrain=True,
     print(f"[{_PACKAGE}] attach_custom_ctls: {len(out)} ctl(s) 作成 "
           f"(source={source_curve})")
     return out
+
+
+def apply_hierarchy_to_existing_ctls(joints=None,
+                                        name_suffix="_ctl",
+                                        npo_suffix="_ctl_npo"):
+    """v0.9.57: 既存 custom ctl の npo を joint 階層に沿って parent し直す。
+
+    v0.9.56 前 (or inherit_hierarchy=False) で作った flat 配置の ctl 群を
+    FK 階層に組み直す 後付けツール。
+
+    Args:
+        joints: 対象 joint list。 None なら 選択 joint、無ければ scene 全 joint
+                で <joint>_ctl / <joint>_ctl_npo が存在するもの。
+
+    Returns: 移動した npo 数
+    """
+    if joints is None:
+        joints = cmds.ls(sl=True, type="joint")
+    if not joints:
+        # scene 全体から探す
+        joints = []
+        for j in cmds.ls(type="joint") or []:
+            base = _base_name(j)
+            if cmds.objExists(base + npo_suffix) and \
+                    cmds.objExists(base + name_suffix):
+                joints.append(j)
+        if not joints:
+            cmds.warning(f"[{_PACKAGE}] target joint 無し "
+                         "(選択 or *_ctl 有り joint)")
+            return 0
+        print(f"[{_PACKAGE}] scene 全体 scan: {len(joints)} joint(s) 対象")
+
+    # joint→ctl マップ
+    joint_to_ctl = {}
+    for j in joints:
+        base = _base_name(j)
+        ctl = base + name_suffix
+        npo = base + npo_suffix
+        if cmds.objExists(ctl) and cmds.objExists(npo):
+            joint_to_ctl[j] = (npo, ctl)
+        else:
+            cmds.warning(f"[{_PACKAGE}] {j}: ctl/npo 見つからない ({ctl}, {npo})")
+
+    if not joint_to_ctl:
+        cmds.warning(f"[{_PACKAGE}] 有効な joint→ctl マップ 0 個")
+        return 0
+
+    n = 0
+    for jnt, (npo, ctl) in joint_to_ctl.items():
+        # 一番近い 祖先 joint で ctl 有るもの
+        ancestor = cmds.listRelatives(jnt, p=True, type="joint") or []
+        while ancestor:
+            anc = ancestor[0]
+            if anc in joint_to_ctl:
+                anc_ctl = joint_to_ctl[anc][1]
+                # 既に anc_ctl 下 なら skip
+                cur_p = cmds.listRelatives(npo, p=True) or []
+                if cur_p and cur_p[0] == anc_ctl:
+                    print(f"  {npo}: 既に {anc_ctl} 下、skip")
+                    break
+                try:
+                    cmds.parent(npo, anc_ctl)
+                    n += 1
+                    print(f"  {npo} → parent under {anc_ctl}")
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] {npo} → {anc_ctl}: {exc}")
+                break
+            ancestor = cmds.listRelatives(anc, p=True, type="joint") or []
+    print(f"[{_PACKAGE}] apply_hierarchy: {n} npo(s) を 親 ctl 下に parent")
+    return n
 
 
 def _ui_attach_custom_ctls(*_):
