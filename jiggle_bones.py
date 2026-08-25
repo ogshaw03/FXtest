@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.32"
+__version__ = "0.5.33"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1773,8 +1773,17 @@ def create_or_get_master_ctl(position=None, size=None):
         try: cmds.parent(npo, "jiggle_bones_grp")
         except Exception: pass
 
-    # 各 category に対して bool attr 追加 (0=off, 1=on)、default 1
-    for cat in _JIGGLE_TOKENS.keys():
+    # v0.5.33: 登録済 category のみ attr 追加
+    # (以前は 全 8 カテゴリ 追加 → 使ってない項目でごちゃつく)
+    reg = get_registered_chains() or {}
+    active_cats = [c for c in _JIGGLE_TOKENS.keys()
+                   if reg.get(c)]   # 実際 chain が登録されてる category のみ
+    # fallback: registry 空なら hairSystem 存在ベース
+    if not active_cats:
+        active_cats = [c for c in _JIGGLE_TOKENS.keys()
+                       if _hair_systems_for_category(c)]
+
+    for cat in active_cats:
         if not cmds.attributeQuery(cat, node=ctl, exists=True):
             cmds.addAttr(ctl, ln=cat, at="bool", dv=1, k=True)
 
@@ -1783,8 +1792,29 @@ def create_or_get_master_ctl(position=None, size=None):
         cmds.addAttr(ctl, ln="allSim", at="bool", dv=1, k=True)
 
     print(f"[jiggle_bones] master ctl 作成: {ctl} (size={size}, "
-          f"attrs={list(_JIGGLE_TOKENS.keys())})")
+          f"attrs={active_cats})")
     return ctl
+
+
+def _cleanup_unused_master_attrs():
+    """v0.5.33: master に付いてる category attr のうち、該当 hairSystem が
+    scene に無いものを削除。 keyframe 等 依存があれば削除失敗 → skip。"""
+    if not cmds.objExists(MASTER_CTL_NAME):
+        return 0
+    n = 0
+    for cat in _JIGGLE_TOKENS.keys():
+        if not cmds.attributeQuery(cat, node=MASTER_CTL_NAME, exists=True):
+            continue
+        hs_list = _hair_systems_for_category(cat)
+        if hs_list:
+            continue   # 使ってるので keep
+        try:
+            cmds.deleteAttr(f"{MASTER_CTL_NAME}.{cat}")
+            print(f"[jiggle_bones] removed unused attr {MASTER_CTL_NAME}.{cat}")
+            n += 1
+        except Exception:
+            pass   # 依存あって削除できないなら skip
+    return n
 
 
 def wire_master_to_chains():
@@ -1800,9 +1830,22 @@ def wire_master_to_chains():
                      "create_or_get_master_ctl() を先に")
         return 0
 
+    # v0.5.33: 使わない category attr を master から削除 (登録済 only 化)
+    _cleanup_unused_master_attrs()
+
     n_wired = 0
     for cat in _JIGGLE_TOKENS.keys():
         hs_list = _hair_systems_for_category(cat)
+        if not hs_list:
+            continue
+        # v0.5.33: 該当 category の attr が master に無ければ動的追加
+        if not cmds.attributeQuery(cat, node=MASTER_CTL_NAME, exists=True):
+            try:
+                cmds.addAttr(MASTER_CTL_NAME, ln=cat, at="bool", dv=1, k=True)
+                print(f"[jiggle_bones] added attr {MASTER_CTL_NAME}.{cat}")
+            except Exception as exc:
+                cmds.warning(f"[jiggle_bones] add attr {cat}: {exc}")
+                continue
         for hs_xform in hs_list:
             shapes = cmds.listRelatives(hs_xform, s=True,
                                           type="hairSystem") or []
