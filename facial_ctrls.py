@@ -24,7 +24,7 @@ fc.create_facial_ctls(head_position=(0, 15, 0), size=1.0)
 fc.link_bs_attr("eye_ctl", "faceBS", "eyeSmile")
 ```
 """
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __package__ = "facial_ctrls"
 
 try:
@@ -54,34 +54,33 @@ _UI_RIGHT_LIST = "facial_ui_rightList"
 # =========================================================================
 
 def _make_face_curve(name, size=1.0):
-    """顔マーク: 外側円 (顔輪郭) + 目 2 個 (小円) + 口 (弧)。"""
+    """v0.1.1: 顔マーク XY 平面 native (Y=up、正面向き、rotation 不要)。
+    輪郭円 + 目 2 個 (上部、小円) + 口 (下部、smile 弧)。"""
     import math
     r = size
-    # 顔輪郭 (円)
     seg = 32
-    face = [(r * math.cos(2 * math.pi * i / seg), 0,
-             r * math.sin(2 * math.pi * i / seg))
+    # 顔輪郭 (XY 円)
+    face = [(r * math.cos(2 * math.pi * i / seg),
+             r * math.sin(2 * math.pi * i / seg), 0)
             for i in range(seg + 1)]
     face_c = cmds.curve(d=1, p=face)
-    # 左目
+    # 目 (上部 Y+0.25)
     er = r * 0.15
-    eye_l = [(er * math.cos(2 * math.pi * i / 16) - r * 0.35, 0,
-              er * math.sin(2 * math.pi * i / 16) + r * 0.25)
+    eye_l = [(er * math.cos(2 * math.pi * i / 16) - r * 0.35,
+              er * math.sin(2 * math.pi * i / 16) + r * 0.25, 0)
              for i in range(17)]
     eye_l_c = cmds.curve(d=1, p=eye_l)
-    # 右目
-    eye_r = [(er * math.cos(2 * math.pi * i / 16) + r * 0.35, 0,
-              er * math.sin(2 * math.pi * i / 16) + r * 0.25)
+    eye_r = [(er * math.cos(2 * math.pi * i / 16) + r * 0.35,
+              er * math.sin(2 * math.pi * i / 16) + r * 0.25, 0)
              for i in range(17)]
     eye_r_c = cmds.curve(d=1, p=eye_r)
-    # 口 (下向き弧)
+    # 口 (下部 Y-0.25 中心、smile 弧: 下に凸)
     mouth = []
     for i in range(9):
-        a = math.pi + (math.pi / 8) * i    # 180° -> 360° range
-        mouth.append((r * 0.35 * math.cos(a), 0,
-                       r * 0.35 * math.sin(a) - r * 0.15))
+        a = math.pi + (math.pi / 8) * i   # 180° - 360° (下半円)
+        mouth.append((r * 0.35 * math.cos(a),
+                       r * 0.35 * math.sin(a) - r * 0.1, 0))
     mouth_c = cmds.curve(d=1, p=mouth)
-    # combine shapes to face_c transform
     for c in (eye_l_c, eye_r_c, mouth_c):
         for s in cmds.listRelatives(c, s=True, type="nurbsCurve") or []:
             cmds.parent(s, face_c, s=True, r=True)
@@ -90,28 +89,26 @@ def _make_face_curve(name, size=1.0):
 
 
 def _make_eye_curve(name, size=1.0):
-    """目 ctl: アーモンド型 (楕円)。"""
+    """v0.1.1: 目 ctl アーモンド楕円 (XY 平面)。"""
     import math
     pts = []
     for i in range(33):
         a = 2 * math.pi * i / 32
-        pts.append((size * math.cos(a), 0, size * 0.4 * math.sin(a)))
+        pts.append((size * math.cos(a), size * 0.4 * math.sin(a), 0))
     return cmds.curve(d=1, p=pts, n=name)
 
 
 def _make_mouth_curve(name, size=1.0):
-    """口 ctl: 唇型 (下弧 + 上弧)。"""
+    """v0.1.1: 口 ctl 唇型 (XY 平面、上弧+下弧)。"""
     import math
     pts = []
-    # 上唇 (上弧)
     for i in range(17):
         a = math.pi * i / 16
-        pts.append((size * math.cos(a), 0, size * 0.3 * math.sin(a)))
-    # 下唇 (下弧、戻り)
+        pts.append((size * math.cos(a), size * 0.3 * math.sin(a), 0))
     for i in range(17):
         a = math.pi + math.pi * i / 16
-        pts.append((size * math.cos(a), 0,
-                     -size * 0.15 * math.sin(a - math.pi)))
+        pts.append((size * math.cos(a),
+                     -size * 0.15 * math.sin(a - math.pi), 0))
     return cmds.curve(d=1, p=pts, n=name)
 
 
@@ -174,8 +171,7 @@ def create_facial_ctls(head_position=None, size=None):
     face_npo = cmds.group(em=True, n=FACE_NPO_NAME)
     cmds.parent(face_ctl, face_npo)
     cmds.xform(face_npo, ws=True, t=head_position)
-    # 顔を 正面向きに (X 軸周り 90° で XZ flat → 前向き 平面)
-    cmds.xform(face_npo, ro=(90, 0, 0))
+    # v0.1.1: XY 平面 native なので rotation 不要 (正面向き 自然)
 
     # 目 ctl (face の 上位置)
     eye_ctl = _make_eye_curve(EYE_CTL_NAME, size=size * 0.35)
