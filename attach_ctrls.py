@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.45"
+__version__ = "0.9.46"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2935,15 +2935,30 @@ def apply_all_parent_switches():
 
 
 def _mesh_has_blendshape(node):
-    """v0.9.45: node (or 子孫) の mesh に blendShape deformer が付いてるか check。"""
-    mesh_shapes = cmds.listRelatives(node, ad=True, type="mesh") or []
-    own_shapes = cmds.listRelatives(node, s=True, type="mesh") or []
+    """v0.9.46: node (or 子孫) の mesh に blendShape deformer が付いてるか check。
+    ambiguous short name で cmds.nodeType が失敗する事があるので、
+    listHistory の type filter で 直接 blendShape だけ拾う。"""
+    mesh_shapes = cmds.listRelatives(node, ad=True, type="mesh",
+                                        f=True) or []
+    own_shapes = cmds.listRelatives(node, s=True, type="mesh",
+                                       f=True) or []
     for ms in list(mesh_shapes) + list(own_shapes):
-        history = cmds.listHistory(ms) or []
-        for h in history:
+        try:
+            # type filter で blendShape だけ 取得 → nodeType 呼出し不要
+            bs = cmds.listHistory(ms, type="blendShape") or []
+            # 上位 Maya version で type filter 未サポートなら例外 → fallback
+            if bs:
+                return True
+        except (RuntimeError, TypeError):
+            # fallback: 全 history 拾って nodeType (safe wrap)
             try:
-                if cmds.nodeType(h) == "blendShape":
-                    return True
+                history = cmds.listHistory(ms) or []
+                for h in history:
+                    try:
+                        if cmds.nodeType(h) == "blendShape":
+                            return True
+                    except Exception:
+                        continue
             except Exception:
                 pass
     return False
@@ -2999,14 +3014,16 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl",
         if node in _KNOWN_CTRL_GROUPS:
             target = ctrl_name
         else:
+            # v0.9.46: cmds.nodeType(shortName) が ambiguous 名で落ちる事が
+            # あるので、listRelatives の type filter で 判定に統一。
             is_joint = cmds.objectType(node, isa="joint")
             has_joint_desc = bool(cmds.listRelatives(node, ad=True,
                                                       type="joint"))
             has_mesh_desc = bool(cmds.listRelatives(node, ad=True,
                                                       type="mesh"))
-            own_shapes = cmds.listRelatives(node, s=True) or []
-            has_own_mesh = any(cmds.nodeType(s) == "mesh"
-                               for s in own_shapes)
+            own_mesh_shapes = cmds.listRelatives(node, s=True,
+                                                   type="mesh") or []
+            has_own_mesh = bool(own_mesh_shapes)
 
             if is_joint or has_joint_desc:
                 target = bone_name
