@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.53"
+__version__ = "0.9.54"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3067,8 +3067,9 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl",
         "world_ctl", "main_ctl",
         "jb_master_ctl_npo",
         "attach_ctrls_worldRef",   # v0.9.43 world ref locator
+        "facial_registry_grp",     # v0.1.5 facial UI registry
+        "face_ctl_npo",            # facial 顔 npo
     }
-    # jb_master_ctl 自身も (npo 無い場合の安全)
     _KNOWN_CTRL_GROUPS.add("jb_master_ctl")
 
     n = 0

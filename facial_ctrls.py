@@ -24,7 +24,7 @@ fc.create_facial_ctls(head_position=(0, 15, 0), size=1.0)
 fc.link_bs_attr("eye_ctl", "faceBS", "eyeSmile")
 ```
 """
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 __package__ = "facial_ctrls"
 
 try:
@@ -315,9 +315,24 @@ def _load_registered_ctls():
 
 
 def _save_registered_ctls(ctls):
-    """scene に登録 list を save。"""
+    """v0.1.5: scene に登録 list を save。 registry node は ctrl 下に
+    parent + hidden にする (Outliner を汚さない)。"""
     if not cmds.objExists("facial_registry_grp"):
         cmds.createNode("transform", n="facial_registry_grp")
+    # ctrl group 下に parent (attach_ctrls の 4 group 構造 想定)
+    for cand in ("ctrl", "main_ctl"):
+        if cmds.objExists(cand):
+            cur_p = cmds.listRelatives("facial_registry_grp", p=True) or []
+            if not cur_p or cur_p[0] != cand:
+                try: cmds.parent("facial_registry_grp", cand)
+                except: pass
+            break
+    # visibility off (Outliner 表示は残るが viewport で見えない)
+    try:
+        cmds.setAttr("facial_registry_grp.visibility", 0)
+        cmds.setAttr("facial_registry_grp.hiddenInOutliner", 1)
+    except Exception:
+        pass
     if not cmds.attributeQuery(_REGISTRY_ATTR, node="facial_registry_grp",
                                  exists=True):
         cmds.addAttr("facial_registry_grp", ln=_REGISTRY_ATTR, dt="string")
