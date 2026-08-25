@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.46"
+__version__ = "0.9.47"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2934,6 +2934,77 @@ def apply_all_parent_switches():
     return n1 + n2
 
 
+def organize_jiggle_bones_grp():
+    """v0.9.47: jiggle_bones_grp 内部を jb_ctrl / jb_bone / jb_sim に整理。
+
+    ctrl: *_jbCtl / *_jbNpo / jb_master_ctl_npo (curve controls)
+    bone: *_jbFK (FK duplicate joint chain)
+    sim : hairSystem / nucleus / follicle / dyn/rest curve / ikHandle /
+          collider 等 (dynamics 系)
+
+    Returns: 移動した node 数
+    """
+    if not cmds.objExists("jiggle_bones_grp"):
+        return 0
+
+    # 3 sub-group を確保
+    subgroups = {
+        "ctrl": "jb_ctrl_grp",
+        "bone": "jb_bone_grp",
+        "sim":  "jb_sim_grp",
+    }
+    for _key, gname in subgroups.items():
+        if not cmds.objExists(gname):
+            cmds.createNode("transform", n=gname, p="jiggle_bones_grp")
+        else:
+            p = cmds.listRelatives(gname, p=True) or []
+            if not p or p[0] != "jiggle_bones_grp":
+                try: cmds.parent(gname, "jiggle_bones_grp")
+                except Exception: pass
+
+    n = 0
+    children = cmds.listRelatives("jiggle_bones_grp", c=True,
+                                    type="transform") or []
+    subgroup_names = set(subgroups.values())
+    for c in children:
+        if c in subgroup_names:
+            continue
+        # categorize by name pattern + shape type
+        is_ctl = (c.endswith("_jbCtl") or c.endswith("_jbNpo")
+                  or c == "jb_master_ctl" or c == "jb_master_ctl_npo")
+        is_fk_joint = c.endswith("_jbFK") or c.endswith("_jbFK_end")
+        # else check shape type
+        shapes = cmds.listRelatives(c, s=True) or []
+        shape_types = set(cmds.nodeType(s) for s in shapes if s)
+
+        if is_ctl:
+            target = subgroups["ctrl"]
+        elif is_fk_joint or cmds.objectType(c, isa="joint"):
+            target = subgroups["bone"]
+        elif shape_types & {"hairSystem", "nucleus", "follicle",
+                             "nurbsCurve", "nRigid", "ikHandle",
+                             "locator", "mesh"}:
+            # sim-related shapes (nurbsCurve は jb_dyn / jb_rest / jb_master
+            # 判定既に上で行われた後の残り = dyn/rest curve)
+            target = subgroups["sim"]
+        elif c.startswith("jb_collider_"):
+            target = subgroups["sim"]
+        else:
+            # 判定できない → sim に (安全側)
+            target = subgroups["sim"]
+
+        try:
+            cmds.parent(c, target)
+            n += 1
+            print(f"  {c} → {target}")
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] {c} → {target}: {exc}")
+
+    print(f"[{_PACKAGE}] organize_jiggle_bones_grp: {n} node(s) 整理完了 "
+          f"(jb_ctrl_grp / jb_bone_grp / jb_sim_grp)")
+    return n
+
+
 def _mesh_has_blendshape(node):
     """v0.9.46: node (or 子孫) の mesh に blendShape deformer が付いてるか check。
     ambiguous short name で cmds.nodeType が失敗する事があるので、
@@ -3042,6 +3113,12 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl",
             print(f"  {node} → {target}")
         except Exception as exc:
             cmds.warning(f"[{_PACKAGE}] {node} → {target}: {exc}")
+
+    # v0.9.47: jiggle_bones_grp が有れば中身も整理
+    try:
+        organize_jiggle_bones_grp()
+    except Exception as exc:
+        cmds.warning(f"[{_PACKAGE}] organize_jiggle_bones_grp: {exc}")
 
     print(f"[{_PACKAGE}] organize_outliner: {n} node(s) 整理完了 "
           f"({geo_name} / {blendshape_name} / {bone_name} / {ctrl_name})")
