@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.43"
+__version__ = "0.9.44"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2934,6 +2934,87 @@ def apply_all_parent_switches():
     return n1 + n2
 
 
+def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl"):
+    """v0.9.44: 全 top-level transform を geo / bone / ctrl 3 group に整理。
+
+    categorize:
+      - 何らかの joint 子孫 (or 自身 joint) → bone
+      - 何らかの mesh 子孫 (skin geo) → geo
+      - それ以外 (curve ctl / group) → ctrl
+
+    Maya default (persp/top/front/side、default*Set 等)、既に 3 group の
+    子 になってる node、既に geo/bone/ctrl 名 node は skip。
+
+    Returns: 移動した node 数
+    """
+    if cmds is None:
+        raise RuntimeError("run inside Maya")
+    # 3 top-level group を確保 (無ければ作る)
+    for g in (geo_name, bone_name, ctrl_name):
+        if not cmds.objExists(g):
+            cmds.createNode("transform", n=g)
+    # skip 対象
+    maya_defaults = {"persp", "top", "front", "side",
+                      "defaultLightSet", "defaultObjectSet",
+                      geo_name, bone_name, ctrl_name}
+
+    n = 0
+    for node in cmds.ls(assemblies=True) or []:
+        if node in maya_defaults:
+            continue
+        if not cmds.objExists(node):
+            continue
+        # 既に geo/bone/ctrl 下 なら skip
+        p = cmds.listRelatives(node, p=True) or []
+        if p and p[0] in (geo_name, bone_name, ctrl_name):
+            continue
+
+        # categorize
+        is_joint = cmds.objectType(node, isa="joint")
+        has_joint_desc = bool(cmds.listRelatives(node, ad=True, type="joint"))
+        has_mesh_desc = bool(cmds.listRelatives(node, ad=True, type="mesh"))
+        # 自身が mesh transform か
+        own_shapes = cmds.listRelatives(node, s=True) or []
+        has_own_mesh = any(cmds.nodeType(s) == "mesh" for s in own_shapes)
+
+        target = None
+        if is_joint or has_joint_desc:
+            target = bone_name
+        elif has_own_mesh or has_mesh_desc:
+            target = geo_name
+        else:
+            target = ctrl_name
+
+        try:
+            cmds.parent(node, target)
+            n += 1
+            print(f"  {node} → {target}")
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] {node} → {target}: {exc}")
+
+    print(f"[{_PACKAGE}] organize_outliner: {n} node(s) 移動完了 "
+          f"({geo_name} / {bone_name} / {ctrl_name})")
+    return n
+
+
+def _ui_organize_outliner(*_):
+    """UI ハンドラ: confirmDialog 経由で organize_outliner 実行。"""
+    result = cmds.confirmDialog(
+        t="Outliner 整理",
+        m="全 top-level transform を以下に整理します:\n\n"
+          "  geo   : mesh 系 (skin geometry)\n"
+          "  bone  : joint chain\n"
+          "  ctrl  : ctl / rig group (attach_ctrls_grp / jiggle_bones_grp 等)\n\n"
+          "既に 3 group 下 の node は skip。 Maya default (persp 等) は 除外。\n"
+          "joint の 移動は world 座標保持 (skinning 影響なし)。\n\n実行しますか?",
+        b=["実行", "Cancel"], defaultButton="実行",
+        cancelButton="Cancel", dismissString="Cancel")
+    if result != "実行":
+        return
+    n = organize_outliner()
+    print(f"[{_PACKAGE}] {n} node(s) 整理完了")
+
+
 def fix_ik_follow_root(target_ctl=None):
     """v0.9.42: 既存 setup の IK/PV/UI npo を main_ctl (or world_ctl) 追従に。
 
@@ -3876,6 +3957,12 @@ def full_auto_setup(scale=1.0, skip_decoration=True, delete_junk=True,
         except Exception as _ps_exc:
             cmds.warning(f"[attach_ctrls] parent switch setup failed (continue): {_ps_exc}")
 
+        # v0.9.44 Step 10: Outliner を geo / bone / ctrl に整理
+        try:
+            organize_outliner()
+        except Exception as _org_exc:
+            cmds.warning(f"[attach_ctrls] organize_outliner failed (continue): {_org_exc}")
+
         print(f"[{_PACKAGE}] === full_auto_setup complete ===")
         print(f"  FK ctls attached: {len(attach_result)}")
         print(f"  IK/FK chains    : {len(ik_results)}")
@@ -3986,6 +4073,17 @@ def _build_body() -> None:
                 ann="v0.9.40: 上の Preset shape を 選択 filter で 一括差替。"
                      "「選択中のみ」なら 選択 ctl(s) が target、他は 名前 pattern。"
                      " v0.9.41: Preset = Custom で 下 field の curve を source に使用可。")
+    cmds.setParent("..")
+
+    # v0.9.44: Outliner 整理 (geo / bone / ctrl)
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
+    cmds.button(l="🗂 Outliner 整理  (geo / bone / ctrl に分類)",
+                h=26, c=_ui_organize_outliner,
+                bgc=(0.40, 0.50, 0.65),
+                ann="v0.9.44: 全 top-level transform を "
+                     "geo (mesh) / bone (joint) / ctrl (ctl/rig group) の "
+                     "3 group に整理。 skinning 影響なし。 full_auto_setup にも "
+                     "自動組込。")
     cmds.setParent("..")
 
     # v0.9.41: Custom curve pick 用 textField + button
