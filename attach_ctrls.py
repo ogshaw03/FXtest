@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.44"
+__version__ = "0.9.45"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2934,29 +2934,56 @@ def apply_all_parent_switches():
     return n1 + n2
 
 
-def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl"):
-    """v0.9.44: 全 top-level transform を geo / bone / ctrl 3 group に整理。
+def _mesh_has_blendshape(node):
+    """v0.9.45: node (or 子孫) の mesh に blendShape deformer が付いてるか check。"""
+    mesh_shapes = cmds.listRelatives(node, ad=True, type="mesh") or []
+    own_shapes = cmds.listRelatives(node, s=True, type="mesh") or []
+    for ms in list(mesh_shapes) + list(own_shapes):
+        history = cmds.listHistory(ms) or []
+        for h in history:
+            try:
+                if cmds.nodeType(h) == "blendShape":
+                    return True
+            except Exception:
+                pass
+    return False
 
-    categorize:
-      - 何らかの joint 子孫 (or 自身 joint) → bone
-      - 何らかの mesh 子孫 (skin geo) → geo
-      - それ以外 (curve ctl / group) → ctrl
 
-    Maya default (persp/top/front/side、default*Set 等)、既に 3 group の
-    子 になってる node、既に geo/bone/ctrl 名 node は skip。
+def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl",
+                       blendshape_name="blendshape"):
+    """v0.9.45: 全 top-level transform を geo / blendshape / bone / ctrl の
+    4 group に整理。
+
+    categorize (優先順):
+      1. 既知 rig group (attach_ctrls_grp / jiggle_bones_grp 等) → ctrl
+         (子孫に joint 有っても ctrl 扱い 強制)
+      2. 自身 joint or joint 子孫 有り → bone
+      3. mesh (自身/子孫) で **blendShape 付き** → blendshape
+      4. mesh (自身/子孫) → geo
+      5. その他 → ctrl
 
     Returns: 移動した node 数
     """
     if cmds is None:
         raise RuntimeError("run inside Maya")
-    # 3 top-level group を確保 (無ければ作る)
-    for g in (geo_name, bone_name, ctrl_name):
+
+    for g in (geo_name, bone_name, ctrl_name, blendshape_name):
         if not cmds.objExists(g):
             cmds.createNode("transform", n=g)
-    # skip 対象
+
     maya_defaults = {"persp", "top", "front", "side",
                       "defaultLightSet", "defaultObjectSet",
-                      geo_name, bone_name, ctrl_name}
+                      geo_name, bone_name, ctrl_name, blendshape_name}
+
+    # v0.9.45: rig 系 group は 内部に joint あっても ctrl 扱い
+    _KNOWN_CTRL_GROUPS = {
+        "attach_ctrls_grp", "jiggle_bones_grp",
+        "world_ctl", "main_ctl",
+        "jb_master_ctl_npo",
+        "attach_ctrls_worldRef",   # v0.9.43 world ref locator
+    }
+    # jb_master_ctl 自身も (npo 無い場合の安全)
+    _KNOWN_CTRL_GROUPS.add("jb_master_ctl")
 
     n = 0
     for node in cmds.ls(assemblies=True) or []:
@@ -2964,26 +2991,33 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl"):
             continue
         if not cmds.objExists(node):
             continue
-        # 既に geo/bone/ctrl 下 なら skip
         p = cmds.listRelatives(node, p=True) or []
-        if p and p[0] in (geo_name, bone_name, ctrl_name):
+        if p and p[0] in (geo_name, bone_name, ctrl_name, blendshape_name):
             continue
 
-        # categorize
-        is_joint = cmds.objectType(node, isa="joint")
-        has_joint_desc = bool(cmds.listRelatives(node, ad=True, type="joint"))
-        has_mesh_desc = bool(cmds.listRelatives(node, ad=True, type="mesh"))
-        # 自身が mesh transform か
-        own_shapes = cmds.listRelatives(node, s=True) or []
-        has_own_mesh = any(cmds.nodeType(s) == "mesh" for s in own_shapes)
-
-        target = None
-        if is_joint or has_joint_desc:
-            target = bone_name
-        elif has_own_mesh or has_mesh_desc:
-            target = geo_name
-        else:
+        # 1. 既知 rig group は ctrl 強制
+        if node in _KNOWN_CTRL_GROUPS:
             target = ctrl_name
+        else:
+            is_joint = cmds.objectType(node, isa="joint")
+            has_joint_desc = bool(cmds.listRelatives(node, ad=True,
+                                                      type="joint"))
+            has_mesh_desc = bool(cmds.listRelatives(node, ad=True,
+                                                      type="mesh"))
+            own_shapes = cmds.listRelatives(node, s=True) or []
+            has_own_mesh = any(cmds.nodeType(s) == "mesh"
+                               for s in own_shapes)
+
+            if is_joint or has_joint_desc:
+                target = bone_name
+            elif has_own_mesh or has_mesh_desc:
+                # v0.9.45: blendShape 付きは blendshape group へ
+                if _mesh_has_blendshape(node):
+                    target = blendshape_name
+                else:
+                    target = geo_name
+            else:
+                target = ctrl_name
 
         try:
             cmds.parent(node, target)
@@ -2992,8 +3026,8 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl"):
         except Exception as exc:
             cmds.warning(f"[{_PACKAGE}] {node} → {target}: {exc}")
 
-    print(f"[{_PACKAGE}] organize_outliner: {n} node(s) 移動完了 "
-          f"({geo_name} / {bone_name} / {ctrl_name})")
+    print(f"[{_PACKAGE}] organize_outliner: {n} node(s) 整理完了 "
+          f"({geo_name} / {blendshape_name} / {bone_name} / {ctrl_name})")
     return n
 
 
@@ -3002,10 +3036,11 @@ def _ui_organize_outliner(*_):
     result = cmds.confirmDialog(
         t="Outliner 整理",
         m="全 top-level transform を以下に整理します:\n\n"
-          "  geo   : mesh 系 (skin geometry)\n"
-          "  bone  : joint chain\n"
-          "  ctrl  : ctl / rig group (attach_ctrls_grp / jiggle_bones_grp 等)\n\n"
-          "既に 3 group 下 の node は skip。 Maya default (persp 等) は 除外。\n"
+          "  geo         : mesh 系 (skin geometry)\n"
+          "  blendshape  : blendShape 付き mesh (表情等)\n"
+          "  bone        : joint chain (rig root)\n"
+          "  ctrl        : ctl / attach_ctrls_grp / jiggle_bones_grp 等\n\n"
+          "既に 4 group 下 の node は skip。 Maya default (persp 等) は 除外。\n"
           "joint の 移動は world 座標保持 (skinning 影響なし)。\n\n実行しますか?",
         b=["実行", "Cancel"], defaultButton="実行",
         cancelButton="Cancel", dismissString="Cancel")
