@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.52"
+__version__ = "0.9.53"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -4281,6 +4281,16 @@ def _build_body() -> None:
                 bgc=(0.30, 0.55, 0.70))
     cmds.setParent("..")
 
+    # v0.9.53: facial ctl + blendShape 紐付け UI 起動ボタン
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
+    cmds.button(l="😀 Facial Ctrls…  (顔ctl + blendShape 紐付け UI)",
+                h=28, c=_ui_open_facial_ctrls,
+                bgc=(0.55, 0.45, 0.65),
+                ann="v0.9.53: 顔 (face/eye/mouth) ctl 作成 + blendShape "
+                     "attr を proxy attribute で 紐付け する 独立 UI。"
+                     " facial_ctrls.py を scripts folder に置いておく必要。")
+    cmds.setParent("..")
+
     # v0.9.39: カーブ差し替え (FK/IK/PV 全 ctl の shape 一括変更)
     cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
     cmds.button(l="🎨 Ctl Curve 差し替え  (選択: source + target(s))",
@@ -4773,6 +4783,32 @@ def _ui_bulk_replace_ctl_curves(*_):
         return
     n = replace_ctl_curves_bulk(source_arg, filter_key)
     print(f"[{_PACKAGE}] 一括差替: {n} ctl(s) 完了")
+
+
+def _ui_open_facial_ctrls(*_):
+    """v0.9.53: facial_ctrls UI (facial_ctrls.show_ui) を起動。
+    lazy import で 単体運用時の依存回避。"""
+    try:
+        import importlib, sys as _sys
+        if "facial_ctrls" in _sys.modules:
+            importlib.reload(_sys.modules["facial_ctrls"])
+            fc = _sys.modules["facial_ctrls"]
+        else:
+            import facial_ctrls as fc
+        fc.show_ui()
+    except ImportError:
+        cmds.confirmDialog(
+            title="Facial Ctrls not installed",
+            message="facial_ctrls.py が Maya scripts フォルダ (または "
+                    "sys.path) に見つかりません。\n\n"
+                    "GitHub raw から取得:\n"
+                    "https://raw.githubusercontent.com/ogshaw03/FXtest/"
+                    "main/facial_ctrls.py\n"
+                    "を C:/Users/<user>/Documents/maya/2023/scripts/ に "
+                    "保存してください。",
+            button=["OK"], defaultButton="OK")
+    except Exception as exc:
+        cmds.warning(f"[attach_ctrls] facial_ctrls の起動に失敗: {exc}")
 
 
 def _ui_open_jiggle_bones(*_):
