@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.47"
+__version__ = "0.9.48"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3120,9 +3120,59 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl",
     except Exception as exc:
         cmds.warning(f"[{_PACKAGE}] organize_jiggle_bones_grp: {exc}")
 
+    # v0.9.48: display layers 作成 + メンバー割当
+    try:
+        _create_display_layers(geo_name, blendshape_name, bone_name, ctrl_name)
+    except Exception as exc:
+        cmds.warning(f"[{_PACKAGE}] _create_display_layers: {exc}")
+
     print(f"[{_PACKAGE}] organize_outliner: {n} node(s) 整理完了 "
           f"({geo_name} / {blendshape_name} / {bone_name} / {ctrl_name})")
     return n
+
+
+def _create_display_layers(geo_name, blendshape_name, bone_name, ctrl_name):
+    """v0.9.48: bone/ctrl/geometry の display layer を作成、対応 group の
+    全 descendant transform をメンバーに登録。
+
+    Layer:
+      bone_lyr     : bone group 配下 全 joint
+      ctrl_lyr     : ctrl group 配下 全 curve transform
+      geometry_lyr : geo + blendshape group 配下 全 mesh transform
+    """
+    layers = [
+        ("bone_lyr",     [bone_name],                       17),  # yellow-ish
+        ("ctrl_lyr",     [ctrl_name],                       13),  # red
+        ("geometry_lyr", [geo_name, blendshape_name],       6),   # blue
+    ]
+    for lname, source_grps, color_idx in layers:
+        if not cmds.objExists(lname):
+            cmds.createDisplayLayer(name=lname, empty=True)
+        # 集める: source group 自身 + 全 descendant transform
+        members = []
+        seen = set()
+        for grp in source_grps:
+            if not cmds.objExists(grp):
+                continue
+            if grp not in seen:
+                seen.add(grp)
+                members.append(grp)
+            for d in cmds.listRelatives(grp, ad=True, type="transform") or []:
+                if d not in seen:
+                    seen.add(d)
+                    members.append(d)
+        if members:
+            try:
+                cmds.editDisplayLayerMembers(lname, members, noRecurse=True)
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] layer members {lname}: {exc}")
+        # color
+        try:
+            cmds.setAttr(f"{lname}.color", color_idx)
+        except Exception:
+            pass
+        print(f"[{_PACKAGE}] display layer {lname}: {len(members)} members "
+              f"(color {color_idx})")
 
 
 def _ui_organize_outliner(*_):
