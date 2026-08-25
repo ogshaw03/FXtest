@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.40"
+__version__ = "0.9.41"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3613,6 +3613,7 @@ def full_auto_setup(scale=1.0, skip_decoration=True, delete_junk=True,
 _UI_SCALE = "attach_ctrls_ui_scale"
 _UI_SHAPE_PRESET = "attach_ctrls_ui_shape_preset"   # v0.9.40
 _UI_SHAPE_FILTER = "attach_ctrls_ui_shape_filter"   # v0.9.40
+_UI_SHAPE_CUSTOM = "attach_ctrls_ui_shape_custom"   # v0.9.41
 _UI_CONSTRAIN = "attach_ctrls_ui_constrain"
 _UI_SKIP_DECOR = "attach_ctrls_ui_skip_decor"
 _UI_DELETE_JUNK = "attach_ctrls_ui_delete_junk"
@@ -3685,8 +3686,9 @@ def _build_body() -> None:
                    co4=(4, 2, 2, 2))
     cmds.text(l="Preset:", al="right")
     cmds.optionMenu(_UI_SHAPE_PRESET)
+    # v0.9.41: "Custom (下 field)" を追加
     for p in ("Circle", "CircleX", "Cube", "Diamond", "Cross",
-              "Arrow", "Sphere"):
+              "Arrow", "Sphere", "Custom (下 field)"):
         cmds.menuItem(l=p)
     try: cmds.optionMenu(_UI_SHAPE_PRESET, e=True, v="Circle")
     except: pass
@@ -3701,7 +3703,19 @@ def _build_body() -> None:
                 c=_ui_bulk_replace_ctl_curves,
                 bgc=(0.55, 0.65, 0.35),
                 ann="v0.9.40: 上の Preset shape を 選択 filter で 一括差替。"
-                     "「選択中のみ」なら 選択 ctl(s) が target、他は 名前 pattern。")
+                     "「選択中のみ」なら 選択 ctl(s) が target、他は 名前 pattern。"
+                     " v0.9.41: Preset = Custom で 下 field の curve を source に使用可。")
+    cmds.setParent("..")
+
+    # v0.9.41: Custom curve pick 用 textField + button
+    cmds.rowLayout(nc=3, adj=2, cw3=(70, 200, 130),
+                   ct3=("right", "both", "both"), co3=(4, 2, 2))
+    cmds.text(l="Custom:", al="right")
+    cmds.textField(_UI_SHAPE_CUSTOM, ann="Preset = Custom 選択時、この curve を"
+                    " source として使用")
+    cmds.button(l="Pick 選択 curve", h=22, c=_ui_pick_custom_curve,
+                ann="viewport / Outliner で curve を 1 個 選択 → クリックで "
+                    "上の field に 名前 セット")
     cmds.setParent("..")
 
     cmds.separator(h=10, style="in")
@@ -4078,10 +4092,46 @@ def _ui_replace_ctl_curves(*_):
     print(f"[{_PACKAGE}] {n} ctl(s) 差し替え完了")
 
 
+def _ui_pick_custom_curve(*_):
+    """v0.9.41: 選択 curve の名前を Custom field にセット。"""
+    sel = cmds.ls(sl=True, type="transform") or []
+    if not sel:
+        cmds.warning("viewport / Outliner で curve transform を選択してください")
+        return
+    src = sel[0]
+    # nurbsCurve shape 確認
+    shapes = cmds.listRelatives(src, s=True, type="nurbsCurve") or []
+    if not shapes:
+        cmds.warning(f"{src} に nurbsCurve shape が無い (curve じゃない?)")
+        return
+    cmds.textField(_UI_SHAPE_CUSTOM, e=True, tx=src)
+    # Preset を Custom に自動切替
+    try:
+        cmds.optionMenu(_UI_SHAPE_PRESET, e=True, v="Custom (下 field)")
+    except Exception:
+        pass
+    print(f"[{_PACKAGE}] Custom source = {src} (Preset を Custom に切替)")
+
+
 def _ui_bulk_replace_ctl_curves(*_):
-    """v0.9.40: preset + filter で 一括差替。"""
+    """v0.9.40: preset + filter で 一括差替。
+    v0.9.41: Preset='Custom (下 field)' なら 下 textField の curve を source に。"""
     preset = cmds.optionMenu(_UI_SHAPE_PRESET, q=True, v=True)
     filter_key = cmds.optionMenu(_UI_SHAPE_FILTER, q=True, v=True)
+
+    # v0.9.41: Custom の場合は field から source curve 取得
+    source_arg = preset
+    if preset.startswith("Custom"):
+        custom_name = (cmds.textField(_UI_SHAPE_CUSTOM, q=True, tx=True)
+                        or "").strip()
+        if not custom_name:
+            cmds.warning("Custom field が空です。Pick 選択 curve で curve を選んでください")
+            return
+        if not cmds.objExists(custom_name):
+            cmds.warning(f"Custom curve '{custom_name}' が scene に存在しない")
+            return
+        source_arg = custom_name
+
     targets = _bulk_targets(filter_key)
     if not targets:
         cmds.warning(f"target 0 個: {filter_key}")
@@ -4091,7 +4141,7 @@ def _ui_bulk_replace_ctl_curves(*_):
         preview += f' … (+{len(targets)-8})'
     result = cmds.confirmDialog(
         t="一括差替確認",
-        m=f"Preset shape: {preset}\n"
+        m=f"Source: {source_arg}\n"
           f"Filter: {filter_key}\n"
           f"Target ctl(s): {len(targets)} 個\n"
           f"  {preview}\n\n"
@@ -4100,7 +4150,7 @@ def _ui_bulk_replace_ctl_curves(*_):
         cancelButton="Cancel", dismissString="Cancel")
     if result != "実行":
         return
-    n = replace_ctl_curves_bulk(preset, filter_key)
+    n = replace_ctl_curves_bulk(source_arg, filter_key)
     print(f"[{_PACKAGE}] 一括差替: {n} ctl(s) 完了")
 
 
