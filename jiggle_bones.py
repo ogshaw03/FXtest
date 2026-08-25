@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.29"
+__version__ = "0.5.30"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1646,6 +1646,156 @@ def _ui_replace_ctl_curves(*_):
     print(f"[jiggle_bones] {n} ctl(s) 差し替え完了")
 
 
+# =========================================================================
+# Master ctl (v0.5.30) — 足元 に per-category ON/OFF ctl を配置
+# =========================================================================
+
+MASTER_CTL_NAME = "jb_master_ctl"
+MASTER_CTL_NPO = "jb_master_ctl_npo"
+
+
+def _make_master_curve(name, size=1.0):
+    """flat circle-with-cross (visible from top)。足元設置用。"""
+    import math
+    r = size
+    pts = []
+    seg = 24
+    for i in range(seg + 1):
+        a = 2 * math.pi * i / seg
+        pts.append((r * math.cos(a), 0, r * math.sin(a)))
+    # 十字
+    pts.extend([(r * 0.8, 0, 0), (-r * 0.8, 0, 0),
+                 (0, 0, 0),
+                 (0, 0, r * 0.8), (0, 0, -r * 0.8)])
+    return cmds.curve(d=1, p=pts, n=name)
+
+
+def create_or_get_master_ctl(position=None, size=None):
+    """v0.5.30: 足元 (or 指定位置) に per-category master ctl を作る/取得。
+
+    Args:
+        position: world position (x,y,z)。None なら 世界原点。
+        size: curve size。None なら auto (mesh bbox 参照)。
+
+    Returns: master ctl transform 名
+    """
+    if cmds.objExists(MASTER_CTL_NAME):
+        return MASTER_CTL_NAME
+
+    # size 決定
+    if size is None:
+        try:
+            bbox = cmds.exactWorldBoundingBox(cmds.ls(type="mesh")) or None
+            if bbox:
+                dx = bbox[3] - bbox[0]
+                dz = bbox[5] - bbox[2]
+                size = max(1.0, min(dx, dz) * 0.15)
+            else:
+                size = 3.0
+        except Exception:
+            size = 3.0
+
+    # position 決定
+    if position is None:
+        position = (0, 0, 0)
+
+    # NPO + ctl
+    if cmds.objExists(MASTER_CTL_NPO):
+        cmds.delete(MASTER_CTL_NPO)
+    ctl = _make_master_curve(MASTER_CTL_NAME, size=size)
+    # 色 (青紫、目立たせる)
+    shapes = cmds.listRelatives(ctl, s=True) or []
+    for s in shapes:
+        try:
+            cmds.setAttr(s + ".overrideEnabled", 1)
+            cmds.setAttr(s + ".overrideColor", 15)   # dark purple / blue
+        except Exception:
+            pass
+    npo = cmds.group(em=True, n=MASTER_CTL_NPO)
+    cmds.parent(ctl, npo)
+    cmds.xform(npo, ws=True, t=position)
+
+    # attach_ctrls の main_ctl か 世界直下 に置く
+    if cmds.objExists("main_ctl"):
+        try: cmds.parent(npo, "main_ctl")
+        except Exception: pass
+    _ensure_jb_group()
+    if not cmds.listRelatives(npo, p=True):
+        try: cmds.parent(npo, "jiggle_bones_grp")
+        except Exception: pass
+
+    # 各 category に対して bool attr 追加 (0=off, 1=on)、default 1
+    for cat in _JIGGLE_TOKENS.keys():
+        if not cmds.attributeQuery(cat, node=ctl, exists=True):
+            cmds.addAttr(ctl, ln=cat, at="bool", dv=1, k=True)
+
+    # 全 category one-shot ON/OFF 便利 attr
+    if not cmds.attributeQuery("allSim", node=ctl, exists=True):
+        cmds.addAttr(ctl, ln="allSim", at="bool", dv=1, k=True)
+
+    print(f"[jiggle_bones] master ctl 作成: {ctl} (size={size}, "
+          f"attrs={list(_JIGGLE_TOKENS.keys())})")
+    return ctl
+
+
+def wire_master_to_chains():
+    """v0.5.30: 全 chain の hairSystem.active を master ctl の 該当 category
+    attr で drive する。 既に接続済 の hairSystem は skip。
+
+    condition node で:
+      hairSystem.active = master.allSim AND master.<category>
+    (両方 1 で active、どちらか 0 で off)
+    """
+    if not cmds.objExists(MASTER_CTL_NAME):
+        cmds.warning(f"[jiggle_bones] {MASTER_CTL_NAME} 未生成、"
+                     "create_or_get_master_ctl() を先に")
+        return 0
+
+    n_wired = 0
+    for cat in _JIGGLE_TOKENS.keys():
+        hs_list = _hair_systems_for_category(cat)
+        for hs_xform in hs_list:
+            shapes = cmds.listRelatives(hs_xform, s=True,
+                                          type="hairSystem") or []
+            if not shapes:
+                continue
+            hs = shapes[0]
+            # 既存 driver を切断 (二重防止)
+            for c in cmds.listConnections(hs + ".active", s=True, d=False,
+                                            plugs=True) or []:
+                try: cmds.disconnectAttr(c, hs + ".active")
+                except Exception: pass
+            # multiplyDivide で AND (allSim × cat_attr)
+            md_name = f"{hs}_activeGate"
+            if cmds.objExists(md_name):
+                try: cmds.delete(md_name)
+                except: pass
+            md = cmds.createNode("multiplyDivide", n=md_name)
+            cmds.setAttr(md + ".operation", 1)   # multiply
+            cmds.connectAttr(f"{MASTER_CTL_NAME}.allSim",
+                              md + ".input1X", f=True)
+            cmds.connectAttr(f"{MASTER_CTL_NAME}.{cat}",
+                              md + ".input2X", f=True)
+            cmds.connectAttr(md + ".outputX", hs + ".active", f=True)
+            n_wired += 1
+    print(f"[jiggle_bones] wire_master_to_chains: {n_wired} hairSystem(s) wired")
+    return n_wired
+
+
+def _ui_setup_master(*_):
+    """UI: 選択位置に master ctl を作成 (無ければ世界原点)、全 chain wire。"""
+    pos = None
+    sel = cmds.ls(sl=True) or []
+    if sel:
+        try:
+            pos = cmds.xform(sel[0], q=True, ws=True, t=True)
+            print(f"[jiggle_bones] master 位置 = {sel[0]} の world pos {pos}")
+        except Exception:
+            pass
+    create_or_get_master_ctl(position=pos)
+    wire_master_to_chains()
+
+
 def set_aim_axis_all(axis):
     """v0.5.14: 既存の全 jb SplineIK の dForwardAxis を一括変更。
     setup し直さずに 子方向軸を修正できる。"""
@@ -1788,13 +1938,18 @@ def create_jiggle_for_chain(chain, category=None, aim_axis=None):
             cmds.warning(f"[jiggle_bones] root translate constraint failed: {exc}")
 
     # v0.5.13: chain setup 完了時に scene 全体で MCD 副産物掃除。
-    # v0.5.12 の差分検出だけでは 拾えない empty root transform
-    # (parent 済み / rename 済み 抽出後に empty になった元 group 等) を
-    # 網羅的に削除。副作用防止のため named 前提 (jb_*, 実 mesh 等はスキップ)。
     try:
         _cleanup_mcd_junk_inline()
     except Exception:
         pass
+
+    # v0.5.30: master ctl があれば その新 chain の hairSystem を wire。
+    # (master ctl は 別 UI ボタン or 手動で作成、無ければ skip)
+    if cmds.objExists(MASTER_CTL_NAME):
+        try:
+            wire_master_to_chains()
+        except Exception:
+            pass
 
     print(f"[jiggle_bones] v0.5.0 setup {_chain_id(chain)} → "
           f"category={category}, joints={len(chain)}, "
@@ -2801,6 +2956,18 @@ def _show_ui_impl():
                      "shape でコピー差し替え。 color / rig 構造 は 保持。 "
                      "使い方: 好みの curve shape を先に選択 → Shift+ で "
                      "差し替えたい *_jbCtl を追加選択 → ボタンクリック")
+
+    # v0.5.30: 揺れ物 Master ctl (per-category ON/OFF)
+    cmds.separator(h=4, style="none", p=body_col)
+    master_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 500))
+    cmds.button(l="👑 揺れ物 Master ctl 作成/更新 (per-category ON/OFF)",
+                h=24, p=master_row, c=_ui_setup_master,
+                bgc=(0.55, 0.35, 0.55),
+                ann="v0.5.30: 足元に 揺れ物 master ctl を作成。 hair/skirt/tail 等 "
+                     "各 category 毎に bool attr (ON/OFF)。 allSim で全カテゴリ 一括 mute。"
+                     " 何か 1 個 joint / ctl を選択して押すと その world 位置に作成、"
+                     "無選択なら 世界原点。 attach_ctrls の main_ctl があれば その下に "
+                     "parent。 全 hairSystem.active を master と wire 済。")
 
     # 補助: 命名 heuristic で一括登録
     aux_row = cmds.rowLayout(nc=1, adj=1, p=body_col, cw=(1, 490))
