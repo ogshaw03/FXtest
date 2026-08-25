@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.51"
+__version__ = "0.9.52"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3145,31 +3145,41 @@ def _create_display_layers(geo_name, blendshape_name, bone_name, ctrl_name):
       - shape type で filter (joint/nurbsCurve/mesh) して 過不足 なくす
       - Maya default layer からの 削除 も 明示
     """
-    def _collect_by_shape(source_grps, shape_types):
-        """source_grps 配下 で shape が shape_types に該当する transform を集める。
-        v0.9.51: 全操作を full DAG path (f=True) で行い ambiguous name
-        (L_sleeve_73 等の 複数箇所存在名) 回避。"""
+    def _collect_by_shape(source_grps, shape_types, scene_wide_types=None):
+        """source_grps 配下 で shape が shape_types に該当する transform 集約。
+        v0.9.52: scene_wide_types 指定時、source_grps 縛りなく scene 全体から
+        該当 type を拾う (jiggle 内の FK joint など hierarchy 深い箇所も含む)。
+        v0.9.51: full DAG path (f=True) で ambiguous name 回避。"""
         out = []
         seen = set()
+        # v0.9.52: scene_wide 型 (joint / mesh 等) は scene 全体から
+        if scene_wide_types:
+            for t in scene_wide_types:
+                for n in cmds.ls(type=t, l=True) or []:
+                    # shape なら parent transform、transform ならそのまま
+                    if cmds.objectType(n, isa="transform"):
+                        node = n
+                    else:
+                        parents = cmds.listRelatives(n, p=True, f=True) or []
+                        node = parents[0] if parents else None
+                    if node and node not in seen:
+                        seen.add(node); out.append(node)
+        # group 配下 filter
         for grp in source_grps:
             if not cmds.objExists(grp):
                 continue
-            # 全 descendant transform を full path で pick
             desc = cmds.listRelatives(grp, ad=True, type="transform",
                                         f=True) or []
-            # grp 自身の full path も
             grp_full = cmds.ls(grp, l=True) or [grp]
             desc = list(grp_full) + list(desc)
             for d in desc:
                 if d in seen:
                     continue
-                # joint 判定
                 try:
                     if "joint" in shape_types and cmds.objectType(d, isa="joint"):
                         seen.add(d); out.append(d); continue
                 except Exception:
                     pass
-                # shape 判定 (full path で shape 取得)
                 shapes = cmds.listRelatives(d, s=True, f=True) or []
                 for s in shapes:
                     try:
@@ -3180,10 +3190,20 @@ def _create_display_layers(geo_name, blendshape_name, bone_name, ctrl_name):
                         seen.add(d); out.append(d); break
         return out
 
+    # v0.9.52: bone_lyr は scene 全体の joint (jiggle 内 *_jbFK 含む)
+    #          geometry_lyr は scene 全体の mesh (blendshape group 含む)
     layers = [
-        ("bone_lyr",     _collect_by_shape([bone_name], {"joint"}),  17),
-        ("ctrl_lyr",     _collect_by_shape([ctrl_name], {"nurbsCurve", "locator"}),  13),
-        ("geometry_lyr", _collect_by_shape([geo_name, blendshape_name], {"mesh"}),   6),
+        ("bone_lyr",
+            _collect_by_shape([bone_name], {"joint"},
+                                scene_wide_types=("joint",)),
+            17),
+        ("ctrl_lyr",
+            _collect_by_shape([ctrl_name], {"nurbsCurve", "locator"}),
+            13),
+        ("geometry_lyr",
+            _collect_by_shape([geo_name, blendshape_name], {"mesh"},
+                                scene_wide_types=("mesh",)),
+            6),
     ]
     for lname, members, color_idx in layers:
         if not cmds.objExists(lname):
