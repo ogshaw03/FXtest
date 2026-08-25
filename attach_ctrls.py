@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.55"
+__version__ = "0.9.56"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -583,8 +583,10 @@ def _lock_hide_attrs(ctl, attrs):
 
 def attach_custom_ctls(joints=None, source_curve=None, do_constrain=True,
                          color_idx=None, name_suffix="_ctl",
-                         npo_suffix="_ctl_npo"):
+                         npo_suffix="_ctl_npo", inherit_hierarchy=True):
     """v0.9.55: 選択 joint 各々に source_curve の shape を複製して 配置。
+    v0.9.56: inherit_hierarchy=True で ctl npo を 親 joint の ctl 下に
+             自動 parent (FK 階層継承)。
 
     処理 (per joint):
       1. source_curve を duplicate
@@ -592,13 +594,19 @@ def attach_custom_ctls(joints=None, source_curve=None, do_constrain=True,
       3. npo group を joint 位置に matchTransform、ctl を npo 下に
       4. do_constrain=True なら parentConstraint(ctl, joint, mo=True)
 
+    Pass 2 (v0.9.56、inherit_hierarchy=True):
+      各 ctl の npo を、選択群内の 一番近い 祖先 joint の ctl 下に parent。
+      → parent ctl 動かすと 子 ctl 全体が追従、joint chain も FK 階層で動く。
+      祖先が選択内に無ければ ROOT_GROUP 下に残る (top ctl)。
+
     Args:
-        joints:       joint list (None なら 選択)
-        source_curve: shape コピー元 curve transform
-        do_constrain: True なら 各 joint を ctl に parentConstraint
-        color_idx:    color 上書き。 None なら L/R/C 自動判定
-        name_suffix:  ctl 名の suffix (default "_ctl")
-        npo_suffix:   npo 名の suffix (default "_ctl_npo")
+        joints:              joint list (None なら 選択)
+        source_curve:        shape コピー元 curve transform
+        do_constrain:        True なら 各 joint を ctl に parentConstraint
+        color_idx:           color 上書き。 None なら L/R/C 自動判定
+        name_suffix:         ctl 名の suffix (default "_ctl")
+        npo_suffix:          npo 名の suffix (default "_ctl_npo")
+        inherit_hierarchy:   True なら ctl 階層を joint 階層に沿わせる (v0.9.56)
 
     Returns: dict {joint: (npo, ctl)}
     """
@@ -670,6 +678,28 @@ def attach_custom_ctls(joints=None, source_curve=None, do_constrain=True,
 
         out[jnt] = (npo, ctl)
         print(f"  {jnt} → {ctl} (npo={npo})")
+
+    # v0.9.56 Pass 2: FK 階層継承 (npo を 祖先 joint の ctl 下に parent)
+    if inherit_hierarchy:
+        n_parented = 0
+        for jnt, (npo, ctl) in out.items():
+            # 選択群内 の 一番近い 祖先 joint を探す
+            ancestor = cmds.listRelatives(jnt, p=True, type="joint") or []
+            while ancestor:
+                anc = ancestor[0]
+                if anc in out:
+                    anc_ctl = out[anc][1]
+                    try:
+                        cmds.parent(npo, anc_ctl)
+                        n_parented += 1
+                        print(f"  hierarchy: {npo} → parent under {anc_ctl}")
+                    except Exception as exc:
+                        cmds.warning(f"[{_PACKAGE}] hierarchy parent "
+                                      f"{npo} → {anc_ctl}: {exc}")
+                    break
+                ancestor = cmds.listRelatives(anc, p=True, type="joint") or []
+            # ancestor 見つからず (top ctl) → ROOT_GROUP 下のまま
+        print(f"[{_PACKAGE}] hierarchy: {n_parented} ctl(s) 親 ctl に parent")
 
     print(f"[{_PACKAGE}] attach_custom_ctls: {len(out)} ctl(s) 作成 "
           f"(source={source_curve})")
