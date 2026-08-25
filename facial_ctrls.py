@@ -24,7 +24,7 @@ fc.create_facial_ctls(head_position=(0, 15, 0), size=1.0)
 fc.link_bs_attr("eye_ctl", "faceBS", "eyeSmile")
 ```
 """
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __package__ = "facial_ctrls"
 
 try:
@@ -53,62 +53,48 @@ _UI_RIGHT_LIST = "facial_ui_rightList"
 # Curve shape 生成
 # =========================================================================
 
-def _make_face_curve(name, size=1.0):
-    """v0.1.1: 顔マーク XY 平面 native (Y=up、正面向き、rotation 不要)。
-    輪郭円 + 目 2 個 (上部、小円) + 口 (下部、smile 弧)。"""
+def _make_face_outline(name, size=1.0):
+    """v0.1.2: 顔輪郭 のみ (外側 円 1 個)。"""
     import math
     r = size
     seg = 32
-    # 顔輪郭 (XY 円)
-    face = [(r * math.cos(2 * math.pi * i / seg),
-             r * math.sin(2 * math.pi * i / seg), 0)
-            for i in range(seg + 1)]
-    face_c = cmds.curve(d=1, p=face)
-    # 目 (上部 Y+0.25)
-    er = r * 0.15
-    eye_l = [(er * math.cos(2 * math.pi * i / 16) - r * 0.35,
-              er * math.sin(2 * math.pi * i / 16) + r * 0.25, 0)
-             for i in range(17)]
-    eye_l_c = cmds.curve(d=1, p=eye_l)
-    eye_r = [(er * math.cos(2 * math.pi * i / 16) + r * 0.35,
-              er * math.sin(2 * math.pi * i / 16) + r * 0.25, 0)
-             for i in range(17)]
-    eye_r_c = cmds.curve(d=1, p=eye_r)
-    # 口 (下部 Y-0.25 中心、smile 弧: 下に凸)
-    mouth = []
-    for i in range(9):
-        a = math.pi + (math.pi / 8) * i   # 180° - 360° (下半円)
-        mouth.append((r * 0.35 * math.cos(a),
-                       r * 0.35 * math.sin(a) - r * 0.1, 0))
-    mouth_c = cmds.curve(d=1, p=mouth)
-    for c in (eye_l_c, eye_r_c, mouth_c):
-        for s in cmds.listRelatives(c, s=True, type="nurbsCurve") or []:
-            cmds.parent(s, face_c, s=True, r=True)
-        cmds.delete(c)
-    return cmds.rename(face_c, name)
-
-
-def _make_eye_curve(name, size=1.0):
-    """v0.1.1: 目 ctl アーモンド楕円 (XY 平面)。"""
-    import math
-    pts = []
-    for i in range(33):
-        a = 2 * math.pi * i / 32
-        pts.append((size * math.cos(a), size * 0.4 * math.sin(a), 0))
+    pts = [(r * math.cos(2 * math.pi * i / seg),
+            r * math.sin(2 * math.pi * i / seg), 0)
+           for i in range(seg + 1)]
     return cmds.curve(d=1, p=pts, n=name)
 
 
-def _make_mouth_curve(name, size=1.0):
-    """v0.1.1: 口 ctl 唇型 (XY 平面、上弧+下弧)。"""
+def _make_face_eyes(name, size=1.0):
+    """v0.1.2: 目 (顔マーク の 2 つの 目) を 1 transform 下 に。
+    face_ctl と組み合わせた時 顔の 目位置 に配置される寸法。"""
     import math
+    r = size
+    er = r * 0.15   # 目 半径
+    # 左目
+    eye_l = [(er * math.cos(2 * math.pi * i / 16) - r * 0.35,
+              er * math.sin(2 * math.pi * i / 16) + r * 0.25, 0)
+             for i in range(17)]
+    tr = cmds.curve(d=1, p=eye_l, n=name)
+    # 右目 shape を tr に merge
+    eye_r = [(er * math.cos(2 * math.pi * i / 16) + r * 0.35,
+              er * math.sin(2 * math.pi * i / 16) + r * 0.25, 0)
+             for i in range(17)]
+    r_curve = cmds.curve(d=1, p=eye_r)
+    for s in cmds.listRelatives(r_curve, s=True, type="nurbsCurve") or []:
+        cmds.parent(s, tr, s=True, r=True)
+    cmds.delete(r_curve)
+    return tr
+
+
+def _make_face_mouth(name, size=1.0):
+    """v0.1.2: 口 (顔マーク の smile 弧)。"""
+    import math
+    r = size
     pts = []
-    for i in range(17):
-        a = math.pi * i / 16
-        pts.append((size * math.cos(a), size * 0.3 * math.sin(a), 0))
-    for i in range(17):
-        a = math.pi + math.pi * i / 16
-        pts.append((size * math.cos(a),
-                     -size * 0.15 * math.sin(a - math.pi), 0))
+    for i in range(9):
+        a = math.pi + (math.pi / 8) * i   # 180° - 360° (下半円)
+        pts.append((r * 0.35 * math.cos(a),
+                     r * 0.35 * math.sin(a) - r * 0.1, 0))
     return cmds.curve(d=1, p=pts, n=name)
 
 
@@ -166,29 +152,32 @@ def create_facial_ctls(head_position=None, size=None):
             except: pass
 
     # 顔マーク
-    face_ctl = _make_face_curve(FACE_CTL_NAME, size=size)
+    # v0.1.2: 顔マークを 3 パーツ (輪郭 / 目 / 口) の 別 transform に分割。
+    # 全て 同じ 黄色 で、見た目 は 1 つの 顔だが 選択は 別々。
+    # face_ctl (輪郭) = 顔全体 移動、 eye_ctl = 目 表情 attr、
+    # mouth_ctl = 口 表情 attr 用。
+    face_ctl = _make_face_outline(FACE_CTL_NAME, size=size)
     _set_ctl_color(face_ctl, 17)   # 黄
     face_npo = cmds.group(em=True, n=FACE_NPO_NAME)
     cmds.parent(face_ctl, face_npo)
     cmds.xform(face_npo, ws=True, t=head_position)
-    # v0.1.1: XY 平面 native なので rotation 不要 (正面向き 自然)
 
-    # 目 ctl (face の 上位置)
-    eye_ctl = _make_eye_curve(EYE_CTL_NAME, size=size * 0.35)
-    _set_ctl_color(eye_ctl, 14)   # 緑
+    # 目 (顔輪郭 の 中 に 目位置で 2 つの 小円)
+    eye_ctl = _make_face_eyes(EYE_CTL_NAME, size=size)
+    _set_ctl_color(eye_ctl, 17)   # 黄 (face と 同色)
     eye_npo = cmds.group(em=True, n=EYE_NPO_NAME)
     cmds.parent(eye_ctl, eye_npo)
     cmds.parent(eye_npo, face_ctl)
-    cmds.setAttr(f"{eye_npo}.translate", 0, 0.25 * size, 0, type="double3")
+    cmds.setAttr(f"{eye_npo}.translate", 0, 0, 0, type="double3")
     cmds.setAttr(f"{eye_npo}.rotate", 0, 0, 0, type="double3")
 
-    # 口 ctl (face の 下位置)
-    mouth_ctl = _make_mouth_curve(MOUTH_CTL_NAME, size=size * 0.4)
-    _set_ctl_color(mouth_ctl, 13)   # 赤
+    # 口 (顔輪郭 の 中 に smile 弧)
+    mouth_ctl = _make_face_mouth(MOUTH_CTL_NAME, size=size)
+    _set_ctl_color(mouth_ctl, 17)   # 黄
     mouth_npo = cmds.group(em=True, n=MOUTH_NPO_NAME)
     cmds.parent(mouth_ctl, mouth_npo)
     cmds.parent(mouth_npo, face_ctl)
-    cmds.setAttr(f"{mouth_npo}.translate", 0, -0.15 * size, 0, type="double3")
+    cmds.setAttr(f"{mouth_npo}.translate", 0, 0, 0, type="double3")
     cmds.setAttr(f"{mouth_npo}.rotate", 0, 0, 0, type="double3")
 
     # face_npo を ctrl group / world_ctl 下に (attach_ctrls 有れば)
