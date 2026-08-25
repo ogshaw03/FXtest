@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.41"
+__version__ = "0.9.42"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -1042,6 +1042,20 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None, label=None):
     cmds.parent(ik_ctl, ik_npo)
     cmds.matchTransform(ik_npo, end, pos=True, rot=True)
     cmds.parent(ik_npo, ROOT_GROUP)
+    # v0.9.42: main_ctl (or world_ctl) が存在すれば IK npo を parentConstraint
+    # で 追従させる → キャラを Root で動かすと IK ctl も一緒に付いてくる。
+    # animator の ctl 変位は 保持 (mo=True で offset 維持)。
+    _follow_target = None
+    for cand in ("main_ctl", "world_ctl"):
+        if cmds.objExists(cand):
+            _follow_target = cand
+            break
+    if _follow_target:
+        try:
+            cmds.parentConstraint(_follow_target, ik_npo, mo=True,
+                                    n=label + "_IK_npo_followPC")
+        except Exception as _exc:
+            cmds.warning(f"[{_PACKAGE}] IK npo follow constraint failed: {_exc}")
     cmds.pointConstraint(ik_ctl, ik_handle, mo=False)
     _lock_hide_attrs(ik_ctl, ["sx", "sy", "sz"])
     # 水平化 (bone 継承の斜め表示解消):
@@ -2234,6 +2248,16 @@ def _create_ui_host_ctl(label, world_pos, size, side):
     cmds.parent(host, host_npo)
     cmds.xform(host_npo, ws=True, t=world_pos)
     cmds.parent(host_npo, ROOT_GROUP)
+    # v0.9.42: UI ctl も main_ctl/world_ctl 追従に (Root 動かした時 UI 表示も
+    # キャラと一緒に付いてくる)
+    for _cand in ("main_ctl", "world_ctl"):
+        if cmds.objExists(_cand):
+            try:
+                cmds.parentConstraint(_cand, host_npo, mo=True,
+                                        n=label + "_UI_npo_followPC")
+            except Exception:
+                pass
+            break
     _lock_hide_attrs(host, ["tx","ty","tz","rx","ry","rz","sx","sy","sz"])
     return host
 
@@ -2704,6 +2728,53 @@ def setup_twist_wiring(transfer_weights=False):
           f"{n_created} newly created, {n_transferred_total} vertex weights "
           f"transferred (existing model _twist_ bones untouched)")
     return n_wired
+
+
+def fix_ik_follow_root(target_ctl=None):
+    """v0.9.42: 既存 setup の IK/PV/UI npo を main_ctl (or world_ctl) 追従に。
+
+    Args:
+        target_ctl: 追従先。None なら "main_ctl" > "world_ctl" 順で探す。
+
+    Returns: 追加した parentConstraint 数
+    """
+    # 追従先決定
+    if target_ctl is None:
+        for cand in ("main_ctl", "world_ctl"):
+            if cmds.objExists(cand):
+                target_ctl = cand
+                break
+    if not (target_ctl and cmds.objExists(target_ctl)):
+        cmds.warning(f"[{_PACKAGE}] 追従 target が無い ({target_ctl})、"
+                     "main_ctl / world_ctl のどれかを scene に作ってください")
+        return 0
+
+    n = 0
+    # 対象 npo pattern: *_IK_npo, *_UI_npo (PV は 元 rig 側 追従なので対象外)
+    # 揺れ物 (*_jbCtl) 系や FK ctl は 元 joint 階層下 なので触らない
+    patterns = ["*_IK_npo", "*_UI_npo"]
+    seen = set()
+    for pat in patterns:
+        for npo in cmds.ls(pat, type="transform") or []:
+            if npo in seen:
+                continue
+            seen.add(npo)
+            # 既存 followPC constraint が有れば skip (二重防止)
+            pc_name = npo + "_followPC"
+            existing = [c for c in cmds.listConnections(npo, s=True, d=False,
+                                                          type="parentConstraint")
+                        or [] if "_followPC" in c]
+            if existing:
+                print(f"[{_PACKAGE}] {npo}: already has follow constraint, skip")
+                continue
+            try:
+                cmds.parentConstraint(target_ctl, npo, mo=True, n=pc_name)
+                n += 1
+                print(f"[{_PACKAGE}] {npo} ← parentConstraint ({target_ctl})")
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] {npo}: {exc}")
+    print(f"[{_PACKAGE}] fix_ik_follow_root: {n} npo(s) constrained to {target_ctl}")
+    return n
 
 
 def fix_stretch_cycles():
