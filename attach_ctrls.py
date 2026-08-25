@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.49"
+__version__ = "0.9.50"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3072,13 +3072,19 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl",
     _KNOWN_CTRL_GROUPS.add("jb_master_ctl")
 
     n = 0
-    for node in cmds.ls(assemblies=True) or []:
+    n_skip_default = 0
+    n_skip_already = 0
+    all_top = cmds.ls(assemblies=True) or []
+    print(f"[{_PACKAGE}] organize_outliner: scanning {len(all_top)} top-level nodes")
+    for node in all_top:
         if node in maya_defaults:
+            n_skip_default += 1
             continue
         if not cmds.objExists(node):
             continue
         p = cmds.listRelatives(node, p=True) or []
         if p and p[0] in (geo_name, bone_name, ctrl_name, blendshape_name):
+            n_skip_already += 1
             continue
 
         # 1. 既知 rig group は ctrl 強制
@@ -3126,7 +3132,8 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl",
     except Exception as exc:
         cmds.warning(f"[{_PACKAGE}] _create_display_layers: {exc}")
 
-    print(f"[{_PACKAGE}] organize_outliner: {n} node(s) 整理完了 "
+    print(f"[{_PACKAGE}] organize_outliner: {n} 移動 / "
+          f"{n_skip_default} default skip / {n_skip_already} 既配置 skip "
           f"({geo_name} / {blendshape_name} / {bone_name} / {ctrl_name})")
     return n
 
@@ -3191,7 +3198,14 @@ def _create_display_layers(geo_name, blendshape_name, bone_name, ctrl_name):
 
 
 def _ui_organize_outliner(*_):
-    """UI ハンドラ: confirmDialog 経由で organize_outliner 実行。"""
+    """UI ハンドラ: confirmDialog 経由で organize_outliner 実行。
+    v0.9.50: verbose 化で silent 失敗の原因を見える化。"""
+    print(f"[{_PACKAGE}] === Outliner 整理 開始 ===")
+    # 現状 top-level scan (何が対象になるか事前確認)
+    top = cmds.ls(assemblies=True) or []
+    print(f"  scene top-level: {len(top)} nodes")
+    for t in top:
+        print(f"    - {t}")
     result = cmds.confirmDialog(
         t="Outliner 整理",
         m="全 top-level transform を以下に整理します:\n\n"
@@ -3204,9 +3218,16 @@ def _ui_organize_outliner(*_):
         b=["実行", "Cancel"], defaultButton="実行",
         cancelButton="Cancel", dismissString="Cancel")
     if result != "実行":
+        print(f"[{_PACKAGE}] user cancel")
         return
-    n = organize_outliner()
-    print(f"[{_PACKAGE}] {n} node(s) 整理完了")
+    try:
+        n = organize_outliner()
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        cmds.warning(f"[{_PACKAGE}] organize_outliner エラー: {exc}")
+        return
+    print(f"[{_PACKAGE}] === {n} node(s) 整理完了 ===")
 
 
 def fix_ik_follow_root(target_ctl=None):
