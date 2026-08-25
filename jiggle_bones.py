@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.27"
+__version__ = "0.5.28"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1011,16 +1011,43 @@ def _create_spline_ik(chain, dynamic_curve_shape):
     ikh = ret[0] if isinstance(ret, (list, tuple)) else ret
     _parent_to_jb(ikh)
 
-    # v0.5.14: 子方向軸 (aim_axis) を SplineIK に反映。
-    # 合ってないと joint が 90/180 度 twist して skinning 裏返り。
-    # 一旦 script global にキャッシュされた選択値を読む (create_jiggle_for_chain 側で set)。
+    # v0.5.28: SplineIK advanced twist を完全設定。
+    # v0.5.14 は dTwistControlEnable + dForwardAxis のみ設定していたが、
+    # dWorldUpType/dWorldUpAxis/dWorldUpMatrix が未設定だと solver が
+    # default (Scene Up = world Y) を使う → 骨の実 orientation と不整合
+    # → 90/180 度の twist が入る (user 報告 "骨が拗じられる"の原因)。
+    #
+    # 修正: dWorldUpType=4 (Object Rotation Up Start/End) を使い、
+    # start/end joint 自身の orientation を twist reference にする。
+    # これで joint の 実 local 軸 と 完全整合、余計な twist 無し。
     aim = _current_setup_aim_axis or _DEFAULT_AIM_AXIS
     dfa = _AIM_AXIS_TO_DFA.get(aim, 0)
+    # aim 軸に垂直な 軸を "up" として選ぶ:
+    #   aim=Y+ → up=X+ (dWorldUpAxis=2)
+    #   aim=X+ → up=Y+ (dWorldUpAxis=0)
+    #   aim=Z+ → up=X+ (dWorldUpAxis=2)
+    up_axis_for_aim = {"X+": 0, "X-": 0, "Y+": 2, "Y-": 2, "Z+": 2, "Z-": 2}
+    dwua = up_axis_for_aim.get(aim, 2)
     try:
         cmds.setAttr(ikh + ".dTwistControlEnable", 1)
         cmds.setAttr(ikh + ".dForwardAxis", dfa)
+        # Object Rotation Up (Start/End) — start & end joint の orientation を
+        # twist 参照に (chain[0] と chain[-1] の worldMatrix を渡す)
+        cmds.setAttr(ikh + ".dWorldUpType", 4)
+        cmds.setAttr(ikh + ".dWorldUpAxis", dwua)
+        # start / end joint の worldMatrix を connect
+        try:
+            cmds.connectAttr(chain[0] + ".worldMatrix[0]",
+                              ikh + ".dWorldUpMatrix", f=True)
+        except Exception:
+            pass
+        try:
+            cmds.connectAttr(chain[-1] + ".worldMatrix[0]",
+                              ikh + ".dWorldUpMatrixEnd", f=True)
+        except Exception:
+            pass
     except Exception as exc:
-        cmds.warning(f"[jiggle_bones] spline IK dForwardAxis set failed: {exc}")
+        cmds.warning(f"[jiggle_bones] spline IK advanced twist set failed: {exc}")
 
     # v0.4.7: worldSpace[0] を明示接続 (記事準拠)
     try:
@@ -1514,16 +1541,40 @@ def set_aim_axis_all(axis):
         cmds.warning(f"[jiggle_bones] invalid axis {axis}, choose from {_AIM_AXIS_CHOICES}")
         return 0
     dfa = _AIM_AXIS_TO_DFA[axis]
+    up_axis_for_aim = {"X+": 0, "X-": 0, "Y+": 2, "Y-": 2, "Z+": 2, "Z-": 2}
+    dwua = up_axis_for_aim.get(axis, 2)
     n = 0
     for ikh in cmds.ls("jb_ikh_*", type="ikHandle") or []:
         try:
             cmds.setAttr(ikh + ".dTwistControlEnable", 1)
             cmds.setAttr(ikh + ".dForwardAxis", dfa)
+            # v0.5.28: WorldUp も設定して twist 完全制御
+            cmds.setAttr(ikh + ".dWorldUpType", 4)
+            cmds.setAttr(ikh + ".dWorldUpAxis", dwua)
+            # start/end joint の worldMatrix を connect
+            sj = cmds.ikHandle(ikh, q=True, sj=True)
+            # end joint は effector 経由で 遡る
+            ee = cmds.ikHandle(ikh, q=True, ee=True)
+            ee_j = cmds.listConnections(ee + ".translate", s=True, d=False) or []
+            end_j = ee_j[0] if ee_j else None
+            if sj:
+                try:
+                    cmds.connectAttr(sj + ".worldMatrix[0]",
+                                      ikh + ".dWorldUpMatrix", f=True)
+                except Exception:
+                    pass
+            if end_j:
+                try:
+                    cmds.connectAttr(end_j + ".worldMatrix[0]",
+                                      ikh + ".dWorldUpMatrixEnd", f=True)
+                except Exception:
+                    pass
             n += 1
         except Exception:
             pass
     set_current_aim_axis(axis)
-    print(f"[jiggle_bones] set_aim_axis_all: {n} ikHandle(s) → {axis} (dFA={dfa})")
+    print(f"[jiggle_bones] set_aim_axis_all: {n} ikHandle(s) → {axis} "
+          f"(dFA={dfa}, dWorldUpAxis={dwua})")
     return n
 
 
