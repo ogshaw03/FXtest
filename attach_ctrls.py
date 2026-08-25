@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.39"
+__version__ = "0.9.40"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3611,6 +3611,8 @@ def full_auto_setup(scale=1.0, skip_decoration=True, delete_junk=True,
 # =========================================================================
 
 _UI_SCALE = "attach_ctrls_ui_scale"
+_UI_SHAPE_PRESET = "attach_ctrls_ui_shape_preset"   # v0.9.40
+_UI_SHAPE_FILTER = "attach_ctrls_ui_shape_filter"   # v0.9.40
 _UI_CONSTRAIN = "attach_ctrls_ui_constrain"
 _UI_SKIP_DECOR = "attach_ctrls_ui_skip_decor"
 _UI_DELETE_JUNK = "attach_ctrls_ui_delete_junk"
@@ -3670,12 +3672,36 @@ def _build_body() -> None:
 
     # v0.9.39: カーブ差し替え (FK/IK/PV 全 ctl の shape 一括変更)
     cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
-    cmds.button(l="🎨 Ctl Curve 差し替え  (source → target 選択順)",
+    cmds.button(l="🎨 Ctl Curve 差し替え  (選択: source + target(s))",
                 h=28, c=_ui_replace_ctl_curves,
                 bgc=(0.45, 0.55, 0.35),
                 ann="v0.9.39: 選択順 = source curve + target ctl(s)。"
-                     " target の shape だけ 差し替え (rig 構造 / color / anim は 保持)。"
-                     " FK ctl / IK ctl / PV ctl / 揺れ物 jbCtl 何でも対応。")
+                     " target の shape だけ 差し替え (rig 構造 / color / anim は 保持)。")
+    cmds.setParent("..")
+
+    # v0.9.40: プリセット shape + フィルタ で 一括差替
+    cmds.rowLayout(nc=4, adj=4, cw4=(50, 130, 160, 100),
+                   ct4=("both", "both", "both", "both"),
+                   co4=(4, 2, 2, 2))
+    cmds.text(l="Preset:", al="right")
+    cmds.optionMenu(_UI_SHAPE_PRESET)
+    for p in ("Circle", "CircleX", "Cube", "Diamond", "Cross",
+              "Arrow", "Sphere"):
+        cmds.menuItem(l=p)
+    try: cmds.optionMenu(_UI_SHAPE_PRESET, e=True, v="Circle")
+    except: pass
+    cmds.optionMenu(_UI_SHAPE_FILTER)
+    for f in ("選択中のみ", "全 FK ctl (*_ctl)", "全 IK ctl (*_IK_ctl)",
+              "全 PV ctl (*_PV_ctl)", "全 UI ctl (*_UI_ctl)",
+              "全 揺れ物 (*_jbCtl)", "全 ctl (全パターン)"):
+        cmds.menuItem(l=f)
+    try: cmds.optionMenu(_UI_SHAPE_FILTER, e=True, v="選択中のみ")
+    except: pass
+    cmds.button(l="🎨 一括差替", h=26,
+                c=_ui_bulk_replace_ctl_curves,
+                bgc=(0.55, 0.65, 0.35),
+                ann="v0.9.40: 上の Preset shape を 選択 filter で 一括差替。"
+                     "「選択中のみ」なら 選択 ctl(s) が target、他は 名前 pattern。")
     cmds.setParent("..")
 
     cmds.separator(h=10, style="in")
@@ -3831,6 +3857,107 @@ def _ui_delete(*_):
     delete_generated()
 
 
+# v0.9.40: プリセット shape 定義 (source curve が無くても bulk 差替可)
+_CTL_SHAPE_PRESETS = {
+    "Cube":    [(-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),(-1,-1,-1),
+                (-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1),(-1,-1,1),
+                (1,-1,1),(1,-1,-1),(1,1,-1),(1,1,1),(-1,1,1),(-1,1,-1)],
+    "Diamond": [(0,1.5,0),(1,0,0),(0,-1.5,0),(-1,0,0),(0,1.5,0),
+                (0,0,1),(1,0,0),(0,0,-1),(-1,0,0),(0,0,1),(0,1.5,0),
+                (0,0,-1),(0,-1.5,0)],
+    "Cross":   [(-1,0,0),(1,0,0),(0,0,0),(0,-1,0),(0,1,0),(0,0,0),
+                (0,0,-1),(0,0,1)],
+    "Arrow":   [(-0.5,0,0),(0.5,0,0),(0.5,0,-1),(1,0,-1),(0,0,-2),
+                (-1,0,-1),(-0.5,0,-1),(-0.5,0,0)],
+    "Sphere":  None,   # circle 3 個で構成、code で作る
+}
+
+
+def _make_preset_shape(preset_name, size=1.0):
+    """preset 名から curve を作って返す (temporary transform、差替後 delete する)。"""
+    if preset_name == "Circle":
+        return cmds.circle(nr=(0, 1, 0), r=size, ch=False,
+                            n=f"__preset_{preset_name}")[0]
+    if preset_name == "CircleX":
+        return cmds.circle(nr=(1, 0, 0), r=size, ch=False,
+                            n=f"__preset_{preset_name}")[0]
+    if preset_name == "Sphere":
+        c1 = cmds.circle(nr=(1, 0, 0), r=size, ch=False)[0]
+        c2 = cmds.circle(nr=(0, 1, 0), r=size, ch=False)[0]
+        c3 = cmds.circle(nr=(0, 0, 1), r=size, ch=False)[0]
+        # combine shapes into c1
+        for c in (c2, c3):
+            shapes = cmds.listRelatives(c, s=True, type="nurbsCurve") or []
+            for s in shapes:
+                cmds.parent(s, c1, s=True, r=True)
+            cmds.delete(c)
+        c1 = cmds.rename(c1, f"__preset_{preset_name}")
+        return c1
+    pts = _CTL_SHAPE_PRESETS.get(preset_name)
+    if not pts:
+        return None
+    scaled = [(p[0] * size, p[1] * size, p[2] * size) for p in pts]
+    return cmds.curve(d=1, p=scaled, n=f"__preset_{preset_name}")
+
+
+def _bulk_targets(filter_key):
+    """filter_key に応じた ctl transform list を返す。"""
+    if filter_key == "選択中のみ":
+        return cmds.ls(sl=True, type="transform") or []
+    patterns = {
+        "全 FK ctl (*_ctl)":     ["*_ctl"],
+        "全 IK ctl (*_IK_ctl)":  ["*_IK_ctl"],
+        "全 PV ctl (*_PV_ctl)":  ["*_PV_ctl"],
+        "全 UI ctl (*_UI_ctl)":  ["*_UI_ctl"],
+        "全 揺れ物 (*_jbCtl)":   ["*_jbCtl"],
+        "全 ctl (全パターン)":    ["*_ctl", "*_IK_ctl", "*_PV_ctl",
+                                   "*_UI_ctl", "*_jbCtl"],
+    }
+    pats = patterns.get(filter_key, [])
+    out = []
+    seen = set()
+    for p in pats:
+        for n in cmds.ls(p, type="transform") or []:
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+    return out
+
+
+def replace_ctl_curves_bulk(preset_or_source, filter_key, size=1.0):
+    """v0.9.40: preset shape または source curve で target 群を一括差替。
+
+    Args:
+        preset_or_source: preset 名 (Circle/Cube/Diamond/... ) or
+                          scene 内 curve transform 名
+        filter_key: '選択中のみ' or '全 FK ctl' 等
+        size: preset 使用時 の scale
+
+    Returns: 差替件数
+    """
+    # source 決定 (preset か scene curve か)
+    temp_source = None
+    if preset_or_source in _CTL_SHAPE_PRESETS or preset_or_source in \
+            ("Circle", "CircleX", "Sphere"):
+        temp_source = _make_preset_shape(preset_or_source, size=size)
+        source = temp_source
+    else:
+        source = preset_or_source
+    if not (source and cmds.objExists(source)):
+        cmds.warning(f"[{_PACKAGE}] source が無効: {preset_or_source}")
+        return 0
+    targets = _bulk_targets(filter_key)
+    if not targets:
+        cmds.warning(f"[{_PACKAGE}] target 0 個: {filter_key}")
+        if temp_source: cmds.delete(temp_source)
+        return 0
+    n = replace_ctl_curves(source, targets)
+    if temp_source:
+        try: cmds.delete(temp_source)
+        except: pass
+    return n
+
+
 def replace_ctl_curves(source, targets, preserve_color=True):
     """v0.9.39: source curve の shape を targets 各々に コピー、既存 shape を
     差し替える (rig 構造 / color / anim curve / constraint 保持、見た目 のみ変更)。
@@ -3949,6 +4076,32 @@ def _ui_replace_ctl_curves(*_):
         return
     n = replace_ctl_curves(source, targets)
     print(f"[{_PACKAGE}] {n} ctl(s) 差し替え完了")
+
+
+def _ui_bulk_replace_ctl_curves(*_):
+    """v0.9.40: preset + filter で 一括差替。"""
+    preset = cmds.optionMenu(_UI_SHAPE_PRESET, q=True, v=True)
+    filter_key = cmds.optionMenu(_UI_SHAPE_FILTER, q=True, v=True)
+    targets = _bulk_targets(filter_key)
+    if not targets:
+        cmds.warning(f"target 0 個: {filter_key}")
+        return
+    preview = ', '.join(targets[:8])
+    if len(targets) > 8:
+        preview += f' … (+{len(targets)-8})'
+    result = cmds.confirmDialog(
+        t="一括差替確認",
+        m=f"Preset shape: {preset}\n"
+          f"Filter: {filter_key}\n"
+          f"Target ctl(s): {len(targets)} 個\n"
+          f"  {preview}\n\n"
+          f"実行しますか?",
+        b=["実行", "Cancel"], defaultButton="実行",
+        cancelButton="Cancel", dismissString="Cancel")
+    if result != "実行":
+        return
+    n = replace_ctl_curves_bulk(preset, filter_key)
+    print(f"[{_PACKAGE}] 一括差替: {n} ctl(s) 完了")
 
 
 def _ui_open_jiggle_bones(*_):
