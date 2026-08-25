@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.48"
+__version__ = "0.9.49"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3132,41 +3132,56 @@ def organize_outliner(geo_name="geo", bone_name="bone", ctrl_name="ctrl",
 
 
 def _create_display_layers(geo_name, blendshape_name, bone_name, ctrl_name):
-    """v0.9.48: bone/ctrl/geometry の display layer を作成、対応 group の
-    全 descendant transform をメンバーに登録。
-
-    Layer:
-      bone_lyr     : bone group 配下 全 joint
-      ctrl_lyr     : ctrl group 配下 全 curve transform
-      geometry_lyr : geo + blendshape group 配下 全 mesh transform
+    """v0.9.49: bone / ctrl / geometry の display layer を作成 + 割当。
+    v0.9.48 で "ジオと骨がレイヤーに入ってない" bug の 修正:
+      - editDisplayLayerMembers を 各 member 個別 呼出しに変更
+      - shape type で filter (joint/nurbsCurve/mesh) して 過不足 なくす
+      - Maya default layer からの 削除 も 明示
     """
-    layers = [
-        ("bone_lyr",     [bone_name],                       17),  # yellow-ish
-        ("ctrl_lyr",     [ctrl_name],                       13),  # red
-        ("geometry_lyr", [geo_name, blendshape_name],       6),   # blue
-    ]
-    for lname, source_grps, color_idx in layers:
-        if not cmds.objExists(lname):
-            cmds.createDisplayLayer(name=lname, empty=True)
-        # 集める: source group 自身 + 全 descendant transform
-        members = []
+    def _collect_by_shape(source_grps, shape_types):
+        """source_grps 配下 で shape が shape_types に該当する transform を集める。
+        joint は shape 無し なので type="joint" で 別枠、cmds.ls で判定。"""
+        out = []
         seen = set()
         for grp in source_grps:
             if not cmds.objExists(grp):
                 continue
-            if grp not in seen:
-                seen.add(grp)
-                members.append(grp)
-            for d in cmds.listRelatives(grp, ad=True, type="transform") or []:
-                if d not in seen:
-                    seen.add(d)
-                    members.append(d)
+            # 全 descendant transform を pick
+            desc = [grp] + (cmds.listRelatives(grp, ad=True,
+                                                  type="transform") or [])
+            for d in desc:
+                if d in seen:
+                    continue
+                # joint 判定
+                if "joint" in shape_types and cmds.objectType(d, isa="joint"):
+                    seen.add(d); out.append(d); continue
+                # shape 判定
+                shapes = cmds.listRelatives(d, s=True) or []
+                for s in shapes:
+                    try:
+                        st = cmds.nodeType(s)
+                    except Exception:
+                        continue
+                    if st in shape_types:
+                        seen.add(d); out.append(d); break
+        return out
+
+    layers = [
+        ("bone_lyr",     _collect_by_shape([bone_name], {"joint"}),  17),
+        ("ctrl_lyr",     _collect_by_shape([ctrl_name], {"nurbsCurve", "locator"}),  13),
+        ("geometry_lyr", _collect_by_shape([geo_name, blendshape_name], {"mesh"}),   6),
+    ]
+    for lname, members, color_idx in layers:
+        if not cmds.objExists(lname):
+            cmds.createDisplayLayer(name=lname, empty=True)
+        # 既存 メンバー全削除 → 新 memberships 追加 (idempotent、他 layer からも移す)
         if members:
-            try:
-                cmds.editDisplayLayerMembers(lname, members, noRecurse=True)
-            except Exception as exc:
-                cmds.warning(f"[{_PACKAGE}] layer members {lname}: {exc}")
-        # color
+            for m in members:
+                try:
+                    cmds.editDisplayLayerMembers(lname, m, noRecurse=True)
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] add {m} to {lname}: {exc}")
+        # color 設定
         try:
             cmds.setAttr(f"{lname}.color", color_idx)
         except Exception:
