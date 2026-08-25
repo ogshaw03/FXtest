@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.33"
+__version__ = "0.5.34"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1817,60 +1817,114 @@ def _cleanup_unused_master_attrs():
     return n
 
 
+def _follicles_for_category(cat):
+    """category の 全 chain の follicle shape を返す (v0.5.34)。"""
+    out = []
+    reg = get_registered_chains() or {}
+    for chain in reg.get(cat, []):
+        if not chain or not cmds.objExists(chain[0]):
+            continue
+        f_xform = _follicle_name(chain)
+        if cmds.objExists(f_xform):
+            shapes = cmds.listRelatives(f_xform, s=True,
+                                          type="follicle") or []
+            if shapes:
+                out.append(shapes[0])
+    # fallback: 命名から拾う (registry と ズレてる時)
+    if not out:
+        for f in cmds.ls("jb_foll_*Shape", type="follicle") or []:
+            out.append(f)
+    return out
+
+
 def wire_master_to_chains():
-    """v0.5.30: 全 chain の hairSystem.active を master ctl の 該当 category
-    attr で drive する。 既に接続済 の hairSystem は skip。
+    """v0.5.34: 全 chain の follicle.simulationMethod を master ctl の
+    category attr で drive。 hairSystem.active は不確実な gate だった
+    ので follicle 側で確実に stop させる。
 
     condition node で:
-      hairSystem.active = master.allSim AND master.<category>
-    (両方 1 で active、どちらか 0 で off)
+      product = master.allSim × master.<category>
+      product == 1 → simulationMethod = 2 (dynamic follicle、揺れる)
+      product == 0 → simulationMethod = 0 (static、動かない)
+
+    加えて hairSystem.active も同 gate で driving (保険)。
     """
     if not cmds.objExists(MASTER_CTL_NAME):
         cmds.warning(f"[jiggle_bones] {MASTER_CTL_NAME} 未生成、"
                      "create_or_get_master_ctl() を先に")
         return 0
 
-    # v0.5.33: 使わない category attr を master から削除 (登録済 only 化)
     _cleanup_unused_master_attrs()
 
     n_wired = 0
     for cat in _JIGGLE_TOKENS.keys():
         hs_list = _hair_systems_for_category(cat)
-        if not hs_list:
+        foll_list = _follicles_for_category(cat)
+        if not hs_list and not foll_list:
             continue
-        # v0.5.33: 該当 category の attr が master に無ければ動的追加
+        # attr が無ければ動的追加
         if not cmds.attributeQuery(cat, node=MASTER_CTL_NAME, exists=True):
             try:
                 cmds.addAttr(MASTER_CTL_NAME, ln=cat, at="bool", dv=1, k=True)
                 print(f"[jiggle_bones] added attr {MASTER_CTL_NAME}.{cat}")
-            except Exception as exc:
-                cmds.warning(f"[jiggle_bones] add attr {cat}: {exc}")
+            except Exception:
                 continue
+
+        # 共通: multiplyDivide (product = allSim × cat) を category 単位で 1 個
+        md_name = f"jb_master_{cat}_gate_MD"
+        if cmds.objExists(md_name):
+            try: cmds.delete(md_name)
+            except: pass
+        md = cmds.createNode("multiplyDivide", n=md_name)
+        cmds.setAttr(md + ".operation", 1)
+        cmds.connectAttr(f"{MASTER_CTL_NAME}.allSim",
+                          md + ".input1X", f=True)
+        cmds.connectAttr(f"{MASTER_CTL_NAME}.{cat}",
+                          md + ".input2X", f=True)
+
+        # condition (product == 1 → 2, else 0)
+        cond_name = f"jb_master_{cat}_gate_COND"
+        if cmds.objExists(cond_name):
+            try: cmds.delete(cond_name)
+            except: pass
+        cond = cmds.createNode("condition", n=cond_name)
+        cmds.setAttr(cond + ".secondTerm", 1)
+        cmds.setAttr(cond + ".operation", 0)   # equal
+        cmds.setAttr(cond + ".colorIfTrueR", 2)   # dynamic
+        cmds.setAttr(cond + ".colorIfFalseR", 0)  # static
+        cmds.connectAttr(md + ".outputX", cond + ".firstTerm", f=True)
+
+        # 各 follicle.simulationMethod に接続
+        for f in foll_list:
+            # 既存接続 切断
+            for c in cmds.listConnections(f + ".simulationMethod",
+                                            s=True, d=False, plugs=True) or []:
+                try: cmds.disconnectAttr(c, f + ".simulationMethod")
+                except: pass
+            try:
+                cmds.connectAttr(cond + ".outColorR",
+                                  f + ".simulationMethod", f=True)
+                n_wired += 1
+            except Exception as exc:
+                cmds.warning(f"[jiggle_bones] follicle wire {f}: {exc}")
+
+        # 保険で hairSystem.active も駆動
         for hs_xform in hs_list:
             shapes = cmds.listRelatives(hs_xform, s=True,
                                           type="hairSystem") or []
-            if not shapes:
-                continue
+            if not shapes: continue
             hs = shapes[0]
-            # 既存 driver を切断 (二重防止)
             for c in cmds.listConnections(hs + ".active", s=True, d=False,
                                             plugs=True) or []:
                 try: cmds.disconnectAttr(c, hs + ".active")
-                except Exception: pass
-            # multiplyDivide で AND (allSim × cat_attr)
-            md_name = f"{hs}_activeGate"
-            if cmds.objExists(md_name):
-                try: cmds.delete(md_name)
                 except: pass
-            md = cmds.createNode("multiplyDivide", n=md_name)
-            cmds.setAttr(md + ".operation", 1)   # multiply
-            cmds.connectAttr(f"{MASTER_CTL_NAME}.allSim",
-                              md + ".input1X", f=True)
-            cmds.connectAttr(f"{MASTER_CTL_NAME}.{cat}",
-                              md + ".input2X", f=True)
-            cmds.connectAttr(md + ".outputX", hs + ".active", f=True)
-            n_wired += 1
-    print(f"[jiggle_bones] wire_master_to_chains: {n_wired} hairSystem(s) wired")
+            try:
+                cmds.connectAttr(md + ".outputX", hs + ".active", f=True)
+            except Exception:
+                pass
+
+    print(f"[jiggle_bones] wire_master_to_chains: {n_wired} follicle(s) wired "
+          f"(via simulationMethod + hairSystem.active)")
     return n_wired
 
 
