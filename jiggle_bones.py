@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.30"
+__version__ = "0.5.31"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1655,19 +1655,39 @@ MASTER_CTL_NPO = "jb_master_ctl_npo"
 
 
 def _make_master_curve(name, size=1.0):
-    """flat circle-with-cross (visible from top)。足元設置用。"""
+    """v0.5.31: 歯車風 master shape (flat XZ、上から見える)。
+    2 段 波 (outer teeth + inner ring) + 短い 4 方向十字 で 設定っぽく。"""
     import math
-    r = size
-    pts = []
-    seg = 24
+    r_out = size
+    r_teeth = size * 1.15   # 歯先
+    r_in = size * 0.7       # 内側リング
+    seg = 24                # 歯数 (12) の 2 倍で 波
+    # ----- outer gear (teeth 波) -----
+    outer = []
     for i in range(seg + 1):
         a = 2 * math.pi * i / seg
-        pts.append((r * math.cos(a), 0, r * math.sin(a)))
-    # 十字
-    pts.extend([(r * 0.8, 0, 0), (-r * 0.8, 0, 0),
-                 (0, 0, 0),
-                 (0, 0, r * 0.8), (0, 0, -r * 0.8)])
-    return cmds.curve(d=1, p=pts, n=name)
+        r = r_teeth if i % 2 == 0 else r_out
+        outer.append((r * math.cos(a), 0, r * math.sin(a)))
+    outer_curve = cmds.curve(d=1, p=outer)
+    # ----- inner ring (円) -----
+    inner_seg = 32
+    inner = [(r_in * math.cos(2 * math.pi * i / inner_seg), 0,
+              r_in * math.sin(2 * math.pi * i / inner_seg))
+             for i in range(inner_seg + 1)]
+    inner_curve = cmds.curve(d=1, p=inner)
+    # ----- 4 方向 短十字 (center indicator) -----
+    cross_len = size * 0.35
+    cross_pts = [(cross_len, 0, 0), (-cross_len, 0, 0), (0, 0, 0),
+                 (0, 0, cross_len), (0, 0, -cross_len)]
+    cross_curve = cmds.curve(d=1, p=cross_pts)
+    # ----- shapes を outer transform 下に combine -----
+    for c in (inner_curve, cross_curve):
+        shapes = cmds.listRelatives(c, s=True, type="nurbsCurve") or []
+        for s in shapes:
+            cmds.parent(s, outer_curve, s=True, r=True)
+        cmds.delete(c)
+    outer_curve = cmds.rename(outer_curve, name)
+    return outer_curve
 
 
 def create_or_get_master_ctl(position=None, size=None):
