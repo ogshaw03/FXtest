@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.50"
+__version__ = "0.9.51"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3147,23 +3147,30 @@ def _create_display_layers(geo_name, blendshape_name, bone_name, ctrl_name):
     """
     def _collect_by_shape(source_grps, shape_types):
         """source_grps 配下 で shape が shape_types に該当する transform を集める。
-        joint は shape 無し なので type="joint" で 別枠、cmds.ls で判定。"""
+        v0.9.51: 全操作を full DAG path (f=True) で行い ambiguous name
+        (L_sleeve_73 等の 複数箇所存在名) 回避。"""
         out = []
         seen = set()
         for grp in source_grps:
             if not cmds.objExists(grp):
                 continue
-            # 全 descendant transform を pick
-            desc = [grp] + (cmds.listRelatives(grp, ad=True,
-                                                  type="transform") or [])
+            # 全 descendant transform を full path で pick
+            desc = cmds.listRelatives(grp, ad=True, type="transform",
+                                        f=True) or []
+            # grp 自身の full path も
+            grp_full = cmds.ls(grp, l=True) or [grp]
+            desc = list(grp_full) + list(desc)
             for d in desc:
                 if d in seen:
                     continue
                 # joint 判定
-                if "joint" in shape_types and cmds.objectType(d, isa="joint"):
-                    seen.add(d); out.append(d); continue
-                # shape 判定
-                shapes = cmds.listRelatives(d, s=True) or []
+                try:
+                    if "joint" in shape_types and cmds.objectType(d, isa="joint"):
+                        seen.add(d); out.append(d); continue
+                except Exception:
+                    pass
+                # shape 判定 (full path で shape 取得)
+                shapes = cmds.listRelatives(d, s=True, f=True) or []
                 for s in shapes:
                     try:
                         st = cmds.nodeType(s)
