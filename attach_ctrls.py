@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.54"
+__version__ = "0.9.55"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -579,6 +579,129 @@ def _lock_hide_attrs(ctl, attrs):
             cmds.setAttr(f"{ctl}.{a}", lock=True, keyable=False, channelBox=False)
         except Exception:
             pass
+
+
+def attach_custom_ctls(joints=None, source_curve=None, do_constrain=True,
+                         color_idx=None, name_suffix="_ctl",
+                         npo_suffix="_ctl_npo"):
+    """v0.9.55: 選択 joint 各々に source_curve の shape を複製して 配置。
+
+    処理 (per joint):
+      1. source_curve を duplicate
+      2. shape だけ target ctl (transform) に move
+      3. npo group を joint 位置に matchTransform、ctl を npo 下に
+      4. do_constrain=True なら parentConstraint(ctl, joint, mo=True)
+
+    Args:
+        joints:       joint list (None なら 選択)
+        source_curve: shape コピー元 curve transform
+        do_constrain: True なら 各 joint を ctl に parentConstraint
+        color_idx:    color 上書き。 None なら L/R/C 自動判定
+        name_suffix:  ctl 名の suffix (default "_ctl")
+        npo_suffix:   npo 名の suffix (default "_ctl_npo")
+
+    Returns: dict {joint: (npo, ctl)}
+    """
+    if cmds is None:
+        raise RuntimeError("Must run inside Maya.")
+
+    if joints is None:
+        joints = cmds.ls(sl=True, type="joint")
+    if not joints:
+        cmds.warning(f"[{_PACKAGE}] joint 選択なし")
+        return {}
+    if not (source_curve and cmds.objExists(source_curve)):
+        cmds.warning(f"[{_PACKAGE}] source_curve 存在しない: {source_curve}")
+        return {}
+    src_shapes = cmds.listRelatives(source_curve, s=True,
+                                       type="nurbsCurve") or []
+    if not src_shapes:
+        cmds.warning(f"[{_PACKAGE}] {source_curve} に nurbsCurve shape 無し")
+        return {}
+
+    if not cmds.objExists(ROOT_GROUP):
+        cmds.group(em=True, name=ROOT_GROUP)
+
+    out = {}
+    for jnt in joints:
+        if not cmds.objExists(jnt):
+            continue
+        base = _base_name(jnt)
+        ctl_name = base + name_suffix
+        npo_name = base + npo_suffix
+        if cmds.objExists(ctl_name):
+            cmds.warning(f"[{_PACKAGE}] {ctl_name} 既存、skip")
+            continue
+
+        # ctl transform + source shape 複製
+        dup = cmds.duplicate(source_curve, rc=True)[0]
+        # shape のみ抽出
+        dup_shapes = cmds.listRelatives(dup, s=True, type="nurbsCurve") or []
+        # ctl transform を新規作成 (source の transform は捨てる)
+        ctl = cmds.createNode("transform", n=ctl_name)
+        for i, s in enumerate(dup_shapes):
+            new_name = f"{ctl_name}Shape" if i == 0 else f"{ctl_name}Shape{i}"
+            s = cmds.rename(s, new_name)
+            try: cmds.parent(s, ctl, s=True, r=True)
+            except: pass
+        try: cmds.delete(dup)
+        except: pass
+
+        # color
+        if color_idx is None:
+            side = _detect_side(base)
+            col = {"L": COLOR_L, "R": COLOR_R, "C": COLOR_C}[side]
+        else:
+            col = color_idx
+        _set_ctl_color(ctl, col)
+
+        # npo に入れて joint 位置に snap
+        npo = cmds.group(em=True, n=npo_name)
+        cmds.parent(ctl, npo)
+        cmds.matchTransform(npo, jnt, pos=True, rot=True)
+        cmds.parent(npo, ROOT_GROUP)
+
+        if do_constrain:
+            try:
+                cmds.parentConstraint(ctl, jnt, mo=True,
+                                        n=f"{jnt}_customCtl_pc")
+            except Exception as exc:
+                cmds.warning(f"[{_PACKAGE}] constrain {jnt}: {exc}")
+
+        out[jnt] = (npo, ctl)
+        print(f"  {jnt} → {ctl} (npo={npo})")
+
+    print(f"[{_PACKAGE}] attach_custom_ctls: {len(out)} ctl(s) 作成 "
+          f"(source={source_curve})")
+    return out
+
+
+def _ui_attach_custom_ctls(*_):
+    """UI: 選択の 最初 = source curve、残り = target joint(s)。"""
+    sel = cmds.ls(sl=True) or []
+    if len(sel) < 2:
+        cmds.warning("最初に source curve、続けて joint(s) を Shift+選択 "
+                     "(計 2 個以上)")
+        return
+    source = sel[0]
+    joints = [s for s in sel[1:] if cmds.objectType(s, isa="joint")]
+    if not joints:
+        cmds.warning("2 個目以降に joint が無い (source が joint でもダメ)")
+        return
+    do_constr = cmds.checkBoxGrp(_UI_CUSTOM_CONSTRAIN, q=True, value1=True)
+    result = cmds.confirmDialog(
+        t="カスタム ctl 配置",
+        m=f"Source curve: {source}\n"
+          f"Target joints: {len(joints)} 個\n  "
+          f"{', '.join(joints[:6])}{'…' if len(joints) > 6 else ''}\n\n"
+          f"do_constrain: {do_constr}\n\n"
+          f"各 joint に source shape の ctl を配置 → npo で snap。 実行?",
+        b=["実行", "Cancel"], defaultButton="実行",
+        cancelButton="Cancel", dismissString="Cancel")
+    if result != "実行":
+        return
+    attach_custom_ctls(joints=joints, source_curve=source,
+                        do_constrain=do_constr)
 
 
 def attach_controllers(joints=None, scale=1.0, do_constrain=True,
@@ -4225,6 +4348,7 @@ _UI_SCALE = "attach_ctrls_ui_scale"
 _UI_SHAPE_PRESET = "attach_ctrls_ui_shape_preset"   # v0.9.40
 _UI_SHAPE_FILTER = "attach_ctrls_ui_shape_filter"   # v0.9.40
 _UI_SHAPE_CUSTOM = "attach_ctrls_ui_shape_custom"   # v0.9.41
+_UI_CUSTOM_CONSTRAIN = "attach_ctrls_ui_custom_constrain"   # v0.9.55
 _UI_CONSTRAIN = "attach_ctrls_ui_constrain"
 _UI_SKIP_DECOR = "attach_ctrls_ui_skip_decor"
 _UI_DELETE_JUNK = "attach_ctrls_ui_delete_junk"
@@ -4326,6 +4450,22 @@ def _build_body() -> None:
                 ann="v0.9.40: 上の Preset shape を 選択 filter で 一括差替。"
                      "「選択中のみ」なら 選択 ctl(s) が target、他は 名前 pattern。"
                      " v0.9.41: Preset = Custom で 下 field の curve を source に使用可。")
+    cmds.setParent("..")
+
+    # v0.9.55: 選択骨に カスタム curve ctl を配置
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
+    cmds.button(l="🎯 選択 curve → 残り joint(s) に ctl 配置 + constrain",
+                h=26, c=_ui_attach_custom_ctls,
+                bgc=(0.35, 0.55, 0.45),
+                ann="v0.9.55: 選択順 = source curve + target joint(s)。 "
+                     "各 joint に source shape の ctl 作成、npo で位置 snap、"
+                     "parentConstraint(ctl, joint) で joint を drive。"
+                     " 分岐 root の各子 に FK ctl 手動配置 等に。")
+    cmds.setParent("..")
+    cmds.rowLayout(nc=1, adj=1, cw=(1, 400))
+    cmds.checkBoxGrp(_UI_CUSTOM_CONSTRAIN,
+                      label="Constrain:", label1="parentConstraint(ctl → joint)",
+                      value1=True, cw2=(80, 260))
     cmds.setParent("..")
 
     # v0.9.44: Outliner 整理 (geo / bone / ctrl)
