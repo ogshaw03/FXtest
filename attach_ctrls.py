@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.42"
+__version__ = "0.9.43"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2730,6 +2730,210 @@ def setup_twist_wiring(transfer_weights=False):
     return n_wired
 
 
+def _ensure_world_ref_locator():
+    """v0.9.43: mGear-style parent switch の "world" 参照 locator を確保。
+    identity transform (world 直下、位置/回転 0)。 全 switch で共有。"""
+    name = "attach_ctrls_worldRef"
+    if not cmds.objExists(name):
+        loc = cmds.spaceLocator(n=name)[0]
+        for a in ("tx", "ty", "tz", "rx", "ry", "rz"):
+            cmds.setAttr(f"{loc}.{a}", 0)
+        # visibility off
+        try: cmds.setAttr(loc + "Shape.visibility", 0)
+        except: pass
+        if cmds.objExists(ROOT_GROUP):
+            try: cmds.parent(loc, ROOT_GROUP)
+            except: pass
+        return loc
+    return name
+
+
+def _remove_existing_follow_constraints(npo):
+    """既存 followPC / switchPC を全部削除 (二重防止)。"""
+    for c in cmds.listConnections(npo, s=True, d=False,
+                                     type="parentConstraint") or []:
+        if "_followPC" in c or "_switchPC" in c:
+            try:
+                cmds.delete(c)
+            except Exception:
+                pass
+
+
+def add_parent_switch(host_ctl, target_npo, targets, attr_name="parent",
+                       default_index=1):
+    """v0.9.43: mGear-style parent switch を作る。
+
+    host_ctl (UI ctl 等) に enum attr を追加、target_npo を targets 各々に
+    parentConstraint、condition node で weight を切替。
+
+    Args:
+        host_ctl:      enum attr を追加する ctl (e.g. leg_L_UI_ctl)
+        target_npo:    追従対象 npo (e.g. leg_L_IK_npo)
+        targets:       [(node_name, display_name), ...]  追従先候補
+                       例: [("attach_ctrls_worldRef", "world"),
+                            ("main_ctl", "root"),
+                            ("Hips", "hip")]
+        attr_name:     属性名 ("ikRef" / "pvRef" 等)
+        default_index: 起動時の parent index
+
+    Returns: parentConstraint 名 (成功) or None
+    """
+    if not (host_ctl and cmds.objExists(host_ctl)):
+        cmds.warning(f"[{_PACKAGE}] host_ctl '{host_ctl}' 存在しない")
+        return None
+    if not (target_npo and cmds.objExists(target_npo)):
+        cmds.warning(f"[{_PACKAGE}] target_npo '{target_npo}' 存在しない")
+        return None
+    # 有効 target のみ
+    valid = [(n, d) for n, d in targets if n and cmds.objExists(n)]
+    if not valid:
+        cmds.warning(f"[{_PACKAGE}] valid target 0 個")
+        return None
+
+    _remove_existing_follow_constraints(target_npo)
+
+    # enum attr 作成 (or update)
+    labels = ":".join(d for _n, d in valid)
+    if cmds.attributeQuery(attr_name, node=host_ctl, exists=True):
+        # 既存 attr 削除して作り直し (labels 数が違う可能性)
+        try: cmds.deleteAttr(f"{host_ctl}.{attr_name}")
+        except: pass
+    cmds.addAttr(host_ctl, ln=attr_name, at="enum", en=labels, k=True)
+    cmds.setAttr(f"{host_ctl}.{attr_name}", default_index)
+
+    # parentConstraint (全 target を weight で追加、mo=True)
+    tgt_nodes = [n for n, _d in valid]
+    pc = cmds.parentConstraint(tgt_nodes, target_npo, mo=True,
+                                 n=target_npo + "_switchPC")[0]
+    w_attrs = cmds.parentConstraint(pc, q=True, weightAliasList=True) or []
+
+    # condition node で enum → weight (該当 index だけ 1、他 0)
+    for i, wa in enumerate(w_attrs):
+        cond_name = f"{target_npo}_switchCond{i}"
+        if cmds.objExists(cond_name):
+            try: cmds.delete(cond_name)
+            except: pass
+        cond = cmds.createNode("condition", n=cond_name)
+        cmds.setAttr(cond + ".secondTerm", i)
+        cmds.setAttr(cond + ".operation", 0)   # equal
+        cmds.setAttr(cond + ".colorIfTrueR", 1)
+        cmds.setAttr(cond + ".colorIfFalseR", 0)
+        cmds.connectAttr(f"{host_ctl}.{attr_name}", cond + ".firstTerm",
+                          f=True)
+        cmds.connectAttr(cond + ".outColorR", f"{pc}.{wa}", f=True)
+    print(f"[{_PACKAGE}] parent switch {host_ctl}.{attr_name} → "
+          f"{target_npo}  targets={[d for _n, d in valid]}")
+    return pc
+
+
+def _detect_hip_joint():
+    """mapping data から Hips 判定 or 命名 heuristic で 探す。"""
+    # mapping data
+    if cmds.objExists("attach_ctrls_grp") \
+            and cmds.attributeQuery("mappingJson", node="attach_ctrls_grp",
+                                      exists=True):
+        try:
+            import json
+            m = json.loads(cmds.getAttr("attach_ctrls_grp.mappingJson") or "{}")
+            fixed = m.get("fixed", m)
+            leg_L = fixed.get("leg_L") or []
+            if leg_L:
+                # leg[0] = UpLeg、その parent が Hip
+                if cmds.objExists(leg_L[0]):
+                    p = cmds.listRelatives(leg_L[0], p=True, type="joint") or []
+                    if p:
+                        return p[0]
+        except Exception:
+            pass
+    # heuristic
+    for cand in ("Hips", "Hip", "pelvis", "Pelvis"):
+        if cmds.objExists(cand):
+            return cand
+    return None
+
+
+def apply_leg_parent_switch(sides=("L", "R"), targets=None):
+    """v0.9.43: leg_{L|R}_UI_ctl に ikRef / pvRef enum attr 追加、
+    leg_{L|R}_IK_npo と _PV_npo を targets 群に parentConstraint 切替。
+
+    Args:
+        sides: 対象 side list
+        targets: [(node, display), ...] default は mGear-style
+                 world / root / hip
+    """
+    world_loc = _ensure_world_ref_locator()
+    hip = _detect_hip_joint()
+    if targets is None:
+        candidates = [
+            (world_loc, "world"),
+            ("main_ctl", "root"),
+        ]
+        if hip:
+            candidates.append((hip, "hip"))
+        targets = candidates
+
+    n = 0
+    for side in sides:
+        host = f"leg_{side}_UI_ctl"
+        ik_npo = f"leg_{side}_IK_npo"
+        pv_npo = f"leg_{side}_PV_npo"
+        if not cmds.objExists(host):
+            cmds.warning(f"[{_PACKAGE}] {host} 未生成、skip")
+            continue
+        if cmds.objExists(ik_npo):
+            add_parent_switch(host, ik_npo, targets,
+                                attr_name="ikRef", default_index=1)
+            n += 1
+        if cmds.objExists(pv_npo):
+            add_parent_switch(host, pv_npo, targets,
+                                attr_name="pvRef", default_index=1)
+            n += 1
+    print(f"[{_PACKAGE}] apply_leg_parent_switch: {n} parent switch created")
+    return n
+
+
+def apply_arm_parent_switch(sides=("L", "R"), targets=None):
+    """v0.9.43: arm 用 (leg と同構造、chest joint を hip の代わりに)。"""
+    world_loc = _ensure_world_ref_locator()
+    # arm は chest / spine 上部 を追従先候補に
+    chest = None
+    for cand in ("Spine2", "Spine1", "Spine", "chest"):
+        if cmds.objExists(cand):
+            chest = cand
+            break
+    if targets is None:
+        candidates = [(world_loc, "world"), ("main_ctl", "root")]
+        if chest:
+            candidates.append((chest, "chest"))
+        targets = candidates
+
+    n = 0
+    for side in sides:
+        host = f"arm_{side}_UI_ctl"
+        ik_npo = f"arm_{side}_IK_npo"
+        pv_npo = f"arm_{side}_PV_npo"
+        if not cmds.objExists(host):
+            continue
+        if cmds.objExists(ik_npo):
+            add_parent_switch(host, ik_npo, targets,
+                                attr_name="ikRef", default_index=1)
+            n += 1
+        if cmds.objExists(pv_npo):
+            add_parent_switch(host, pv_npo, targets,
+                                attr_name="pvRef", default_index=1)
+            n += 1
+    print(f"[{_PACKAGE}] apply_arm_parent_switch: {n} parent switch created")
+    return n
+
+
+def apply_all_parent_switches():
+    """全 arm / leg IK & PV の parent switch を まとめてセットアップ。"""
+    n1 = apply_leg_parent_switch()
+    n2 = apply_arm_parent_switch()
+    print(f"[{_PACKAGE}] apply_all_parent_switches: total {n1+n2} switches")
+    return n1 + n2
+
+
 def fix_ik_follow_root(target_ctl=None):
     """v0.9.42: 既存 setup の IK/PV/UI npo を main_ctl (or world_ctl) 追従に。
 
@@ -3665,6 +3869,12 @@ def full_auto_setup(scale=1.0, skip_decoration=True, delete_junk=True,
             setup_twist_wiring()
         except Exception as _tw_exc:
             cmds.warning(f"[attach_ctrls] twist wiring failed (continue): {_tw_exc}")
+
+        # v0.9.43 Step 9: parent switch (mGear-style) を IK/PV に付ける
+        try:
+            apply_all_parent_switches()
+        except Exception as _ps_exc:
+            cmds.warning(f"[attach_ctrls] parent switch setup failed (continue): {_ps_exc}")
 
         print(f"[{_PACKAGE}] === full_auto_setup complete ===")
         print(f"  FK ctls attached: {len(attach_result)}")
