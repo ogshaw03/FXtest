@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.60"
+__version__ = "0.9.61"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3647,16 +3647,18 @@ def fix_reverse_foot(sides=("L", "R"), mapping=None):
 
 
 def unlock_reverse_foot_pivots(sides=("L", "R"), mapping=None):
-    """v0.9.60: reverse foot pivot ctl の translate を編集可能にする。
+    """v0.9.60/61: reverse foot pivot ctl を独立配置可能な編集モードに。
 
     workflow (B: viewport で動かして確定):
       1. `unlock_reverse_foot_pivots()` を呼ぶ
-      2. viewport で heel/tip/ball ctl を掴んで 好きな位置に移動
-      3. `commit_reverse_foot_pivots()` で 確定 (位置固定 + 再ロック)
+      2. viewport で heel/tip/ball ctl を個別に掴んで 好きな位置に移動
+      3. `commit_reverse_foot_pivots()` で 確定 (階層復元 + 再ロック)
 
-    内部: heel/tip/ball の tx/ty/tz を unlock + 表示、
-    foot IK handle は 一時的に leg_IK_ctl 直下に退避 (現 world 保持)
-    → ball_ctl を動かしても leg が引きずられない。
+    v0.9.61: heel/tip/ball を「独立配置」できるように pivRoot 下のフラット
+    構造に一時展開。従来は heel→tip→ball の chain だったので heel 動かすと
+    tip/ball が引きずられていた (user 実害報告)。
+    さらに rfToeIkh も tip_ctl → leg_IK_ctl 直下に退避、foot_ikh も同様に
+    退避 → 編集中は 骨が一切追従しない。
     """
     if mapping is None:
         mapping = _resolve_leg_mapping()
@@ -3664,36 +3666,50 @@ def unlock_reverse_foot_pivots(sides=("L", "R"), mapping=None):
     for side in sides:
         ankle = _resolve_ankle_from_mapping(side, mapping)
         if not ankle: continue
-        ik_ctl = f"leg_{side}_IK_ctl"
+        ik_ctl   = f"leg_{side}_IK_ctl"
+        piv_root = ankle + "_pivRoot"
         foot_ikh = f"leg_{side}_ikh"
+        rf_ikh   = ankle + "_rfToeIkh"
+        # 1. heel/tip/ball を chain → フラット (pivRoot 直下) に展開
+        target_parent = piv_root if cmds.objExists(piv_root) else ik_ctl
+        if not cmds.objExists(target_parent):
+            print(f"  {side}: pivRoot/ik_ctl 無し、skip"); continue
         for suf in ("_heel_ctl", "_tip_ctl", "_ball_ctl"):
             piv = ankle + suf
             if not cmds.objExists(piv): continue
+            cur_p = cmds.listRelatives(piv, p=True) or [None]
+            if cur_p[0] != target_parent:
+                try:
+                    cmds.parent(piv, target_parent)  # world 保持
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] {piv} unparent: {exc}")
             for a in ("tx","ty","tz"):
                 try:
                     cmds.setAttr(f"{piv}.{a}", lock=False, keyable=True,
                                   channelBox=True)
                 except Exception: pass
-        # foot ikh を一時退避 (world 保持)
-        if cmds.objExists(foot_ikh) and cmds.objExists(ik_ctl):
-            cur_parent = cmds.listRelatives(foot_ikh, p=True) or [None]
-            if cur_parent[0] != ik_ctl:
-                try:
-                    cmds.parent(foot_ikh, ik_ctl)  # world 保持で退避
-                    print(f"  {side}: {foot_ikh} を {ik_ctl} 直下に退避")
-                except Exception as exc:
-                    cmds.warning(f"[{_PACKAGE}] ikh 退避 {exc}")
+        # 2. IK handles を 全部 ik_ctl 直下に退避 (骨を凍結)
+        for h in (foot_ikh, rf_ikh):
+            if cmds.objExists(h) and cmds.objExists(ik_ctl):
+                cur = cmds.listRelatives(h, p=True) or [None]
+                if cur[0] != ik_ctl:
+                    try:
+                        cmds.parent(h, ik_ctl)
+                        print(f"  {side}: {h} を {ik_ctl} 直下に退避")
+                    except Exception as exc:
+                        cmds.warning(f"[{_PACKAGE}] {h}: {exc}")
         n += 1
     print(f"[{_PACKAGE}] unlock_reverse_foot_pivots: {n} side 編集可能\n"
-          f"  → viewport で pivot ctl を移動 → commit_reverse_foot_pivots() で確定")
+          f"  → viewport で heel/tip/ball_ctl を独立に移動 → "
+          f"commit_reverse_foot_pivots() で確定")
     return n
 
 
 def commit_reverse_foot_pivots(sides=("L", "R"), mapping=None):
-    """v0.9.60: unlock 後の viewport 移動を確定 (再 lock + ikh 再アタッチ)。
+    """v0.9.60/61: unlock 後の viewport 移動を確定。
 
-    unlock_reverse_foot_pivots() で移動可能にした pivot ctl の現位置を
-    確定し、foot IK handle を ball_ctl 下に戻して 再度 translate lock する。
+    heel/tip/ball を chain 構造 (heel → tip → ball) に再組成、IK handles を
+    tip_ctl / ball_ctl 下に戻し、translate を再 lock。world 位置は全て保持。
     """
     if mapping is None:
         mapping = _resolve_leg_mapping()
@@ -3701,20 +3717,39 @@ def commit_reverse_foot_pivots(sides=("L", "R"), mapping=None):
     for side in sides:
         ankle = _resolve_ankle_from_mapping(side, mapping)
         if not ankle: continue
+        heel = ankle + "_heel_ctl"
+        tip  = ankle + "_tip_ctl"
         ball = ankle + "_ball_ctl"
         foot_ikh = f"leg_{side}_ikh"
-        # foot ikh を ball_ctl 下に戻す (world 保持)
-        if cmds.objExists(foot_ikh) and cmds.objExists(ball):
-            cur_parent = cmds.listRelatives(foot_ikh, p=True) or [None]
-            if cur_parent[0] != ball:
-                try:
-                    cmds.parent(foot_ikh, ball)
-                    print(f"  {side}: {foot_ikh} を {ball} 下に復帰")
+        rf_ikh   = ankle + "_rfToeIkh"
+        # 1. heel → tip → ball に再階層化 (world 保持)
+        if cmds.objExists(heel) and cmds.objExists(tip):
+            cur = cmds.listRelatives(tip, p=True) or [None]
+            if cur[0] != heel:
+                try: cmds.parent(tip, heel)
                 except Exception as exc:
-                    cmds.warning(f"[{_PACKAGE}] ikh 復帰 {exc}")
-        # heel/tip/ball の tx/ty/tz を再 lock
-        for suf in ("_heel_ctl", "_tip_ctl", "_ball_ctl"):
-            piv = ankle + suf
+                    cmds.warning(f"[{_PACKAGE}] tip→heel: {exc}")
+        if cmds.objExists(tip) and cmds.objExists(ball):
+            cur = cmds.listRelatives(ball, p=True) or [None]
+            if cur[0] != tip:
+                try: cmds.parent(ball, tip)
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] ball→tip: {exc}")
+        # 2. foot ikh を ball 下に、rfToeIkh を tip 下に戻す
+        if cmds.objExists(foot_ikh) and cmds.objExists(ball):
+            cur = cmds.listRelatives(foot_ikh, p=True) or [None]
+            if cur[0] != ball:
+                try: cmds.parent(foot_ikh, ball)
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] foot_ikh→ball: {exc}")
+        if cmds.objExists(rf_ikh) and cmds.objExists(tip):
+            cur = cmds.listRelatives(rf_ikh, p=True) or [None]
+            if cur[0] != tip:
+                try: cmds.parent(rf_ikh, tip)
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] rf_ikh→tip: {exc}")
+        # 3. translate 再 lock
+        for piv in (heel, tip, ball):
             if not cmds.objExists(piv): continue
             for a in ("tx","ty","tz"):
                 try:
