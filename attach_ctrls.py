@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.61"
+__version__ = "0.9.62"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3674,6 +3674,18 @@ def unlock_reverse_foot_pivots(sides=("L", "R"), mapping=None):
         target_parent = piv_root if cmds.objExists(piv_root) else ik_ctl
         if not cmds.objExists(target_parent):
             print(f"  {side}: pivRoot/ik_ctl 無し、skip"); continue
+        # v0.9.62: parent より **先に** unlock。lock されたまま reparent すると
+        # cmds.parent の world 保持補正が tx/ty/tz に書けず、pivot が新 parent
+        # の原点にワープする (user 実害: 「編集モードに入ると足が変な所に飛ぶ」)。
+        for suf in ("_heel_ctl", "_tip_ctl", "_ball_ctl"):
+            piv = ankle + suf
+            if not cmds.objExists(piv): continue
+            for a in ("tx","ty","tz"):
+                try:
+                    cmds.setAttr(f"{piv}.{a}", lock=False, keyable=True,
+                                  channelBox=True)
+                except Exception: pass
+        # reparent は unlock 完了後 (world 位置保持)
         for suf in ("_heel_ctl", "_tip_ctl", "_ball_ctl"):
             piv = ankle + suf
             if not cmds.objExists(piv): continue
@@ -3683,11 +3695,6 @@ def unlock_reverse_foot_pivots(sides=("L", "R"), mapping=None):
                     cmds.parent(piv, target_parent)  # world 保持
                 except Exception as exc:
                     cmds.warning(f"[{_PACKAGE}] {piv} unparent: {exc}")
-            for a in ("tx","ty","tz"):
-                try:
-                    cmds.setAttr(f"{piv}.{a}", lock=False, keyable=True,
-                                  channelBox=True)
-                except Exception: pass
         # 2. IK handles を 全部 ik_ctl 直下に退避 (骨を凍結)
         for h in (foot_ikh, rf_ikh):
             if cmds.objExists(h) and cmds.objExists(ik_ctl):
