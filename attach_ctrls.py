@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.57"
+__version__ = "0.9.58"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2134,8 +2134,82 @@ def _find_toe_joint(ankle_joint):
     for k in kids:
         if valid(k):
             return k
-    # 最後の手段
+    # 最後の手段: _end joint でも許容
     return kids[0]
+
+
+def _create_dummy_toe_joint(ankle_joint):
+    """v0.9.58: ankle の 子に toe joint 無いモデル (MMD 系一部) 用、
+    dummy toe joint を ankle 直下に作成。 位置は mesh bbox の 足元 前方 で推定。
+    skinCluster に は追加しない (見た目 rig 用のみ)。
+
+    Returns: 生成した dummy toe joint name (or None on failure)
+    """
+    if not cmds.objExists(ankle_joint):
+        return None
+    # 既存 dummy が有れば return
+    dummy_name = ankle_joint + "_dummyToe"
+    if cmds.objExists(dummy_name):
+        return dummy_name
+    ankle_pos = cmds.xform(ankle_joint, q=True, ws=True, t=True)
+
+    # 足の 前方向 と 長さ を推定:
+    #   前方向: character が +Z 向きの標準想定 (mesh から改善可)
+    #   長さ:   ankle → mesh bbox の 最前面 距離 (X/Z 平面での 最遠 mesh vertex)
+    forward = [0, 0, 1]   # default +Z
+    foot_len = 2.0        # default fallback
+    ground_y = 0.0
+    try:
+        # ankle が skin する mesh 全体 の bbox
+        skins = cmds.listConnections(ankle_joint + ".worldMatrix[0]",
+                                        s=False, d=True,
+                                        type="skinCluster") or []
+        mesh_transforms = set()
+        for sc in skins:
+            outs = cmds.listConnections(sc + ".outputGeometry",
+                                          s=False, d=True) or []
+            for o in outs:
+                p = cmds.listRelatives(o, p=True) or []
+                if p: mesh_transforms.add(p[0])
+        if not mesh_transforms:
+            # fallback: scene 全 mesh
+            for m in cmds.ls(type="mesh") or []:
+                p = cmds.listRelatives(m, p=True) or []
+                if p: mesh_transforms.add(p[0])
+        if mesh_transforms:
+            bb = cmds.exactWorldBoundingBox(list(mesh_transforms))
+            ground_y = bb[1]
+            # +Z 方向 の bbox 最前面 と ankle の Z 差 = foot 長さ 推定
+            front_z = bb[5]
+            back_z = bb[2]
+            # ankle が back に近ければ forward = +Z、front に近ければ -Z
+            if abs(front_z - ankle_pos[2]) > abs(back_z - ankle_pos[2]):
+                forward = [0, 0, 1]
+                foot_len = max(1.0, abs(front_z - ankle_pos[2]) * 0.4)
+            else:
+                forward = [0, 0, -1]
+                foot_len = max(1.0, abs(back_z - ankle_pos[2]) * 0.4)
+    except Exception as exc:
+        cmds.warning(f"[{_PACKAGE}] dummy toe 推定 fallback: {exc}")
+
+    dummy_pos = (ankle_pos[0] + forward[0] * foot_len,
+                 ground_y,   # 地面 高さ
+                 ankle_pos[2] + forward[2] * foot_len)
+    try:
+        cmds.select(ankle_joint, r=True)
+        dummy = cmds.joint(n=dummy_name, p=dummy_pos)
+        # skinCluster に含めない (影響を与えない)、描画も控えめ
+        try:
+            cmds.setAttr(dummy + ".radius", 0.02)
+            cmds.setAttr(dummy + ".drawStyle", 2)
+        except Exception:
+            pass
+        print(f"[{_PACKAGE}] created dummy toe {dummy} at {dummy_pos} "
+              f"(no toe child under {ankle_joint})")
+        return dummy
+    except Exception as exc:
+        cmds.warning(f"[{_PACKAGE}] dummy toe 生成失敗: {exc}")
+        return None
 
 
 def _create_rfoot_bones(ankle_joint, landmarks):
@@ -2204,8 +2278,13 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     """
     toe_joint = _find_toe_joint(ankle_joint)
     if toe_joint is None:
-        cmds.warning(f"[{_PACKAGE}] setup_reverse_foot: no toe child under {ankle_joint}")
-        return None
+        # v0.9.58: toe child 無いモデル (MMD 一部) → dummy toe を作って続行
+        toe_joint = _create_dummy_toe_joint(ankle_joint)
+        if toe_joint is None:
+            cmds.warning(f"[{_PACKAGE}] setup_reverse_foot: no toe child + "
+                         f"dummy 生成 失敗 for {ankle_joint}")
+            return None
+        print(f"[{_PACKAGE}] setup_reverse_foot: using dummy toe {toe_joint}")
 
     ankle_pos = cmds.xform(ankle_joint, q=True, ws=True, t=True)
     toe_pos = cmds.xform(toe_joint, q=True, ws=True, t=True)
@@ -3479,6 +3558,72 @@ def _ui_organize_outliner(*_):
         cmds.warning(f"[{_PACKAGE}] organize_outliner エラー: {exc}")
         return
     print(f"[{_PACKAGE}] === {n} node(s) 整理完了 ===")
+
+
+def fix_reverse_foot(sides=("L", "R"), mapping=None):
+    """v0.9.58: 既存 IK 済み scene で reverse foot を後付け (or 再構築)。
+
+    実 rig の情報から:
+      - ankle joint = mapping / heuristic で検出
+      - IK ctl / IK handle = `leg_L_IK_ctl` / `leg_L_ikh` 命名から
+    setup_reverse_foot を単独呼出。 toe child 無ければ dummy 自動生成。
+
+    Returns: 追加した reverse foot rig 数
+    """
+    if mapping is None:
+        # scene attr から
+        if cmds.objExists("attach_ctrls_grp") \
+                and cmds.attributeQuery("mappingJson", node="attach_ctrls_grp",
+                                          exists=True):
+            try:
+                import json
+                m = json.loads(cmds.getAttr("attach_ctrls_grp.mappingJson") or "{}")
+                mapping = m.get("fixed", m)
+            except Exception:
+                mapping = {}
+        else:
+            mapping = {}
+
+    n = 0
+    for side in sides:
+        label = f"leg_{side}"
+        ik_ctl = f"{label}_IK_ctl"
+        ikh    = f"{label}_ikh"
+        if not (cmds.objExists(ik_ctl) and cmds.objExists(ikh)):
+            cmds.warning(f"[{_PACKAGE}] {ik_ctl} / {ikh} 未生成、skip")
+            continue
+        # ankle 検出
+        leg_chain = mapping.get(label) or []
+        ankle = None
+        if len(leg_chain) >= 3 and cmds.objExists(leg_chain[2]):
+            ankle = leg_chain[2]
+        else:
+            # heuristic
+            for cand in (f"{'Left' if side == 'L' else 'Right'}Foot",
+                          f"{'Left' if side == 'L' else 'Right'}Ankle",
+                          f"foot_{side}", f"ankle_{side}"):
+                if cmds.objExists(cand):
+                    ankle = cand
+                    break
+        if not ankle:
+            cmds.warning(f"[{_PACKAGE}] ankle joint 検出失敗 for {label}")
+            continue
+        # 既存 reverse foot 有れば skip (or 削除)
+        heel_ctl_name = ankle + "_heel_ctl"
+        if cmds.objExists(heel_ctl_name):
+            print(f"  {ankle}: 既に heel_ctl 有り、skip (削除して再実行なら "
+                  f"手動で {heel_ctl_name} 群削除)")
+            continue
+        try:
+            rf = setup_reverse_foot(ankle, ik_ctl, ikh, side=side)
+            if rf:
+                n += 1
+                print(f"  {label}: reverse foot 作成 → ankle={ankle}")
+        except Exception as exc:
+            import traceback; traceback.print_exc()
+            cmds.warning(f"[{_PACKAGE}] {label} setup_reverse_foot: {exc}")
+    print(f"[{_PACKAGE}] fix_reverse_foot: {n} side(s) 追加/再構築")
+    return n
 
 
 def fix_ik_follow_root(target_ctl=None):
