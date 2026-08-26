@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.59"
+__version__ = "0.9.60"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -3644,6 +3644,114 @@ def fix_reverse_foot(sides=("L", "R"), mapping=None):
             cmds.warning(f"[{_PACKAGE}] {label} setup_reverse_foot: {exc}")
     print(f"[{_PACKAGE}] fix_reverse_foot: {n} side(s) 追加/再構築")
     return n
+
+
+def unlock_reverse_foot_pivots(sides=("L", "R"), mapping=None):
+    """v0.9.60: reverse foot pivot ctl の translate を編集可能にする。
+
+    workflow (B: viewport で動かして確定):
+      1. `unlock_reverse_foot_pivots()` を呼ぶ
+      2. viewport で heel/tip/ball ctl を掴んで 好きな位置に移動
+      3. `commit_reverse_foot_pivots()` で 確定 (位置固定 + 再ロック)
+
+    内部: heel/tip/ball の tx/ty/tz を unlock + 表示、
+    foot IK handle は 一時的に leg_IK_ctl 直下に退避 (現 world 保持)
+    → ball_ctl を動かしても leg が引きずられない。
+    """
+    if mapping is None:
+        mapping = _resolve_leg_mapping()
+    n = 0
+    for side in sides:
+        ankle = _resolve_ankle_from_mapping(side, mapping)
+        if not ankle: continue
+        ik_ctl = f"leg_{side}_IK_ctl"
+        foot_ikh = f"leg_{side}_ikh"
+        for suf in ("_heel_ctl", "_tip_ctl", "_ball_ctl"):
+            piv = ankle + suf
+            if not cmds.objExists(piv): continue
+            for a in ("tx","ty","tz"):
+                try:
+                    cmds.setAttr(f"{piv}.{a}", lock=False, keyable=True,
+                                  channelBox=True)
+                except Exception: pass
+        # foot ikh を一時退避 (world 保持)
+        if cmds.objExists(foot_ikh) and cmds.objExists(ik_ctl):
+            cur_parent = cmds.listRelatives(foot_ikh, p=True) or [None]
+            if cur_parent[0] != ik_ctl:
+                try:
+                    cmds.parent(foot_ikh, ik_ctl)  # world 保持で退避
+                    print(f"  {side}: {foot_ikh} を {ik_ctl} 直下に退避")
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] ikh 退避 {exc}")
+        n += 1
+    print(f"[{_PACKAGE}] unlock_reverse_foot_pivots: {n} side 編集可能\n"
+          f"  → viewport で pivot ctl を移動 → commit_reverse_foot_pivots() で確定")
+    return n
+
+
+def commit_reverse_foot_pivots(sides=("L", "R"), mapping=None):
+    """v0.9.60: unlock 後の viewport 移動を確定 (再 lock + ikh 再アタッチ)。
+
+    unlock_reverse_foot_pivots() で移動可能にした pivot ctl の現位置を
+    確定し、foot IK handle を ball_ctl 下に戻して 再度 translate lock する。
+    """
+    if mapping is None:
+        mapping = _resolve_leg_mapping()
+    n = 0
+    for side in sides:
+        ankle = _resolve_ankle_from_mapping(side, mapping)
+        if not ankle: continue
+        ball = ankle + "_ball_ctl"
+        foot_ikh = f"leg_{side}_ikh"
+        # foot ikh を ball_ctl 下に戻す (world 保持)
+        if cmds.objExists(foot_ikh) and cmds.objExists(ball):
+            cur_parent = cmds.listRelatives(foot_ikh, p=True) or [None]
+            if cur_parent[0] != ball:
+                try:
+                    cmds.parent(foot_ikh, ball)
+                    print(f"  {side}: {foot_ikh} を {ball} 下に復帰")
+                except Exception as exc:
+                    cmds.warning(f"[{_PACKAGE}] ikh 復帰 {exc}")
+        # heel/tip/ball の tx/ty/tz を再 lock
+        for suf in ("_heel_ctl", "_tip_ctl", "_ball_ctl"):
+            piv = ankle + suf
+            if not cmds.objExists(piv): continue
+            for a in ("tx","ty","tz"):
+                try:
+                    cmds.setAttr(f"{piv}.{a}", lock=True, keyable=False,
+                                  channelBox=False)
+                except Exception: pass
+        n += 1
+    print(f"[{_PACKAGE}] commit_reverse_foot_pivots: {n} side 確定")
+    return n
+
+
+def _resolve_leg_mapping():
+    """attach_ctrls_grp.mappingJson から fixed mapping dict を取り出す。"""
+    m = {}
+    if cmds.objExists("attach_ctrls_grp") \
+            and cmds.attributeQuery("mappingJson", node="attach_ctrls_grp",
+                                      exists=True):
+        try:
+            import json
+            data = json.loads(cmds.getAttr("attach_ctrls_grp.mappingJson") or "{}")
+            m = data.get("fixed", data)
+        except Exception: pass
+    return m
+
+
+def _resolve_ankle_from_mapping(side, mapping):
+    """side (L/R) と mapping dict から ankle joint 名を返す (heuristic 込み)。"""
+    label = f"leg_{side}"
+    leg_chain = mapping.get(label) or []
+    if len(leg_chain) >= 3 and cmds.objExists(leg_chain[2]):
+        return leg_chain[2]
+    for cand in (f"{'Left' if side == 'L' else 'Right'}Foot",
+                  f"{'Left' if side == 'L' else 'Right'}Ankle",
+                  f"foot_{side}", f"ankle_{side}"):
+        if cmds.objExists(cand):
+            return cand
+    return None
 
 
 def fix_reverse_foot_orient(sides=("L", "R"), mapping=None):
