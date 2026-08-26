@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.35"
+__version__ = "0.5.36"
 
 
 def _cleanup_mcd_junk_inline():
@@ -2237,6 +2237,41 @@ def is_chain_active(chain):
     """v0.3.0: root FK ctl があれば active とみなす (spline IK も併存)。"""
     return cmds.objExists(_fk_ctl_name(chain[0])) \
         or cmds.objExists(_ik_handle_name(chain))
+
+
+def hide_all_sim_nodes():
+    """v0.5.36: jiggle_bones sim infra を viewport から非表示。
+
+    対象 (シーン全体):
+      - hairSystem / nucleus (transform)
+      - follicle transform
+      - dyn / rest curves (jb_dyn_*/jb_rest_*)
+      - cluster handles (jb_clu_*)
+      - jiggle 用 SplineIK handle (jb_ikh_*)
+      - root offset group (jb_rootoff_*)
+    sim 機能は visibility に依存しないので UI 表示だけ消える。
+    """
+    n = 0
+    # 1. type ベース (hairSystem/nucleus/follicle) は transform 側を hide
+    for node_type in ("hairSystem", "nucleus", "follicle"):
+        for shp in cmds.ls(type=node_type) or []:
+            xf = cmds.listRelatives(shp, p=True, f=True) or []
+            for x in xf:
+                try:
+                    cmds.setAttr(f"{x}.visibility", 0); n += 1
+                except Exception: pass
+    # 2. jb_* 命名の追加候補 (curve / cluster / ikh / rootoff)
+    for pat in ("jb_dyn_*", "jb_rest_*", "jb_clu_*", "jb_ikh_*",
+                 "jb_rootoff_*", "jb_hs_*", "jb_foll_*"):
+        for node in cmds.ls(pat) or []:
+            if not cmds.attributeQuery("visibility", node=node,
+                                         exists=True):
+                continue
+            try:
+                cmds.setAttr(f"{node}.visibility", 0); n += 1
+            except Exception: pass
+    print(f"[jiggle_bones] hide_all_sim_nodes: {n} 個 非表示")
+    return n
 
 
 def fix_spline_ik_self_refs(dry_run=False):
