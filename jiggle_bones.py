@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.34"
+__version__ = "0.5.35"
 
 
 def _cleanup_mcd_junk_inline():
@@ -992,14 +992,61 @@ def _add_follicle_to_hair_system(rest_curve, hs_shape, chain):
     return dyn_shape
 
 
-def _create_spline_ik(chain, dynamic_curve_shape):
+# v0.5.35: category → default up-ref joint 名。
+# SplineIK の dWorldUpMatrix / dWorldUpMatrixEnd は chain 内の joint (self)
+# を参照させると soft cycle が発生し、jointOrient の符号次第で発散して
+# NaN 爆発する (v0.5.0-0.5.34 の実害バグ)。chain 外の 上位 joint を
+# twist reference に使うことで cycle を切る。
+_CATEGORY_UP_REF = {
+    "ear":     ("Head", "head"),
+    "hair":    ("Head", "head"),
+    "ribbon":  ("Head", "head"),
+    "skirt":   ("Hips", "hips", "pelvis", "COG"),
+    "tail":    ("Hips", "hips", "pelvis", "COG"),
+    "sleeve":  ("Spine1", "spine1", "chest", "Spine"),
+    "necktie": ("Spine1", "spine1", "chest", "Neck", "Head"),
+    "coat":    ("Hips", "hips", "pelvis", "COG"),
+}
+
+
+def _resolve_up_ref(chain, category):
+    """chain 外の twist reference joint を決める (self-ref cycle 回避)。
+
+    優先順位:
+      1. category から MAP に沿って名前検索、最初に存在するもの
+      2. chain root の parent joint (chain 外)
+      3. 最終 fallback: chain[0] 自身 (旧挙動、cycle 覚悟)
+    """
+    if cmds is None:
+        return chain[0]
+    candidates = _CATEGORY_UP_REF.get(category, ()) if category else ()
+    for name in candidates:
+        if cmds.objExists(name):
+            return name
+    # chain root の parent (chain 外なら OK)
+    parent = cmds.listRelatives(chain[0], p=True, type="joint") or []
+    if parent and parent[0] not in chain:
+        return parent[0]
+    # 最終 fallback: cycle 覚悟の旧挙動
+    cmds.warning(
+        f"[jiggle_bones] {chain[0]}: up-ref joint 未検出、self-ref fallback "
+        f"(NaN 発散リスク有り、chain root の親 joint 命名を確認)")
+    return chain[0]
+
+
+def _create_spline_ik(chain, dynamic_curve_shape, up_ref=None, category=None):
     """chain (親→末端) に spline IK を張り、dynamic curve に追従させる。
 
     v0.4.7 記事準拠: ikHandle 作成後、明示的に
     `dynamic_curve.worldSpace[0] → ikHandle.inCurve` を再接続する。
-    Maya version によっては `.local` が接続され、follicle 変位が反映
-    されない可能性があるため。
+
+    v0.5.35: dWorldUpMatrix / dWorldUpMatrixEnd を chain 内 joint に繋ぐと
+    self-ref cycle → NaN 発散 (v0.5.0-34 の実害バグ)。up_ref (chain 外の
+    上位 joint、例: Head/Hips) の worldMatrix を twist ref にする。
+    up_ref 省略時は category から _resolve_up_ref で自動判定。
     """
+    if up_ref is None:
+        up_ref = _resolve_up_ref(chain, category)
     ikh_name = _ik_handle_name(chain)
     ret = cmds.ikHandle(
         sj=chain[0], ee=chain[-1],
@@ -1012,14 +1059,13 @@ def _create_spline_ik(chain, dynamic_curve_shape):
     _parent_to_jb(ikh)
 
     # v0.5.28: SplineIK advanced twist を完全設定。
-    # v0.5.14 は dTwistControlEnable + dForwardAxis のみ設定していたが、
     # dWorldUpType/dWorldUpAxis/dWorldUpMatrix が未設定だと solver が
     # default (Scene Up = world Y) を使う → 骨の実 orientation と不整合
     # → 90/180 度の twist が入る (user 報告 "骨が拗じられる"の原因)。
     #
     # 修正: dWorldUpType=4 (Object Rotation Up Start/End) を使い、
-    # start/end joint 自身の orientation を twist reference にする。
-    # これで joint の 実 local 軸 と 完全整合、余計な twist 無し。
+    # chain 外の上位 joint (up_ref) の orientation を twist reference に。
+    # v0.5.35: chain 内 self を ref にすると NaN 発散するため、必ず外部。
     aim = _current_setup_aim_axis or _DEFAULT_AIM_AXIS
     dfa = _AIM_AXIS_TO_DFA.get(aim, 0)
     # aim 軸に垂直な 軸を "up" として選ぶ:
@@ -1031,18 +1077,17 @@ def _create_spline_ik(chain, dynamic_curve_shape):
     try:
         cmds.setAttr(ikh + ".dTwistControlEnable", 1)
         cmds.setAttr(ikh + ".dForwardAxis", dfa)
-        # Object Rotation Up (Start/End) — start & end joint の orientation を
-        # twist 参照に (chain[0] と chain[-1] の worldMatrix を渡す)
+        # Object Rotation Up (Start/End) — up_ref の worldMatrix を start/end
+        # 両方に接続 (chain 外なので self-ref cycle 発生せず)
         cmds.setAttr(ikh + ".dWorldUpType", 4)
         cmds.setAttr(ikh + ".dWorldUpAxis", dwua)
-        # start / end joint の worldMatrix を connect
         try:
-            cmds.connectAttr(chain[0] + ".worldMatrix[0]",
+            cmds.connectAttr(up_ref + ".worldMatrix[0]",
                               ikh + ".dWorldUpMatrix", f=True)
         except Exception:
             pass
         try:
-            cmds.connectAttr(chain[-1] + ".worldMatrix[0]",
+            cmds.connectAttr(up_ref + ".worldMatrix[0]",
                               ikh + ".dWorldUpMatrixEnd", f=True)
         except Exception:
             pass
@@ -2048,7 +2093,9 @@ def create_jiggle_for_chain(chain, category=None, aim_axis=None):
     # ---- 5. SplineIK を ORIGINAL chain 直接に張る (v0.5.0 core、article verbatim) ----
     #    curve2.worldSpace[0] → ikHandle.inCurve
     #    → collision force が減衰なく直接 ORIGINAL rotate を駆動
-    ikh = _create_spline_ik(chain, dyn_shape)
+    #    v0.5.35: category を渡して up_ref (chain 外 joint) を自動選択、
+    #    NaN 発散 bug を防ぐ
+    ikh = _create_spline_ik(chain, dyn_shape, category=category)
 
     # ---- 6. dynBlend attr (legacy) + startCurveAttract を UI 直接制御に ----
     #    v0.5.5: v0.5.0-v0.5.4 の `dynBlend → reverse → startCurveAttract`
@@ -2190,6 +2237,90 @@ def is_chain_active(chain):
     """v0.3.0: root FK ctl があれば active とみなす (spline IK も併存)。"""
     return cmds.objExists(_fk_ctl_name(chain[0])) \
         or cmds.objExists(_ik_handle_name(chain))
+
+
+def fix_spline_ik_self_refs(dry_run=False):
+    """v0.5.35: 既存 scene 内 全 jb_ikh_* の SplineIK self-ref を修復。
+
+    v0.5.0-0.5.34 で作成された rig は dWorldUpMatrix / dWorldUpMatrixEnd を
+    chain 内 start/end joint に接続していた (self-ref)。この構成は
+    jointOrient の符号次第で solver が発散し NaN 爆発する 実害バグ。
+
+    本 API は 全 jb_ikh_* を走査し、category から up_ref (Head/Hips 等) を
+    自動判定して 接続を張り替える。
+
+    Args:
+        dry_run: True なら変更せず 検査のみ。
+
+    Returns:
+        修復件数 (dry_run=True でも 予定件数を返す)
+    """
+    if cmds is None:
+        return 0
+    fixed = 0
+    for ikh in cmds.ls("jb_ikh_*") or []:
+        if cmds.nodeType(ikh) != "ikHandle":
+            continue
+        try:
+            start = cmds.ikHandle(ikh, q=True, sj=True)
+        except Exception:
+            continue
+        if not start:
+            continue
+        # chain 収集 (start から末端まで一直線)
+        chain = [start]
+        cur = start
+        while True:
+            kids = cmds.listRelatives(cur, c=True, type="joint") or []
+            if len(kids) != 1:
+                break
+            chain.append(kids[0])
+            cur = kids[0]
+        # category 推定
+        category = _classify(start) or "hair"
+        # up_ref を確定
+        up_ref = _resolve_up_ref(chain, category)
+        if up_ref == start:
+            # fallback すら見つからない (parent が無い等) → skip
+            print(f"  [skip] {ikh}: up-ref 不明 (chain root parent 無し)")
+            continue
+        # 現接続確認
+        need_fix = False
+        for a in ("dWorldUpMatrix", "dWorldUpMatrixEnd"):
+            conns = cmds.listConnections(f"{ikh}.{a}", s=True, d=False,
+                                          p=True) or []
+            for c in conns:
+                src = c.split(".")[0]
+                if src in chain:
+                    need_fix = True
+                    break
+            if need_fix:
+                break
+        if not need_fix:
+            continue
+        # 修復
+        if dry_run:
+            print(f"  [would fix] {ikh}: → {up_ref}.worldMatrix")
+        else:
+            for a in ("dWorldUpMatrix", "dWorldUpMatrixEnd"):
+                conns = cmds.listConnections(f"{ikh}.{a}", s=True, d=False,
+                                              p=True) or []
+                for c in conns:
+                    try: cmds.disconnectAttr(c, f"{ikh}.{a}")
+                    except Exception: pass
+                try:
+                    cmds.connectAttr(f"{up_ref}.worldMatrix[0]",
+                                      f"{ikh}.{a}", f=True)
+                except Exception as exc:
+                    print(f"  [err] {ikh}.{a}: {exc}")
+            try: cmds.setAttr(f"{ikh}.dTwistControlEnable", 1)
+            except Exception: pass
+            print(f"  [fixed] {ikh}: → {up_ref}.worldMatrix "
+                  f"(category={category})")
+        fixed += 1
+    action = "would fix" if dry_run else "fixed"
+    print(f"[jiggle_bones] fix_spline_ik_self_refs: {fixed} {action}")
+    return fixed
 
 
 # =========================================================================
