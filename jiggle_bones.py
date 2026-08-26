@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.36"
+__version__ = "0.5.37"
 
 
 def _cleanup_mcd_junk_inline():
@@ -1074,23 +1074,35 @@ def _create_spline_ik(chain, dynamic_curve_shape, up_ref=None, category=None):
     #   aim=Z+ → up=X+ (dWorldUpAxis=2)
     up_axis_for_aim = {"X+": 0, "X-": 0, "Y+": 2, "Y-": 2, "Z+": 2, "Z-": 2}
     dwua = up_axis_for_aim.get(aim, 2)
+    # v0.5.37: 2-joint chain (start と end のみ、間 joint 無し) は twist の
+    # interpolation が定義できず、advanced twist を有効にすると solver が
+    # 「本来の jointOrient」と「参照から計算した twist」の差 (例 51°) を
+    # joint.rotate に書き込んでしまい 静止時に耳が変な向きになる (user 実害:
+    # 「耳のツイストがおかしい」)。2-joint chain では OFF が正解。
+    is_two_joint = len(chain) <= 2
     try:
-        cmds.setAttr(ikh + ".dTwistControlEnable", 1)
-        cmds.setAttr(ikh + ".dForwardAxis", dfa)
-        # Object Rotation Up (Start/End) — up_ref の worldMatrix を start/end
-        # 両方に接続 (chain 外なので self-ref cycle 発生せず)
-        cmds.setAttr(ikh + ".dWorldUpType", 4)
-        cmds.setAttr(ikh + ".dWorldUpAxis", dwua)
-        try:
-            cmds.connectAttr(up_ref + ".worldMatrix[0]",
-                              ikh + ".dWorldUpMatrix", f=True)
-        except Exception:
-            pass
-        try:
-            cmds.connectAttr(up_ref + ".worldMatrix[0]",
-                              ikh + ".dWorldUpMatrixEnd", f=True)
-        except Exception:
-            pass
+        if is_two_joint:
+            cmds.setAttr(ikh + ".dTwistControlEnable", 0)
+            for a in ("roll", "twist"):
+                try: cmds.setAttr(ikh + "." + a, 0)
+                except Exception: pass
+        else:
+            cmds.setAttr(ikh + ".dTwistControlEnable", 1)
+            cmds.setAttr(ikh + ".dForwardAxis", dfa)
+            # Object Rotation Up (Start/End) — up_ref の worldMatrix を start/end
+            # 両方に接続 (chain 外なので self-ref cycle 発生せず)
+            cmds.setAttr(ikh + ".dWorldUpType", 4)
+            cmds.setAttr(ikh + ".dWorldUpAxis", dwua)
+            try:
+                cmds.connectAttr(up_ref + ".worldMatrix[0]",
+                                  ikh + ".dWorldUpMatrix", f=True)
+            except Exception:
+                pass
+            try:
+                cmds.connectAttr(up_ref + ".worldMatrix[0]",
+                                  ikh + ".dWorldUpMatrixEnd", f=True)
+            except Exception:
+                pass
     except Exception as exc:
         cmds.warning(f"[jiggle_bones] spline IK advanced twist set failed: {exc}")
 
@@ -2237,6 +2249,38 @@ def is_chain_active(chain):
     """v0.3.0: root FK ctl があれば active とみなす (spline IK も併存)。"""
     return cmds.objExists(_fk_ctl_name(chain[0])) \
         or cmds.objExists(_ik_handle_name(chain))
+
+
+def fix_two_joint_twist():
+    """v0.5.37: 既存 scene 内の 2-joint chain (jb_ikh_*) の advanced twist を
+    無効化。2-joint chain は twist interpolation が定義できず、有効のままだと
+    solver が joint.rotate に twist error を書き込んで 静止時姿勢が崩れる。
+    """
+    n = 0
+    for ikh in cmds.ls("jb_ikh_*", type="ikHandle") or []:
+        try:
+            start = cmds.ikHandle(ikh, q=True, sj=True)
+            if not start: continue
+            # chain 収集
+            chain = [start]
+            cur = start
+            while True:
+                kids = cmds.listRelatives(cur, c=True, type="joint") or []
+                if len(kids) != 1: break
+                chain.append(kids[0]); cur = kids[0]
+            if len(chain) > 2:
+                continue   # 3+ joint は twist 有効のまま
+            # 2-joint: twist OFF
+            cmds.setAttr(f"{ikh}.dTwistControlEnable", 0)
+            for a in ("roll", "twist"):
+                try: cmds.setAttr(f"{ikh}.{a}", 0)
+                except Exception: pass
+            print(f"  [fixed] {ikh}: twist OFF (chain={chain})")
+            n += 1
+        except Exception as exc:
+            print(f"  [err] {ikh}: {exc}")
+    print(f"[jiggle_bones] fix_two_joint_twist: {n} 個 修復")
+    return n
 
 
 def hide_all_sim_nodes():
