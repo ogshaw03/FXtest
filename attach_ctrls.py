@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.62"
+__version__ = "0.9.63"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -1252,6 +1252,9 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None, label=None):
     # IK handle は attach_ctrls_grp 下に (元 chain 内に置かないほうが管理しやすい)
     try: cmds.parent(ik_handle, ROOT_GROUP)
     except Exception: pass
+    # v0.9.63: IK handle は viewport 汚しなので非表示 (機能は生きたまま)
+    try: cmds.setAttr(ik_handle + ".visibility", 0)
+    except Exception: pass
 
     # --- 3. IK ctl (end joint 位置) — 手/足 IK は水平 box shape ---
     is_leg = "leg" in label.lower()
@@ -2404,6 +2407,8 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
             toe_ikh = cmds.ikHandle(sj=rf_ball, ee=rf_toe,
                                     sol="ikSCsolver", n=label + "_rfToeIkh")[0]
             cmds.parent(toe_ikh, toe_piv)
+            try: cmds.setAttr(toe_ikh + ".visibility", 0)   # v0.9.63
+            except Exception: pass
             if cmds.objExists(toe_joint):
                 # v0.9.9-2 (AUDIT2 P0-C 回帰): 単純 orientConstraint 追加は
                 # `Object is already connected` で失敗、あるいは既存の rotate
@@ -2468,6 +2473,8 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
                 toe_ikh = cmds.ikHandle(sj=ankle_ik, ee=toe_ik,
                                         sol="ikSCsolver", n=label + "_toeIkh")[0]
                 cmds.parent(toe_ikh, toe_piv)
+                try: cmds.setAttr(toe_ikh + ".visibility", 0)   # v0.9.63
+                except Exception: pass
                 if cmds.objExists(toe_joint):
                     for con in (cmds.listConnections(toe_joint + ".translateX",
                                 s=True, d=False, type="constraint") or []):
@@ -3643,6 +3650,23 @@ def fix_reverse_foot(sides=("L", "R"), mapping=None):
             import traceback; traceback.print_exc()
             cmds.warning(f"[{_PACKAGE}] {label} setup_reverse_foot: {exc}")
     print(f"[{_PACKAGE}] fix_reverse_foot: {n} side(s) 追加/再構築")
+    return n
+
+
+def hide_all_ik_handles():
+    """v0.9.63: scene 内の 全 IK handle を非表示にする (機能は保持)。
+
+    ikHandle ノード の .visibility を 0 に。solver は visibility に依存せず
+    動くので UI 表示だけ消す。attach_ctrls / jiggle_bones 双方の handle を対象。
+    """
+    n = 0
+    for h in cmds.ls(type="ikHandle") or []:
+        try:
+            cmds.setAttr(f"{h}.visibility", 0)
+            n += 1
+        except Exception as exc:
+            print(f"  skip {h}: {exc}")
+    print(f"[{_PACKAGE}] hide_all_ik_handles: {n} 個 非表示")
     return n
 
 
