@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.58"
+__version__ = "0.9.59"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -2511,6 +2511,26 @@ def setup_reverse_foot(ankle_joint, foot_ik_ctl, foot_ikh, side="C"):
     # で translate だけロックしてあるので自由に触れる。
     # tip: heel/toe は主に rotateX、bank は heel の rotateZ で直感的に操作可。
 
+    # v0.9.59: ankle_ik の orientConstraint 参照を ik_ctl → ball_piv に付け替え。
+    # 標準 setup_ik_fk は `orientConstraint(ik_ctl, ankle_ik)` を張るため、
+    # tip/heel/ball の pivot chain が rotate されても ik_ctl は動かず、
+    # ankle_ik が回らない → ankle joint も回らない → 「爪先立ちにならない」
+    # (user 実害報告)。ball_piv は pivot chain の末端 = 各 pivot の合成 world
+    # 回転を保持するので、これを参照させれば heel/tip/ball のどれを回しても
+    # ankle が正しく tilt する。ik_ctl 自体の rotate も ball_piv が子孫として
+    # 継承するので、従来通り ik_ctl を回して足姿勢を制御することも可能。
+    ankle_ik = ankle_joint + "_ik"
+    old_oc = ankle_ik + "_ikctl_oc"
+    if cmds.objExists(ankle_ik):
+        if cmds.objExists(old_oc):
+            try: cmds.delete(old_oc)
+            except Exception: pass
+        try:
+            cmds.orientConstraint(ball_piv, ankle_ik, mo=True,
+                                   n=ankle_ik + "_rfoot_oc")
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] rfoot orient: {exc}")
+
     print(f"[{_PACKAGE}] Reverse foot: {ankle_joint} heel/ball/toe pivots "
           f"(direct rotate control, no UI attrs)")
     return {
@@ -3623,6 +3643,70 @@ def fix_reverse_foot(sides=("L", "R"), mapping=None):
             import traceback; traceback.print_exc()
             cmds.warning(f"[{_PACKAGE}] {label} setup_reverse_foot: {exc}")
     print(f"[{_PACKAGE}] fix_reverse_foot: {n} side(s) 追加/再構築")
+    return n
+
+
+def fix_reverse_foot_orient(sides=("L", "R"), mapping=None):
+    """v0.9.59: 既存 rig の ankle_ik orient 参照を ball_ctl に付け替え。
+
+    v0.9.58 以前 (含 fix_reverse_foot 経由で作成された rig) は
+    `orientConstraint(ik_ctl → ankle_ik)` のままなので、tip/heel/ball の
+    pivot chain を回しても ik_ctl は動かず ankle 姿勢が変わらない
+    (「爪先立ちしない」bug)。ball_piv を新参照にすることで pivot chain の
+    合成回転が ankle_ik → ankle joint と伝わる。
+    """
+    if mapping is None:
+        if cmds.objExists("attach_ctrls_grp") \
+                and cmds.attributeQuery("mappingJson", node="attach_ctrls_grp",
+                                          exists=True):
+            try:
+                import json
+                m = json.loads(cmds.getAttr("attach_ctrls_grp.mappingJson") or "{}")
+                mapping = m.get("fixed", m)
+            except Exception:
+                mapping = {}
+        else:
+            mapping = {}
+    n = 0
+    for side in sides:
+        label = f"leg_{side}"
+        # ankle 特定
+        leg_chain = mapping.get(label) or []
+        ankle = None
+        if len(leg_chain) >= 3 and cmds.objExists(leg_chain[2]):
+            ankle = leg_chain[2]
+        else:
+            for cand in (f"{'Left' if side == 'L' else 'Right'}Foot",
+                          f"{'Left' if side == 'L' else 'Right'}Ankle",
+                          f"foot_{side}", f"ankle_{side}"):
+                if cmds.objExists(cand):
+                    ankle = cand; break
+        if not ankle:
+            cmds.warning(f"[{_PACKAGE}] {label}: ankle 検出失敗、skip")
+            continue
+        ball  = ankle + "_ball_ctl"
+        ik_j  = ankle + "_ik"
+        old_oc = ik_j + "_ikctl_oc"
+        new_oc = ik_j + "_rfoot_oc"
+        if not (cmds.objExists(ball) and cmds.objExists(ik_j)):
+            print(f"  {label}: {ball} or {ik_j} 無し、skip")
+            continue
+        # 既に修復済みなら skip
+        if cmds.objExists(new_oc):
+            print(f"  {label}: 既に {new_oc} 有り、skip")
+            continue
+        # 旧 oc 削除
+        if cmds.objExists(old_oc):
+            try: cmds.delete(old_oc)
+            except Exception: pass
+        # 新 oc: ball_piv → ankle_ik
+        try:
+            cmds.orientConstraint(ball, ik_j, mo=True, n=new_oc)
+            print(f"  {label}: {new_oc} (ball={ball} → {ik_j})")
+            n += 1
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] {label} rfoot orient: {exc}")
+    print(f"[{_PACKAGE}] fix_reverse_foot_orient: {n} side(s) 修復")
     return n
 
 
