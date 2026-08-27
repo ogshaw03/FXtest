@@ -35,7 +35,7 @@ except ImportError:
     fbx_renamer = None  # type: ignore
 
 
-__version__ = "0.9.64"
+__version__ = "0.9.65"
 
 
 WINDOW = "attach_ctrlsWin"
@@ -1376,6 +1376,17 @@ def setup_ik_fk(start, mid, end, side="C", pv_offset=None, label=None):
     cmds.parent(fk_ctls[1][0], fk_ctls[0][1])
     cmds.parent(fk_ctls[2][0], fk_ctls[1][1])
     cmds.parent(fk_ctls[0][0], ROOT_GROUP)
+
+    # v0.9.65: root FK npo を chain[0] joint の parent (Hips / Shoulder 等) に
+    # parentConstraint。これがないと character animate 時 bone は動くが FK npo
+    # は attach_ctrls_grp 直下のままで 静止 → 「FK コントローラがキャラに
+    # ついてこない」実害バグ (user 報告)。orig_parent は line 1194 で捕捉済。
+    if orig_parent and cmds.objExists(orig_parent):
+        try:
+            cmds.parentConstraint(orig_parent, fk_ctls[0][0], mo=True,
+                                   n=fk_ctls[0][0] + "_char_pc")
+        except Exception as exc:
+            cmds.warning(f"[{_PACKAGE}] FK npo char follow {exc}")
 
     # --- 6. Switch attribute (UI host ctl に集約、mGear 慣習に合わせる) ---
     # UI host は wrist/ankle から少し離した目立つ位置に配置 (ユーザ意向:
@@ -3650,6 +3661,42 @@ def fix_reverse_foot(sides=("L", "R"), mapping=None):
             import traceback; traceback.print_exc()
             cmds.warning(f"[{_PACKAGE}] {label} setup_reverse_foot: {exc}")
     print(f"[{_PACKAGE}] fix_reverse_foot: {n} side(s) 追加/再構築")
+    return n
+
+
+def fix_fk_char_follow(mapping=None):
+    """v0.9.65: 既存 rig の FK ctl chain root npo に character bone
+    追従の parentConstraint を追加。
+
+    v0.9.64 以下の setup では root FK npo が attach_ctrls_grp 直下のまま
+    だったため、character animate 時 bone は動くが FK ctl は静止していた
+    (user 実害: 「FK 手足コントローラがキャラについてこない」)。
+
+    mapping が渡されなければ標準 (mixamo/mgear) 命名を仮定。
+    """
+    if mapping is None:
+        mapping = {
+            "LeftUpLeg_fk_npo":     "Hips",
+            "RightUpLeg_fk_npo":    "Hips",
+            "LeftUpperArm_fk_npo":  "LeftShoulder",
+            "RightUpperArm_fk_npo": "RightShoulder",
+        }
+    n = 0
+    for npo, bone in mapping.items():
+        if not (cmds.objExists(npo) and cmds.objExists(bone)):
+            print(f"  skip {npo} → {bone}: 存在しない"); continue
+        existing = cmds.listConnections(f"{npo}.translateX", s=True, d=False,
+                                         type="parentConstraint") or []
+        if existing:
+            print(f"  {npo}: 既に parentConstraint 有り、skip")
+            continue
+        try:
+            cmds.parentConstraint(bone, npo, mo=True, n=f"{npo}_char_pc")
+            print(f"  {npo}: → {bone}")
+            n += 1
+        except Exception as exc:
+            cmds.warning(f"  {npo}: {exc}")
+    print(f"[{_PACKAGE}] fix_fk_char_follow: {n} 個 追加")
     return n
 
 
