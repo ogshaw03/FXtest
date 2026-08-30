@@ -57,7 +57,7 @@ skip_decoration=True (default v0.9.33+) で除外される。本モジュール�
 import maya.cmds as cmds
 import maya.mel as mel
 
-__version__ = "0.5.37"
+__version__ = "0.5.38"
 
 
 def _cleanup_mcd_junk_inline():
@@ -121,6 +121,36 @@ def cleanup_mcd_junk():
 WINDOW = "jiggleBonesWin"
 JB_GROUP = "jiggle_bones_grp"
 NUCLEUS_NAME = "jb_nucleus"
+
+
+# v0.5.38: namespace-aware node lookup。 reference で読み込まれた rig は
+# `char1:jb_master_ctl` の形になり、bare name の cmds.objExists では見つから
+# ないため、 bare + `*:bare` の 2 パターンで検索して 最初に見つかったものを
+# 返すヘルパを 全 hardcoded 参照で経由する。
+def _ns_find(bare_name):
+    """bare name or namespace-prefixed の候補を返す。 無ければ bare を返す
+    (下位互換: 新規作成時に `cmds.group(n=...)` 等は bare で受ける想定)。"""
+    if cmds is None:
+        return bare_name
+    # 直接存在 (namespace 無し)
+    if cmds.objExists(bare_name):
+        return bare_name
+    # namespace 付き検索
+    found = cmds.ls("*:" + bare_name, "*:*:" + bare_name) or []
+    if found:
+        return found[0]
+    return bare_name
+
+
+def _ns_ls(pattern):
+    """pattern を bare と 任意 namespace 両方で ls。 結果は 重複排除して返す。"""
+    if cmds is None:
+        return []
+    r = set()
+    for p in (pattern, "*:" + pattern, "*:*:" + pattern):
+        for n in cmds.ls(p) or []:
+            r.add(n)
+    return list(r)
 
 # UI 表示用の日本語ラベル (API 用 identifier は英語のまま維持)
 _CATEGORY_JP = {
@@ -307,16 +337,31 @@ REGISTRY_ATTR = "chainRegistry"
 
 def _read_registry():
     import json
-    if not cmds.objExists(JB_GROUP):
+    # v0.5.38: referenced rig の namespace 対応
+    grp = _ns_find(JB_GROUP)
+    if not cmds.objExists(grp):
         return []
-    if not cmds.attributeQuery(REGISTRY_ATTR, node=JB_GROUP, exists=True):
+    if not cmds.attributeQuery(REGISTRY_ATTR, node=grp, exists=True):
         return []
-    raw = cmds.getAttr(f"{JB_GROUP}.{REGISTRY_ATTR}") or ""
+    raw = cmds.getAttr(f"{grp}.{REGISTRY_ATTR}") or ""
     if not raw:
         return []
     try:
         data = json.loads(raw)
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        # v0.5.38: chain 内 joint 名も namespace-resolve (referenced 対応)
+        # 保存時は bare、read 時 に現 scene の実在名に置換
+        out = []
+        for e in data:
+            chain = e.get("chain") or []
+            resolved = [_ns_find(j) for j in chain]
+            # 少なくとも 1 個は 存在してること
+            if any(cmds.objExists(j) for j in resolved):
+                e2 = dict(e)
+                e2["chain"] = resolved
+                out.append(e2)
+        return out
     except Exception:
         return []
 
@@ -324,9 +369,10 @@ def _read_registry():
 def _write_registry(entries):
     import json
     _ensure_jb_group()
-    if not cmds.attributeQuery(REGISTRY_ATTR, node=JB_GROUP, exists=True):
-        cmds.addAttr(JB_GROUP, ln=REGISTRY_ATTR, dt="string")
-    cmds.setAttr(f"{JB_GROUP}.{REGISTRY_ATTR}",
+    grp = _ns_find(JB_GROUP)
+    if not cmds.attributeQuery(REGISTRY_ATTR, node=grp, exists=True):
+        cmds.addAttr(grp, ln=REGISTRY_ATTR, dt="string")
+    cmds.setAttr(f"{grp}.{REGISTRY_ATTR}",
                   json.dumps(entries, ensure_ascii=False, indent=2),
                   type="string")
 
@@ -443,16 +489,23 @@ def build_chain_from_selection():
 # =========================================================================
 
 def _ensure_jb_group():
-    if not cmds.objExists(JB_GROUP):
-        cmds.group(em=True, n=JB_GROUP, w=True)
+    # v0.5.38: namespace-aware — 参照 rig 内で既に存在すればそれを返す
+    existing = _ns_find(JB_GROUP)
+    if cmds.objExists(existing):
+        return existing
+    cmds.group(em=True, n=JB_GROUP, w=True)
     return JB_GROUP
 
 
 def _parent_to_jb(node):
     try:
+        grp = _ns_find(JB_GROUP)
         parents = cmds.listRelatives(node, p=True) or []
-        if not parents or parents[0] != JB_GROUP:
-            cmds.parent(node, JB_GROUP)
+        cur = parents[0] if parents else None
+        # 参照 rig の場合、fullPath 比較のため short name も含めて判定
+        cur_short = cur.split("|")[-1] if cur else None
+        if cur_short != grp.split("|")[-1]:
+            cmds.parent(node, grp)
     except Exception:
         pass
 
@@ -1785,8 +1838,10 @@ def create_or_get_master_ctl(position=None, size=None):
 
     Returns: master ctl transform 名
     """
-    if cmds.objExists(MASTER_CTL_NAME):
-        return MASTER_CTL_NAME
+    # v0.5.38: namespace-aware
+    existing = _ns_find(MASTER_CTL_NAME)
+    if cmds.objExists(existing):
+        return existing
 
     # size 決定
     if size is None:
@@ -1856,18 +1911,20 @@ def create_or_get_master_ctl(position=None, size=None):
 def _cleanup_unused_master_attrs():
     """v0.5.33: master に付いてる category attr のうち、該当 hairSystem が
     scene に無いものを削除。 keyframe 等 依存があれば削除失敗 → skip。"""
-    if not cmds.objExists(MASTER_CTL_NAME):
+    # v0.5.38: namespace-aware
+    master = _ns_find(MASTER_CTL_NAME)
+    if not cmds.objExists(master):
         return 0
     n = 0
     for cat in _JIGGLE_TOKENS.keys():
-        if not cmds.attributeQuery(cat, node=MASTER_CTL_NAME, exists=True):
+        if not cmds.attributeQuery(cat, node=master, exists=True):
             continue
         hs_list = _hair_systems_for_category(cat)
         if hs_list:
             continue   # 使ってるので keep
         try:
-            cmds.deleteAttr(f"{MASTER_CTL_NAME}.{cat}")
-            print(f"[jiggle_bones] removed unused attr {MASTER_CTL_NAME}.{cat}")
+            cmds.deleteAttr(f"{master}.{cat}")
+            print(f"[jiggle_bones] removed unused attr {master}.{cat}")
             n += 1
         except Exception:
             pass   # 依存あって削除できないなら skip
@@ -1875,22 +1932,24 @@ def _cleanup_unused_master_attrs():
 
 
 def _follicles_for_category(cat):
-    """category の 全 chain の follicle shape を返す (v0.5.34)。"""
+    """category の 全 chain の follicle shape を返す (v0.5.34)。
+    v0.5.38: fallback で namespace 付き follicle も拾う。"""
     out = []
     reg = get_registered_chains() or {}
     for chain in reg.get(cat, []):
         if not chain or not cmds.objExists(chain[0]):
             continue
-        f_xform = _follicle_name(chain)
+        f_xform = _ns_find(_follicle_name(chain))
         if cmds.objExists(f_xform):
             shapes = cmds.listRelatives(f_xform, s=True,
                                           type="follicle") or []
             if shapes:
                 out.append(shapes[0])
-    # fallback: 命名から拾う (registry と ズレてる時)
+    # fallback: 命名から拾う (registry と ズレてる時、namespace も対応)
     if not out:
-        for f in cmds.ls("jb_foll_*Shape", type="follicle") or []:
-            out.append(f)
+        for f in _ns_ls("jb_foll_*Shape"):
+            if cmds.nodeType(f) == "follicle":
+                out.append(f)
     return out
 
 
@@ -1906,7 +1965,9 @@ def wire_master_to_chains():
 
     加えて hairSystem.active も同 gate で driving (保険)。
     """
-    if not cmds.objExists(MASTER_CTL_NAME):
+    # v0.5.38: namespace-aware
+    master = _ns_find(MASTER_CTL_NAME)
+    if not cmds.objExists(master):
         cmds.warning(f"[jiggle_bones] {MASTER_CTL_NAME} 未生成、"
                      "create_or_get_master_ctl() を先に")
         return 0
@@ -1920,10 +1981,10 @@ def wire_master_to_chains():
         if not hs_list and not foll_list:
             continue
         # attr が無ければ動的追加
-        if not cmds.attributeQuery(cat, node=MASTER_CTL_NAME, exists=True):
+        if not cmds.attributeQuery(cat, node=master, exists=True):
             try:
-                cmds.addAttr(MASTER_CTL_NAME, ln=cat, at="bool", dv=1, k=True)
-                print(f"[jiggle_bones] added attr {MASTER_CTL_NAME}.{cat}")
+                cmds.addAttr(master, ln=cat, at="bool", dv=1, k=True)
+                print(f"[jiggle_bones] added attr {master}.{cat}")
             except Exception:
                 continue
 
@@ -1934,9 +1995,9 @@ def wire_master_to_chains():
             except: pass
         md = cmds.createNode("multiplyDivide", n=md_name)
         cmds.setAttr(md + ".operation", 1)
-        cmds.connectAttr(f"{MASTER_CTL_NAME}.allSim",
+        cmds.connectAttr(f"{master}.allSim",
                           md + ".input1X", f=True)
-        cmds.connectAttr(f"{MASTER_CTL_NAME}.{cat}",
+        cmds.connectAttr(f"{master}.{cat}",
                           md + ".input2X", f=True)
 
         # condition (product == 1 → 2, else 0)
@@ -2765,11 +2826,12 @@ _PARAM_ATTRS = ("stiffness", "damp", "startCurveAttract", "mass",
 def _hair_systems_for_category(category):
     """v0.5.0: 該当 category の全 hairSystem transform 名を返す。
     per-chain (jb_hs_<cat>_<chain>) と 旧 per-category shared
-    (jb_hairSystem_<cat>) の両方を拾う。"""
+    (jb_hairSystem_<cat>) の両方を拾う。
+    v0.5.38: namespace-aware — 参照 rig の *:jb_hs_* も対象。"""
     out = []
     for pat in (f"jb_hs_{category}_*", f"jb_hairSystem_{category}"):
-        for x in cmds.ls(pat, type="transform") or []:
-            if x not in out:
+        for x in _ns_ls(pat):
+            if cmds.nodeType(x) == "transform" and x not in out:
                 out.append(x)
     return out
 
